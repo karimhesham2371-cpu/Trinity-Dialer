@@ -367,13 +367,48 @@ app.post('/api/admin/users', auth, adminOnly, async (req, res) => {
 
 app.patch('/api/admin/users/:id', auth, adminOnly, async (req, res) => {
   const patch = {};
-  const { name, password, active, role } = req.body || {};
+  const { name, email, password, active, role } = req.body || {};
   if (name != null) patch.name = name;
+  if (email != null && String(email).trim()) {
+    const other = await sbSelect('agents',
+      `email=eq.${encodeURIComponent(String(email).trim())}&id=neq.${req.params.id}&select=id`);
+    if (other.length) return res.status(409).json({ error: 'email already in use' });
+    patch.email = String(email).trim();
+  }
   if (active != null) patch.active = !!active;
   if (role != null) patch.role = role === 'admin' ? 'admin' : 'agent';
   if (password) patch.password_hash = await bcrypt.hash(password, 10);
-  try { await sbUpdate('agents', `id=eq.${req.params.id}`, patch); res.json({ ok: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    await sbUpdate('agents', `id=eq.${req.params.id}`, patch);
+    const meta = { ...patch }; delete meta.password_hash;
+    if (password) meta.password = 'reset';
+    audit(req.user, 'UPDATE_AGENT', { target_type: 'agent', target_id: req.params.id, meta });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/users/:id', auth, adminOnly, async (req, res) => {
+  const id = req.params.id;
+  if (id === req.user.id) return res.status(400).json({ error: "you can't delete your own account" });
+  try {
+    const [target] = await sbSelect('agents', `id=eq.${id}&select=id,name,email,role,telnyx_credential_id`);
+    if (!target) return res.status(404).json({ error: 'user not found' });
+    // Never remove the last remaining active admin.
+    if (target.role === 'admin') {
+      const admins = await sbSelect('agents', `role=eq.admin&active=eq.true&select=id`);
+      if (admins.length <= 1) return res.status(400).json({ error: 'cannot delete the last active admin' });
+    }
+    // Best-effort cleanup of the Telnyx WebRTC credential.
+    if (target.telnyx_credential_id && TELNYX_KEY) {
+      await telnyx('DELETE', `/telephony_credentials/${target.telnyx_credential_id}`).catch(() => {});
+    }
+    await sbDelete('campaign_agents', `agent_id=eq.${id}`).catch(() => {});
+    await sbDelete('agents', `id=eq.${id}`);
+    delete rt[id];
+    audit(req.user, 'DELETE_AGENT', { target_type: 'agent', target_id: id,
+      meta: { name: target.name, email: target.email, role: target.role } });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══ ADMIN: campaigns ════════════════════════════════════════════════════════════
@@ -816,6 +851,60 @@ app.get('/api/admin/dnc/export', auth, adminOnly, async (req, res) => {
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', 'attachment; filename="dnc-list.csv"');
     res.send(csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Manual DNC upload — admin pastes/uploads a list; every valid number is added
+// permanently. Accepts single-column or multi-column CSV, with or without header.
+app.post('/api/admin/dnc/import', auth, adminOnly, async (req, res) => {
+  const isJson = req.is('application/json');
+  const text = isJson ? (req.body && req.body.csv) : (typeof req.body === 'string' ? req.body : '');
+  if (!text || !String(text).trim()) return res.status(400).json({ error: 'empty file' });
+  try {
+    // Scan every cell of every line; keep tokens that normalize to a valid NANP number.
+    const found = new Set();
+    let scanned = 0, invalid = 0;
+    for (const line of String(text).replace(/\r\n?/g, '\n').split('\n')) {
+      if (!line.trim()) continue;
+      for (const cell of line.split(',')) {
+        const raw = cell.trim(); if (!raw) continue;
+        const digits = raw.replace(/[^\d]/g, '');
+        if (!digits) continue;
+        scanned++;
+        const p = normPhone(raw);
+        const d2 = p.replace(/[^\d]/g, '');
+        if ((d2.length === 11 && d2.startsWith('1')) || d2.length === 10) found.add(p);
+        else invalid++;
+      }
+    }
+    const phones = [...found];
+    if (!phones.length) return res.status(400).json({ error: 'no valid phone numbers found' });
+
+    // Dedupe against what's already on the list.
+    const existing = new Set();
+    for (let i = 0; i < phones.length; i += 200) {
+      const chunk = phones.slice(i, i + 200).map(p => `"${p}"`).join(',');
+      const hits = await sbSelect('dnc_list', `phone=in.(${chunk})&select=phone`);
+      for (const h of hits || []) existing.add(h.phone);
+    }
+    const fresh = phones.filter(p => !existing.has(p));
+
+    let added = 0;
+    for (let i = 0; i < fresh.length; i += 500) {
+      const rows = fresh.slice(i, i + 500).map(phone => ({
+        phone, reason: 'manual upload', source: 'admin_import',
+      }));
+      await sbInsert('dnc_list', rows);
+      added += rows.length;
+    }
+    // Flag any existing leads that match, so the pre-dial check and pacer skip them.
+    for (let i = 0; i < fresh.length; i += 200) {
+      const chunk = fresh.slice(i, i + 200).map(p => `"${p}"`).join(',');
+      await sbUpdate('leads', `phone=in.(${chunk})`, { dnc: true, status: 'DNC' }).catch(() => {});
+    }
+    audit(req.user, 'IMPORT_DNC', { target_type: 'dnc',
+      meta: { added, duplicates: existing.size, invalid } });
+    res.json({ ok: true, added, duplicates: existing.size, invalid,
+      summary: `${added} added · ${existing.size} already listed · ${invalid} invalid` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Removal requires admin role (enforced) + explicit confirm flag.

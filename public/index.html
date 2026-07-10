@@ -340,6 +340,7 @@
     <div class="navtabs" style="margin-left:18px">
       <button id="tabConsole" class="navtab active" onclick="adminTab('console')">Console</button>
       <button id="tabLeads" class="navtab" onclick="adminTab('leads')">Leads</button>
+      <button id="tabUsers" class="navtab" onclick="adminTab('users')">User management</button>
       <button id="tabReports" class="navtab" onclick="adminTab('reports')">Reports</button>
     </div>
     <div class="sp"></div>
@@ -416,6 +417,33 @@
       <button class="navtab" data-lt="window" onclick="leadTab('window')">Calling window</button>
     </div>
     <div id="ldBody"></div>
+  </div>
+
+  <div id="adminUsers" class="wrap wide hidden">
+    <div class="grid2">
+      <div class="card">
+        <h2>Create user</h2>
+        <div class="row"><input id="nuName" class="field" placeholder="Full name" /><input id="nuEmail" class="field" placeholder="Email or username" /></div>
+        <div class="row mt3">
+          <input id="nuPass" class="field" type="password" placeholder="Password" />
+          <select id="nuRole" class="field"><option value="agent">Agent</option><option value="admin">Admin</option></select>
+        </div>
+        <button id="btnCreateUser" class="btn btn-primary btn-block mt3">Create user</button>
+        <p id="nuErr" class="err mt hidden"></p>
+        <p class="dim mt3" style="font-size:12px">Agents get a Telnyx softphone credential automatically.</p>
+      </div>
+      <div class="card">
+        <h2>About user management</h2>
+        <p class="dim" style="font-size:13px;line-height:1.6">
+          Reset a password, rename, change role, activate/deactivate, or delete any user.
+          Deleting removes their softphone credential and campaign assignments.
+          You can't delete your own account or the last active admin.</p>
+      </div>
+    </div>
+    <div class="card mt">
+      <h2>Users</h2>
+      <table id="umTbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>State</th><th style="text-align:right">Actions</th></tr></thead><tbody></tbody></table>
+    </div>
   </div>
 </div>
 
@@ -767,12 +795,15 @@ const REPTITLES={audit:'Audit logs',calls:'Call logs',agent:'Agent report',resea
 function adminTab(which){
   $('adminConsole').classList.toggle('hidden', which!=='console');
   $('adminLeads').classList.toggle('hidden', which!=='leads');
+  $('adminUsers').classList.toggle('hidden', which!=='users');
   $('adminReports').classList.toggle('hidden', which!=='reports');
   $('tabConsole').classList.toggle('active', which==='console');
   $('tabLeads').classList.toggle('active', which==='leads');
+  $('tabUsers').classList.toggle('active', which==='users');
   $('tabReports').classList.toggle('active', which==='reports');
   if(which==='reports') closeReport(); else closeAdminWs();
   if(which==='leads') initLeads();
+  if(which==='users') initUsers();
 }
 function closeReport(){ $('repPanel').classList.add('hidden'); $('repHome').classList.remove('hidden'); closeAdminWs(); }
 function openReport(kind){
@@ -781,6 +812,79 @@ function openReport(kind){
   $('repFilters').innerHTML=''; $('repBody').innerHTML='';
   if(kind!=='map') closeAdminWs();
   ({audit:initAudit,calls:initCalls,agent:initAgent,research:initResearch,map:renderMap}[kind]||(()=>{}))();
+}
+
+// ── User management ──
+let umUsers=[];
+async function initUsers(){
+  enhanceSelect($('nuRole'));
+  const btn=$('btnCreateUser');
+  if(btn && !btn._wired){ btn._wired=true; btn.onclick=createUser; }
+  await loadUmUsers();
+}
+async function loadUmUsers(){
+  try{ const j=await apiJson('/api/admin/users'); umUsers=j.users||[]; renderUmUsers(); }
+  catch(e){ toast(e.message,'err'); }
+}
+function renderUmUsers(){
+  const tb=$('umTbl').querySelector('tbody'); tb.innerHTML='';
+  if(!umUsers.length){ tb.innerHTML='<tr><td colspan="6" class="dim">No users yet.</td></tr>'; return; }
+  umUsers.forEach(u=>{
+    const st=u.state||'OFFLINE';
+    const dotc={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',WRAP_UP:'warn',BREAK:'warn'}[st]||'faint';
+    const active=u.active!==false;
+    const self=USER&&u.id===USER.id;
+    const tr=document.createElement('tr');
+    tr.innerHTML=
+      `<td>${esc(u.name)}${self?' <span class="dim">(you)</span>':''}</td>`+
+      `<td class="dim">${esc(u.email||'')}</td>`+
+      `<td><span class="pill pill--${u.role==='admin'?'info':'faint'}">${u.role}</span></td>`+
+      `<td><span class="pill pill--${active?'ok':'danger'}">${active?'active':'inactive'}</span></td>`+
+      `<td><span class="pill pill--${dotc}"><span class="dot dot--${dotc}"></span> ${st}</span></td>`+
+      `<td style="text-align:right;white-space:nowrap">`+
+        `<button class="btn btn-sm" data-a="pw">Reset PW</button> `+
+        `<button class="btn btn-sm" data-a="edit">Edit</button> `+
+        `<button class="btn btn-sm" data-a="active">${active?'Deactivate':'Activate'}</button> `+
+        `<button class="btn btn-sm btn-danger" data-a="del"${self?' disabled':''}>Delete</button>`+
+      `</td>`;
+    tr.querySelector('[data-a="pw"]').onclick=()=>umResetPw(u);
+    tr.querySelector('[data-a="edit"]').onclick=()=>umEdit(u);
+    tr.querySelector('[data-a="active"]').onclick=()=>umToggle(u,active);
+    const del=tr.querySelector('[data-a="del"]'); if(!self) del.onclick=()=>umDelete(u);
+    tb.appendChild(tr);
+  });
+}
+async function createUser(){
+  $('nuErr').classList.add('hidden');
+  const body={ name:$('nuName').value.trim(), email:$('nuEmail').value.trim(), password:$('nuPass').value, role:$('nuRole').value };
+  if(!body.name||!body.email||!body.password){ $('nuErr').textContent='Fill name, email and password.'; $('nuErr').classList.remove('hidden'); return; }
+  const btn=$('btnCreateUser'); btn.disabled=true; btn.textContent='Creating…';
+  try{ await apiJson('/api/admin/users','POST',body);
+    $('nuName').value=$('nuEmail').value=$('nuPass').value=''; await loadUmUsers(); toast('User created'); }
+  catch(e){ $('nuErr').textContent=e.message; $('nuErr').classList.remove('hidden'); }
+  finally{ btn.disabled=false; btn.textContent='Create user'; }
+}
+async function umResetPw(u){
+  const pw=prompt(`New password for ${u.name}:`); if(pw==null) return;
+  if(pw.length<4){ toast('Password too short','err'); return; }
+  try{ await apiJson('/api/admin/users/'+u.id,'PATCH',{password:pw}); toast('Password reset'); }
+  catch(e){ toast(e.message,'err'); }
+}
+async function umEdit(u){
+  const name=prompt('Name:',u.name); if(name==null) return;
+  const email=prompt('Email / username:',u.email||''); if(email==null) return;
+  const role=confirm('OK = Admin, Cancel = Agent.\n(Current: '+u.role+')')?'admin':'agent';
+  try{ await apiJson('/api/admin/users/'+u.id,'PATCH',{name:name.trim(),email:email.trim(),role}); await loadUmUsers(); toast('User updated'); }
+  catch(e){ toast(e.message,'err'); }
+}
+async function umToggle(u,active){
+  try{ await apiJson('/api/admin/users/'+u.id,'PATCH',{active:!active}); await loadUmUsers(); toast(active?'Deactivated':'Activated'); }
+  catch(e){ toast(e.message,'err'); }
+}
+async function umDelete(u){
+  if(!confirm(`Delete ${u.name} (${u.email})?\nThis removes their softphone credential and campaign assignments. This cannot be undone.`)) return;
+  try{ await apiJson('/api/admin/users/'+u.id,'DELETE'); await loadUmUsers(); toast('User deleted'); }
+  catch(e){ toast(e.message,'err'); }
 }
 
 // ── formatting helpers ──
@@ -1168,13 +1272,22 @@ async function renderFields(){
 // ── DNC list ──
 async function renderDnc(){
   $('ldBody').innerHTML=`<div class="card">
+    <h2 style="margin:0 0 4px">Upload a DNC list</h2>
+    <p class="dim" style="font-size:12px">Add numbers manually — upload a file or paste them below. One phone per line, or any CSV with a phone column. Every valid number is added permanently and any matching leads are flagged.</p>
+    <div class="dropzone mt3" id="dncDz"><input type="file" accept=".csv,.txt" id="dncFile" hidden><div id="dncDzText">Drop a CSV/TXT or <b>browse</b></div></div>
+    <div class="mt3"><span class="lbl">…or paste numbers</span>
+      <textarea id="dncPaste" class="field" placeholder="+15551234567&#10;5559876543&#10;…"></textarea></div>
+    <button class="btn btn-primary mt3" id="dncImport">Add to DNC list</button>
+    <div id="dncImpMsg" class="dim mt3" style="font-size:12px"></div>
+  </div>
+  <div class="card mt">
     <div class="row" style="align-items:center;gap:12px">
       <h2 style="margin:0">Do-not-call list</h2>
       <input id="dncQ" class="field" placeholder="Search phone…" style="max-width:240px;margin-left:12px">
       <div class="sp" style="flex:1"></div>
       <button class="btn btn-sm" id="dncExport">Export CSV</button>
     </div>
-    <p class="dim mt3" style="font-size:12px">Permanent. Numbers enter only when an agent logs the DNC disposition. Removal is admin-only and asks for confirmation.</p>
+    <p class="dim mt3" style="font-size:12px">Permanent. Numbers enter via an agent's DNC disposition or an admin upload above. Removal is admin-only and asks for confirmation.</p>
     <div id="dncList" class="mt3"></div></div>`;
   const load=async()=>{
     try{ const j=await apiJson('/api/admin/dnc'+($('dncQ').value.trim()?'?q='+encodeURIComponent($('dncQ').value.trim()):''));
@@ -1190,6 +1303,25 @@ async function renderDnc(){
   };
   let t=null; $('dncQ').oninput=()=>{ clearTimeout(t); t=setTimeout(load,300); };
   $('dncExport').onclick=async()=>{ try{ const r=await api('/api/admin/dnc/export'); const txt=await r.text(); const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([txt],{type:'text/csv'})); a.download='dnc-list.csv'; a.click(); URL.revokeObjectURL(a.href); }catch(e){ toast(e.message,'err'); } };
+
+  // ── manual upload wiring ──
+  const dz=$('dncDz'), file=$('dncFile');
+  dz.onclick=()=>file.click();
+  dz.ondragover=(e)=>{ e.preventDefault(); dz.classList.add('drag'); };
+  dz.ondragleave=()=>dz.classList.remove('drag');
+  dz.ondrop=(e)=>{ e.preventDefault(); dz.classList.remove('drag'); if(e.dataTransfer.files[0]) readDncFile(e.dataTransfer.files[0]); };
+  file.onchange=()=>{ if(file.files[0]) readDncFile(file.files[0]); };
+  function readDncFile(f){ const r=new FileReader(); r.onload=()=>{ $('dncPaste').value=r.result; $('dncDzText').innerHTML=`<b>${esc(f.name)}</b> loaded — review and click Add`; }; r.readAsText(f); }
+  $('dncImport').onclick=async()=>{
+    const csv=$('dncPaste').value.trim();
+    if(!csv){ $('dncImpMsg').innerHTML='<span class="err">Add a file or paste some numbers first.</span>'; return; }
+    const btn=$('dncImport'); btn.disabled=true; btn.textContent='Adding…';
+    try{ const j=await apiJson('/api/admin/dnc/import','POST',{csv});
+      $('dncImpMsg').innerHTML=`<b style="color:var(--ok)">${esc(j.summary)}</b>`;
+      $('dncPaste').value=''; $('dncDzText').innerHTML='Drop a CSV/TXT or <b>browse</b>'; load(); }
+    catch(e){ $('dncImpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+    finally{ btn.disabled=false; btn.textContent='Add to DNC list'; }
+  };
   load();
 }
 
