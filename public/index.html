@@ -552,12 +552,14 @@ function openWs(){
   const proto = location.protocol==='https:' ? 'wss' : 'ws';
   const sock = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
   ws = sock;
-  sock.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); };
+  sock.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); log('ws open ✓'); };
   sock.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
     if(m.type==='agent.state'){ applyState(m.state, m); } };
-  sock.onclose = ()=>{
+  sock.onerror = ()=>{ log('ws error'); };
+  sock.onclose = (ev)=>{
     if(sock._intentional) return;      // we replaced it on purpose
     if(sock!==ws) return;              // a newer socket already took over
+    log('ws closed code='+(ev&&ev.code)+' reason='+((ev&&ev.reason)||'(none)'));
     if(TOKEN&&USER&&USER.role==='agent'){
       $('reconnBanner').classList.remove('hidden');
       if(wsReconnTimer) clearTimeout(wsReconnTimer);
@@ -776,9 +778,12 @@ function auxRemainMs(){ return Math.max(0, auxDeadline-Date.now()); }
 function fmtMS(ms){ const s=Math.ceil(ms/1000); return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
 function renderAuxBtn(s){
   const b=$('auxBtn');
+  // Only lock the aux control while a call is live/pending — in every other
+  // state (incl. OFFLINE/CONNECTING) the dropdown must open so the agent can
+  // pick a status. "Ready" from the menu is what triggers the connect.
   const busy = (s==='ON_CALL'||s==='DIALING'||s==='CLAIMING');
-  b.disabled = busy || s==='CONNECTING';
-  if(s==='OFFLINE'){ b.disabled=false; b.textContent='Go Ready'; b.className='btn btn-sm btn-primary'; return; }
+  b.disabled = busy;
+  if(s==='OFFLINE'){ b.textContent='Offline'; b.className='btn btn-sm btn-primary'; return; }
   if(s==='CONNECTING'){ b.textContent='Connecting…'; b.className='btn btn-sm'; return; }
   if(s==='ON_CALL'){ b.textContent='On call'; b.className='btn btn-sm'; return; }
   if(s==='DIALING'||s==='CLAIMING'){ b.textContent='Waiting…'; b.className='btn btn-sm'; return; }
@@ -802,8 +807,7 @@ async function setAux(target){
 }
 $('auxBtn').onclick = (e)=>{
   e.stopPropagation();
-  if(serverState==='OFFLINE'){ setAux('READY'); return; }
-  if($('auxBtn').disabled) return;
+  if($('auxBtn').disabled) return;   // live/pending call — locked
   $('auxMenu').classList.toggle('hidden');
 };
 $('auxMenu').querySelectorAll('button[data-aux]').forEach(b=>{
