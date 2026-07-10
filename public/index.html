@@ -105,7 +105,7 @@ $('btnConnect').onclick = async () => {
   if (!TelnyxRTC) { log('ERROR: Telnyx WebRTC SDK not loaded'); return; }
   try {
     log('fetching login token for agent '+agent+'…');
-    const r = await api('/api/agent/token&agent='+agent);
+    const r = await api('/api/agent/token?agent='+agent);
     if (!r.ok){ log('token error '+r.status); return; }
     const { login_token, name } = await r.json();
     log('got token for '+name+', connecting…');
@@ -146,7 +146,7 @@ $('btnHang').onclick = async () => {
 function startPoll(){
   if (poll) clearInterval(poll);
   poll = setInterval(async () => {
-    try { const r = await api('/api/agent/status&agent='+agent); if(r.ok){ const j=await r.json(); if(j.state!==serverState) setState(j.state); } } catch{}
+    try { const r = await api('/api/agent/status?agent='+agent); if(r.ok){ const j=await r.json(); if(j.state!==serverState) setState(j.state); } } catch{}
   }, 1500);
 }
 
