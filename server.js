@@ -21,7 +21,7 @@ const { WebSocketServer } = require('ws');
 const { deriveFromAreaCode, inCallingWindow } = require('./lib/areacodes');
 
 const app = express();
-app.use(express.json({ limit: '8mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
+app.use(express.json({ limit: '32mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.text({ type: 'text/csv', limit: '32mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -111,6 +111,32 @@ const sbDelete = (t, q)           => sbReq('DELETE', `${t}?${q}`);
 function sbLog(table, row) { // fire-and-forget audit insert
   if (!SB_HOST || !SB_KEY) return;
   sbReq('POST', table, row, 'return=minimal').catch(e => console.error('[sbLog]', e.message));
+}
+// Exact row count regardless of PostgREST's default 1000-row select cap.
+async function sbCount(table, q = '') {
+  const r = await fetch(`https://${SB_HOST}/rest/v1/${table}?${q}${q ? '&' : ''}select=id`, {
+    headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, Prefer: 'count=exact', Range: '0-0' },
+  });
+  const cr = r.headers.get('content-range') || '*/0';
+  return parseInt(cr.split('/')[1], 10) || 0;
+}
+// Fetch ALL rows past the 1000-row cap by paging through ranges.
+async function sbSelectAll(table, q = '', page = 1000) {
+  const out = [];
+  for (let offset = 0; ; offset += page) {
+    const r = await fetch(`https://${SB_HOST}/rest/v1/${table}?${q}`, {
+      headers: {
+        apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`,
+        Range: `${offset}-${offset + page - 1}`, 'Range-Unit': 'items',
+      },
+    });
+    const text = await r.text();
+    if (!r.ok) throw new Error(`Supabase GET ${table} -> ${r.status}: ${text}`);
+    const rows = text ? JSON.parse(text) : [];
+    out.push(...rows);
+    if (rows.length < page) break;
+  }
+  return out;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -358,7 +384,8 @@ app.get('/api/admin/campaigns', auth, adminOnly, async (_req, res) => {
     const out = [];
     for (const c of campaigns) {
       const agentIds = assigns.filter(a => a.campaign_id === c.id).map(a => a.agent_id);
-      const counts   = await sbSelect('leads', `campaign_id=eq.${c.id}&select=status`);
+      // Pull every status row (past the 1000 cap) so totals are accurate on large lists.
+      const counts   = await sbSelectAll('leads', `campaign_id=eq.${c.id}&select=status`);
       const byStatus = counts.reduce((m, l) => (m[l.status] = (m[l.status] || 0) + 1, m), {});
       out.push({ ...c, agent_ids: agentIds, lead_total: counts.length, lead_status: byStatus });
     }
@@ -494,7 +521,7 @@ app.post('/api/admin/campaigns/:id/leads', auth, adminOnly, async (req, res) => 
       if (seen.has(d.phone)) { duplicates++; continue; }
       seen.add(d.phone); deduped.push(d);
     }
-    const existing = await sbSelect('leads', `campaign_id=eq.${campaignId}&select=phone`);
+    const existing = await sbSelectAll('leads', `campaign_id=eq.${campaignId}&select=phone`);
     const existingSet = new Set((existing || []).map(l => l.phone));
     const notExisting = deduped.filter(d => { if (existingSet.has(d.phone)) { duplicates++; return false; } return true; });
 
