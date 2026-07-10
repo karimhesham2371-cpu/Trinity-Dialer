@@ -46,6 +46,8 @@
   .btn-primary:hover{background:var(--accent-hover)}
   .btn-danger{background:var(--danger-tint);border-color:transparent;color:var(--danger)}
   .btn-danger:hover{background:var(--danger);color:#fff}
+  .btn-warn{background:var(--warn-tint);border-color:transparent;color:var(--warn)}
+  .btn-warn:hover{background:var(--warn);color:var(--accent-ink,#0B0E14)}
   .btn-sm{height:30px;padding:0 10px;font-size:12px}
   .btn-block{width:100%}
 
@@ -230,6 +232,13 @@
   .seat--info{border-left:2px solid var(--info);background:var(--info-tint)}
   .benchwrap{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
   .bench{padding:6px 10px;border-radius:10px;background:var(--surface-2);border:1px dashed var(--border-strong);cursor:grab;font:600 12.5px var(--font-ui)}
+  .aux{position:relative}
+  #auxBtn{min-width:118px;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+  #auxBtn:not(:disabled)::after{content:'▾';font-size:10px;opacity:.7;margin-left:2px}
+  .auxMenu{position:absolute;right:0;top:calc(100% + 6px);z-index:60;min-width:180px;background:var(--surface-2);border:1px solid var(--border-strong);border-radius:12px;padding:6px;box-shadow:0 12px 32px rgba(0,0,0,.45)}
+  .auxMenu button{width:100%;display:flex;align-items:center;gap:8px;background:transparent;border:0;color:var(--text);font:600 13px var(--font-ui);text-align:left;padding:9px 10px;border-radius:8px;cursor:pointer}
+  .auxMenu button:hover{background:var(--surface-3,rgba(255,255,255,.06))}
+  .auxMenu .auxHint{margin-left:auto;font:500 10px var(--font-mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em}
 </style>
 </head>
 <body>
@@ -256,7 +265,14 @@
     <span id="agConn" class="pill pill--faint">Softphone —</span>
     <div class="sp"></div>
     <span class="who" id="agWho"></span>
-    <button id="agBreak" class="btn btn-sm">Break</button>
+    <div id="auxWrap" class="aux">
+      <button id="auxBtn" class="btn btn-sm" disabled>Offline</button>
+      <div id="auxMenu" class="auxMenu hidden">
+        <button data-aux="READY"><span class="dot dot--ok"></span> Ready</button>
+        <button data-aux="WRAP_UP"><span class="dot dot--warn"></span> Wrap up <span class="auxHint">3 min</span></button>
+        <button data-aux="BREAK"><span class="dot dot--warn"></span> Break <span class="auxHint">15 min</span></button>
+      </div>
+    </div>
     <button class="btn btn-sm" onclick="logout()">Sign out</button>
   </div>
 
@@ -562,10 +578,16 @@ function applyState(s, snap){
   // agent keeps a "waiting" screen — no contact details are revealed until the
   // lead actually answers and the call goes live (ON_CALL).
   else if(s==='DIALING'||s==='CLAIMING'){ $('bannerState').textContent='Waiting for next call…'; $('bannerSub').textContent='Dialing in the background.'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL'||curLeadId) clearLead(); }
-  else if(s==='WRAP_UP'){ $('bannerState').textContent='Wrap-up — disposition required'; $('bannerSub').textContent='Pick an outcome to continue.'; stopTimer(); $('dispReq').classList.remove('hidden'); }
+  else if(s==='WRAP_UP'){ $('bannerState').textContent = curLeadId?'Wrap-up — disposition required':'Wrap-up'; $('bannerSub').textContent='Auto-returns to Ready when the timer ends.'; stopTimer(); $('dispReq').classList.toggle('hidden', !curLeadId); }
   else if(s==='AVAILABLE'){ $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
   else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
   else { $('bannerState').textContent=u.txt; }
+
+  // AUX auto-return timers + button label (covers manual and post-call wrap).
+  if(s==='WRAP_UP') ensureAuxTimer('WRAP_UP');
+  else if(s==='BREAK') ensureAuxTimer('BREAK');
+  else clearAuxTimer();
+  renderAuxBtn(s);
 }
 
 function startTimer(){ if(timerInt) clearInterval(timerInt); $('timer').classList.remove('hidden');
@@ -717,14 +739,62 @@ $('cPad').onclick=()=>$('padWrap').classList.toggle('hidden');
 $('cHang').onclick=async()=>{ try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ toast(e.message,'err'); } };
 document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/agent/dtmf','POST',{digits:b.textContent}); log('DTMF '+b.textContent); }catch(e){ toast(e.message,'err'); } });
 
-$('agBreak').onclick = async () => {
-  if($('agBreak').dataset.on==='1'){ $('agBreak').textContent='Break'; $('agBreak').dataset.on=''; $('agBreak').className='btn btn-sm'; startAgent(); }
-  else {
-    try{ await apiJson('/api/agent/offline','POST',{reason:'break'}); }catch(e){ log(e.message); }
-    if(client){try{client.disconnect();}catch{}} applyState('BREAK'); $('agConn').className='pill pill--faint'; $('agConn').textContent='Softphone —';
-    $('agBreak').textContent='Resume'; $('agBreak').dataset.on='1'; $('agBreak').className='btn btn-sm btn-primary';
+// ── AUX status dropdown (Ready / Wrap up / Break) ───────────────────────────
+// Ready  → AVAILABLE, receives calls immediately.
+// Wrap up→ paused, max 3 min, auto-returns to Ready.
+// Break  → paused, max 15 min, auto-returns to Ready.
+// Timers are driven off the server state so the automatic post-call wrap is
+// capped the same way. The softphone stays connected in every AUX state.
+const AUX_MAX = { WRAP_UP: 3*60, BREAK: 15*60 };
+let auxTimerInt=null, auxKind=null, auxDeadline=0;
+function clearAuxTimer(){ if(auxTimerInt){clearInterval(auxTimerInt);auxTimerInt=null;} auxKind=null; auxDeadline=0; }
+function ensureAuxTimer(kind){
+  if(auxKind===kind && auxTimerInt) return;           // already counting this state
+  clearAuxTimer();
+  auxKind=kind; auxDeadline=Date.now()+AUX_MAX[kind]*1000;
+  auxTimerInt=setInterval(()=>{
+    if(Date.now()>=auxDeadline){ clearAuxTimer(); setAux('READY'); return; }
+    renderAuxBtn(serverState);
+  },500);
+}
+function auxRemainMs(){ return Math.max(0, auxDeadline-Date.now()); }
+function fmtMS(ms){ const s=Math.ceil(ms/1000); return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
+function renderAuxBtn(s){
+  const b=$('auxBtn');
+  const busy = (s==='ON_CALL'||s==='DIALING'||s==='CLAIMING');
+  b.disabled = busy || s==='CONNECTING';
+  if(s==='OFFLINE'){ b.disabled=false; b.textContent='Go Ready'; b.className='btn btn-sm btn-primary'; return; }
+  if(s==='CONNECTING'){ b.textContent='Connecting…'; b.className='btn btn-sm'; return; }
+  if(s==='ON_CALL'){ b.textContent='On call'; b.className='btn btn-sm'; return; }
+  if(s==='DIALING'||s==='CLAIMING'){ b.textContent='Waiting…'; b.className='btn btn-sm'; return; }
+  if(s==='WRAP_UP'){ b.textContent='Wrap up '+fmtMS(auxRemainMs()); b.className='btn btn-sm btn-warn'; return; }
+  if(s==='BREAK'){ b.textContent='Break '+fmtMS(auxRemainMs()); b.className='btn btn-sm btn-warn'; return; }
+  b.textContent='Ready'; b.className='btn btn-sm'; // AVAILABLE
+}
+async function setAux(target){
+  $('auxMenu').classList.add('hidden');
+  if(target==='READY'){
+    clearAuxTimer();
+    // Not connected yet → do a full go-available (registers softphone).
+    if(!client || serverState==='OFFLINE'){ startAgent(); return; }
+    try{ await apiJson('/api/agent/aux','POST',{state:'AVAILABLE'}); }
+    catch(e){ toast(e.message,'err'); }
+    return;
   }
+  const st = target; // WRAP_UP | BREAK
+  try{ await apiJson('/api/agent/aux','POST',{state:st}); ensureAuxTimer(st); applyState(st); }
+  catch(e){ toast(e.message,'err'); }
+}
+$('auxBtn').onclick = (e)=>{
+  e.stopPropagation();
+  if(serverState==='OFFLINE'){ setAux('READY'); return; }
+  if($('auxBtn').disabled) return;
+  $('auxMenu').classList.toggle('hidden');
 };
+$('auxMenu').querySelectorAll('button[data-aux]').forEach(b=>{
+  b.onclick=(e)=>{ e.stopPropagation(); setAux(b.dataset.aux); };
+});
+document.addEventListener('click',()=>$('auxMenu').classList.add('hidden'));
 
 // hotkeys: number keys = dispositions (in WRAP_UP/ON_CALL); space = mute on call
 document.addEventListener('keydown', e=>{

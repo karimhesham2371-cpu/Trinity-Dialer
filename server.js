@@ -1212,6 +1212,33 @@ app.post('/api/agent/hangup', auth, async (req, res) => {
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 
+// AUX status switch: Ready (AVAILABLE) / Wrap up (WRAP_UP) / Break (BREAK).
+// The softphone stays in-conference the whole time, so switching is instant and
+// no re-dial is needed. The pacer only feeds AVAILABLE agents, so WRAP_UP/BREAK
+// simply pause new calls. Client enforces the max timers (3 min / 15 min) and
+// flips back to Ready; this endpoint just records the requested state.
+app.post('/api/agent/aux', auth, async (req, res) => {
+  const id = req.user.id;
+  const st = rt[id];
+  const want = String((req.body && req.body.state) || '').toUpperCase();
+  if (!['AVAILABLE', 'WRAP_UP', 'BREAK'].includes(want))
+    return res.status(400).json({ error: 'invalid aux state' });
+  if (!st || !st.conferenceId)
+    return res.status(409).json({ error: 'softphone not connected' });
+  if (['DIALING', 'CLAIMING', 'ON_CALL'].includes(st.state))
+    return res.status(409).json({ error: 'busy on a call' });
+  // Returning to Ready with an undispositioned lead still attached (e.g. the
+  // wrap-up timer expired): release the leftover leg so the pacer starts clean.
+  if (want === 'AVAILABLE' && st.leadId) {
+    if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});
+    st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
+  }
+  st.state = want;
+  await setAgentState(id, want);
+  audit(req.user, 'AUX', { target_type: 'session', meta: { state: want } });
+  res.json({ ok: true, state: want });
+});
+
 app.get('/api/agent/status', auth, (req, res) => {
   const st = rt[req.user.id] || { state: 'OFFLINE' };
   res.json({ state: st.state, leadNumber: st.leadNumber || null, leadId: st.leadId || null,
