@@ -335,7 +335,10 @@ app.get('/health', (_req, res) => {
 app.get('/api/admin/users', auth, adminOnly, async (_req, res) => {
   try {
     const rows = await sbSelect('agents', 'select=id,name,email,role,active,state,telnyx_credential_id,campaign_id&order=created_at.asc');
-    res.json({ users: rows });
+    // Overlay the live in-memory runtime state; the DB `state` column is only a
+    // creation-time seed and is never persisted per state change.
+    const users = rows.map(u => ({ ...u, state: (rt[u.id] && rt[u.id].state) || 'OFFLINE' }));
+    res.json({ users });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
