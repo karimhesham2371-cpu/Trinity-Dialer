@@ -790,21 +790,43 @@ function playlistFragment(filters) {
   }
   return parts.join('&');
 }
-app.get('/api/admin/campaigns/:id/playlists', auth, adminOnly, async (req, res) => {
-  try { res.json({ playlists: await sbSelect('playlists', `campaign_id=eq.${req.params.id}&order=priority.asc,created_at.asc`) }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+// ── Playlists (top-level containers of campaigns + agents) ────────────────────
+// A playlist holds many campaigns and many agents. Available agents on a playlist
+// dial leads drawn from its campaigns, highest-priority playlist first.
+async function hydratePlaylists(rows) {
+  if (!rows.length) return [];
+  const ids = rows.map(p => `"${p.id}"`).join(',');
+  const [pcs, pas, camps, agents] = await Promise.all([
+    sbSelect('playlist_campaigns', `playlist_id=in.(${ids})&select=playlist_id,campaign_id`),
+    sbSelect('playlist_agents',    `playlist_id=in.(${ids})&select=playlist_id,agent_id`),
+    sbSelect('campaigns', 'select=id,name,status'),
+    sbSelect('agents', 'select=id,name,role'),
+  ]);
+  const campById  = Object.fromEntries((camps  || []).map(c => [c.id, c]));
+  const agentById = Object.fromEntries((agents || []).map(a => [a.id, a]));
+  return rows.map(p => ({
+    ...p,
+    campaigns: (pcs || []).filter(x => x.playlist_id === p.id)
+      .map(x => campById[x.campaign_id]).filter(Boolean),
+    agents: (pas || []).filter(x => x.playlist_id === p.id)
+      .map(x => agentById[x.agent_id]).filter(Boolean),
+  }));
+}
+app.get('/api/admin/playlists', auth, adminOnly, async (_req, res) => {
+  try {
+    const rows = await sbSelect('playlists', 'order=priority.asc,created_at.asc');
+    res.json({ playlists: await hydratePlaylists(rows) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post('/api/admin/campaigns/:id/playlists', auth, adminOnly, async (req, res) => {
-  const { name, priority, weight, group_name, filters, selection_mode } = req.body || {};
+app.post('/api/admin/playlists', auth, adminOnly, async (req, res) => {
+  const { name, priority, filters, selection_mode } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
   try {
     const [row] = await sbInsert('playlists', {
-      campaign_id: req.params.id, name,
-      priority: Math.min(9, Math.max(1, priority || 5)),
-      weight: weight || 1, group_name: group_name || null,
+      name, priority: Math.min(9, Math.max(1, priority || 5)),
       filters: filters || [], selection_mode: selection_mode || 'balanced',
     });
-    audit(req.user, 'ADD_PLAYLIST', { target_type: 'campaign', target_id: req.params.id, meta: { name } });
+    audit(req.user, 'ADD_PLAYLIST', { target_type: 'playlist', target_id: row.id, meta: { name } });
     res.json({ ok: true, playlist: row });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -818,21 +840,92 @@ app.delete('/api/admin/playlists/:pid', auth, adminOnly, async (req, res) => {
   try { await sbDelete('playlists', `id=eq.${req.params.pid}`); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
-// Live "Available leads: N" — count leads matching a filter set (dialable only).
-app.post('/api/admin/campaigns/:id/playlists/count', auth, adminOnly, async (req, res) => {
-  const filters = (req.body && req.body.filters) || [];
+// Attach / detach a campaign
+app.post('/api/admin/playlists/:pid/campaigns', auth, adminOnly, async (req, res) => {
+  const { campaign_id } = req.body || {};
+  if (!campaign_id) return res.status(400).json({ error: 'campaign_id required' });
   try {
-    const frag = playlistFragment(filters);
-    const q = `campaign_id=eq.${req.params.id}&dnc=eq.false&status=in.(NEW,CALLBACK)` +
+    await sbReq('POST', 'playlist_campaigns',
+      { playlist_id: req.params.pid, campaign_id }, 'resolution=ignore-duplicates,return=minimal');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/admin/playlists/:pid/campaigns/:cid', auth, adminOnly, async (req, res) => {
+  try { await sbDelete('playlist_campaigns', `playlist_id=eq.${req.params.pid}&campaign_id=eq.${req.params.cid}`); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Attach / detach an agent (caller)
+app.post('/api/admin/playlists/:pid/agents', auth, adminOnly, async (req, res) => {
+  const { agent_id } = req.body || {};
+  if (!agent_id) return res.status(400).json({ error: 'agent_id required' });
+  try {
+    await sbReq('POST', 'playlist_agents',
+      { playlist_id: req.params.pid, agent_id }, 'resolution=ignore-duplicates,return=minimal');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/admin/playlists/:pid/agents/:aid', auth, adminOnly, async (req, res) => {
+  try { await sbDelete('playlist_agents', `playlist_id=eq.${req.params.pid}&agent_id=eq.${req.params.aid}`); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Live "Available leads: N" across all campaigns in a playlist (dialable only).
+app.post('/api/admin/playlists/:pid/count', auth, adminOnly, async (req, res) => {
+  try {
+    const [pl] = await sbSelect('playlists', `id=eq.${req.params.pid}&select=filters`);
+    const pcs = await sbSelect('playlist_campaigns', `playlist_id=eq.${req.params.pid}&select=campaign_id`);
+    const cids = (pcs || []).map(x => x.campaign_id);
+    if (!cids.length) return res.json({ count: 0 });
+    const frag = playlistFragment((req.body && req.body.filters) || (pl && pl.filters) || []);
+    const q = `campaign_id=in.(${cids.map(c => `"${c}"`).join(',')})&dnc=eq.false&status=in.(NEW,CALLBACK)` +
               (frag ? `&${frag}` : '') + '&select=id';
-    // PostgREST exact count via Prefer header + Content-Range
     const r = await fetch(`https://${SB_HOST}/rest/v1/leads?${q}`, {
       headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, Prefer: 'count=exact', Range: '0-0' },
     });
     const cr = r.headers.get('content-range') || '*/0';
-    const count = parseInt(cr.split('/')[1], 10) || 0;
-    res.json({ count });
+    res.json({ count: parseInt(cr.split('/')[1], 10) || 0 });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DIDs (caller numbers) + campaign assignment for inbound routing ───────────
+app.get('/api/admin/dids', auth, adminOnly, async (_req, res) => {
+  try {
+    const [dids, camps] = await Promise.all([
+      sbSelect('dids', 'select=*&order=created_at.desc'),
+      sbSelect('campaigns', 'select=id,name'),
+    ]);
+    const cById = Object.fromEntries((camps || []).map(c => [c.id, c.name]));
+    res.json({ dids: (dids || []).map(d => ({ ...d, campaign_name: d.campaign_id ? cById[d.campaign_id] || null : null })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/admin/dids', auth, adminOnly, async (req, res) => {
+  const { phone_number, state } = req.body || {};
+  const num = normPhone(phone_number || '');
+  if (!num) return res.status(400).json({ error: 'valid phone_number required' });
+  const area_code = num.replace(/[^\d]/g, '').replace(/^1/, '').slice(0, 3);
+  const derived = deriveFromAreaCode(area_code);
+  try {
+    const [row] = await sbInsert('dids', {
+      phone_number: num, area_code, state: state || derived.state || null, active: true,
+    });
+    audit(req.user, 'ADD_DID', { target_type: 'did', target_id: row.id, meta: { phone_number: num } });
+    res.json({ ok: true, did: row });
+  } catch (e) { res.status(409).json({ error: e.message }); }
+});
+// Assign / unassign a DID to a campaign (exclusive: one DID → one campaign).
+app.patch('/api/admin/dids/:id', auth, adminOnly, async (req, res) => {
+  const patch = {};
+  if ('campaign_id' in (req.body || {})) patch.campaign_id = req.body.campaign_id || null;
+  if ('active' in (req.body || {})) patch.active = !!req.body.active;
+  if ('daily_cap' in (req.body || {})) patch.daily_cap = req.body.daily_cap;
+  try {
+    const [row] = await sbUpdate('dids', `id=eq.${req.params.id}`, patch);
+    audit(req.user, 'UPDATE_DID', { target_type: 'did', target_id: req.params.id, meta: patch });
+    res.json({ ok: true, did: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/admin/dids/:id', auth, adminOnly, async (req, res) => {
+  try { await sbDelete('dids', `id=eq.${req.params.id}`); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── DNC list management (view / search / export / remove w/ confirm) ──────────
@@ -1305,36 +1398,100 @@ async function dialLead(agentId, lead) {
 }
 
 let pacingBusy = false;
+// Pull the next dialable, in-window lead across a set of campaigns (applying an
+// optional playlist filter set). Returns a lead row or null.
+async function nextDialableLead(campaignIds, filters, nowIso) {
+  if (!campaignIds.length) return null;
+  const inList = campaignIds.map(c => `"${c}"`).join(',');
+  const frag = playlistFragment(filters || []);
+  const leads = await sbSelect('leads',
+    `campaign_id=in.(${inList})&dnc=eq.false&status=in.(NEW,CALLBACK)` +
+    (frag ? `&${frag}` : '') +
+    `&or=(next_callback_at.is.null,next_callback_at.lte.${nowIso})` +
+    `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=15&select=*`);
+  // Compliance: hard lead-local calling window.
+  return (leads || []).find(l =>
+    inCallingWindow(l.timezone, CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour)) || null;
+}
 async function pacingTick() {
   if (pacingBusy || !SB_HOST || !CONNECTION_ID) return;
   pacingBusy = true;
   try {
-    const campaigns = await sbSelect('campaigns', `status=eq.RUNNING&select=id`);
-    if (!campaigns.length) return;
+    // Only bother if at least one agent is free and in-conference.
+    const freeAgents = Object.keys(rt).filter(id => {
+      const st = rt[id]; return st && st.state === 'AVAILABLE' && st.conferenceId;
+    });
+    if (!freeAgents.length) return;
     const nowIso = new Date().toISOString();
-    for (const c of campaigns) {
-      const assigns = await sbSelect('campaign_agents', `campaign_id=eq.${c.id}&select=agent_id`);
-      for (const { agent_id } of assigns) {
-        const st = rt[agent_id];
-        if (!st || st.state !== 'AVAILABLE' || !st.conferenceId) continue;   // only free, in-conference agents
-        // Grab a small batch (not just 1) so we can skip out-of-window leads
-        // without stalling the agent. Out-of-window leads are simply left NEW;
-        // they auto-requeue once their local clock enters the window.
-        const leads = await sbSelect('leads',
-          `campaign_id=eq.${c.id}&dnc=eq.false&status=in.(NEW,CALLBACK)` +
-          `&or=(next_callback_at.is.null,next_callback_at.lte.${nowIso})` +
-          `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=10&select=*`);
-        // Compliance: hard 10AM–9PM lead-local calling window.
-        const lead = leads.find(l =>
-          inCallingWindow(l.timezone, CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour));
-        if (!lead) continue;
-        st.state = 'CLAIMING';                          // guard: prevents re-dial on next tick
-        try { await dialLead(agent_id, lead); }
-        catch (e) { console.error('[pacing:dial]', e.message); st.state = 'AVAILABLE'; }
+
+    // Snapshot the routing model once per tick.
+    const [runningCamps, playlists, plCamps, plAgents, legacyAssigns] = await Promise.all([
+      sbSelect('campaigns', 'status=eq.RUNNING&select=id'),
+      sbSelect('playlists', 'active=eq.true&select=id,priority,filters'),
+      sbSelect('playlist_campaigns', 'select=playlist_id,campaign_id'),
+      sbSelect('playlist_agents', 'select=playlist_id,agent_id'),
+      sbSelect('campaign_agents', 'select=campaign_id,agent_id'),
+    ]);
+    const runningSet = new Set((runningCamps || []).map(c => c.id));
+    const plById = Object.fromEntries((playlists || []).map(p => [p.id, p]));
+    // playlist_id -> [campaignIds that are RUNNING]
+    const campsByPlaylist = {};
+    for (const { playlist_id, campaign_id } of plCamps || []) {
+      if (!runningSet.has(campaign_id)) continue;
+      (campsByPlaylist[playlist_id] ||= []).push(campaign_id);
+    }
+    // agent_id -> ordered playlist list (highest priority = lowest number first)
+    const playlistsByAgent = {};
+    for (const { playlist_id, agent_id } of plAgents || []) {
+      const p = plById[playlist_id]; if (!p) continue;
+      (playlistsByAgent[agent_id] ||= []).push(p);
+    }
+    for (const id in playlistsByAgent) playlistsByAgent[id].sort((a, b) => a.priority - b.priority);
+    // Legacy: agent_id -> [RUNNING campaignIds] (only used if agent is on no playlist)
+    const legacyByAgent = {};
+    for (const { campaign_id, agent_id } of legacyAssigns || []) {
+      if (!runningSet.has(campaign_id)) continue;
+      (legacyByAgent[agent_id] ||= []).push(campaign_id);
+    }
+
+    for (const agentId of freeAgents) {
+      const st = rt[agentId];
+      if (!st || st.state !== 'AVAILABLE' || !st.conferenceId) continue; // re-check (may have changed)
+      let lead = null;
+      const agentPlaylists = playlistsByAgent[agentId];
+      if (agentPlaylists && agentPlaylists.length) {
+        // Playlist-driven: walk playlists in priority order until one yields a lead.
+        for (const p of agentPlaylists) {
+          const cids = campsByPlaylist[p.id];
+          if (!cids || !cids.length) continue;
+          lead = await nextDialableLead(cids, p.filters, nowIso);
+          if (lead) break;
+        }
+      } else {
+        // Legacy fallback: agent assigned straight to campaigns.
+        lead = await nextDialableLead(legacyByAgent[agentId] || [], [], nowIso);
       }
+      if (!lead) continue;
+      st.state = 'CLAIMING';                              // guard: prevents re-dial on next tick
+      try { await dialLead(agentId, lead); }
+      catch (e) { console.error('[pacing:dial]', e.message); st.state = 'AVAILABLE'; }
     }
   } catch (e) { console.error('[pacing]', e.message); }
   finally { pacingBusy = false; }
+}
+
+// Pick a random AVAILABLE, in-conference agent who works `campaignId` (via any
+// playlist that contains it). Returns an agentId or null.
+async function pickInboundAgent(campaignId) {
+  const pcs = await sbSelect('playlist_campaigns', `campaign_id=eq.${campaignId}&select=playlist_id`);
+  const plIds = [...new Set((pcs || []).map(x => x.playlist_id))];
+  if (!plIds.length) return null;
+  const pas = await sbSelect('playlist_agents',
+    `playlist_id=in.(${plIds.map(p => `"${p}"`).join(',')})&select=agent_id`);
+  const candidates = [...new Set((pas || []).map(x => x.agent_id))]
+    .filter(id => { const st = rt[id]; return st && st.state === 'AVAILABLE' && st.conferenceId; });
+  if (!candidates.length) return null;
+  return candidates[Math.floor(Math.random() * candidates.length)];   // random rotation
 }
 
 // ══ WEBHOOK + BRIDGE ═════════════════════════════════════════════════════════════
@@ -1375,6 +1532,51 @@ app.post('/webhooks/telnyx', async (req, res) => {
                   (payload.public_recording_urls && (payload.public_recording_urls.mp3 || payload.public_recording_urls.wav)) || null;
       if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
         { recording_url: url, recording_id: payload.recording_id || null }).catch(() => {});
+      return;
+    }
+
+    // ── Inbound call on one of our DIDs ────────────────────────────────────────
+    // A caller dials a DID assigned to a campaign; ring a random available agent
+    // working that campaign and bridge them into that agent's conference.
+    if (event === 'call.initiated' && (payload.direction === 'incoming' || payload.direction === 'inbound') && !role) {
+      const toNum = normPhone(payload.to || '');
+      const fromNum = payload.from || '';
+      const [did] = await sbSelect('dids', `phone_number=eq.${encodeURIComponent(toNum)}&select=campaign_id,active&limit=1`);
+      if (!did || did.active === false || !did.campaign_id) {
+        console.log(`[inbound] no campaign for ${toNum} — rejecting`);
+        await telnyx('POST', `/calls/${ccid}/actions/reject`, { cause: 'CALL_REJECTED' }).catch(() => {});
+        return;
+      }
+      const chosen = await pickInboundAgent(did.campaign_id);
+      if (!chosen) {
+        console.log(`[inbound] ${toNum} campaign ${did.campaign_id.slice(0, 8)} — no available agent, rejecting`);
+        await telnyx('POST', `/calls/${ccid}/actions/reject`, { cause: 'USER_BUSY' }).catch(() => {});
+        return;
+      }
+      const st = rt[chosen];
+      st.state = 'ON_CALL';                     // reserve so the pacer skips this agent
+      await setAgentState(chosen, 'ON_CALL');
+      await telnyx('POST', `/calls/${ccid}/actions/answer`, {
+        client_state: enc({ role: 'inbound', agentId: chosen, conf: st.conferenceId, campaignId: did.campaign_id, from: fromNum }),
+      });
+      sbLog('calls', { agent_id: chosen, campaign_id: did.campaign_id,
+        telnyx_call_control_id: ccid, from_number: fromNum, to_number: toNum, direction: 'inbound' });
+      console.log(`[inbound] ${toNum} -> agent ${chosen.slice(0, 8)} (campaign ${did.campaign_id.slice(0, 8)})`);
+      return;
+    }
+    // Inbound leg answered -> join it into the chosen agent's conference.
+    if (event === 'call.answered' && role === 'inbound' && agentId) {
+      const st = rt[agentId];
+      if (st && (cs.conf || st.conferenceId)) {
+        await telnyx('POST', `/conferences/${cs.conf || st.conferenceId}/actions/join`, {
+          call_control_id: ccid, start_conference_on_enter: true, mute: false,
+        });
+        st.leadLeg = ccid; st.inbound = true; st.leadId = null;
+        st.onCallSince = Date.now(); st.state = 'ON_CALL';
+        await setAgentState(agentId, 'ON_CALL');
+        sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`, { bridged_at: new Date().toISOString() }).catch(() => {});
+        console.log(`[inbound] agent ${agentId.slice(0, 8)} ON_CALL (bridged inbound)`);
+      }
       return;
     }
 
@@ -1425,8 +1627,16 @@ app.post('/webhooks/telnyx', async (req, res) => {
         const talked = st.state === 'ON_CALL';   // agent actually spoke to a human
         if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
           { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
+        const wasInbound = st.inbound === true;
         st.leadLeg = null; st.leadNumber = null; st.fromNumber = null; st.onCallSince = null;
-        if (talked) {
+        if (wasInbound) {
+          // Inbound calls have no lead to disposition — return straight to AVAILABLE.
+          st.inbound = false; st.leadId = null;
+          if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
+            { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
+          if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
+          console.log(`[bridge] inbound ended, agent ${agentId.slice(0, 8)} AVAILABLE`);
+        } else if (talked) {
           // Require a disposition: hold the agent in WRAP_UP; keep leadId so
           // /api/agent/context + /disposition resolve the right lead.
           if (st.state !== 'OFFLINE') { st.state = 'WRAP_UP'; await setAgentState(agentId, 'WRAP_UP'); }

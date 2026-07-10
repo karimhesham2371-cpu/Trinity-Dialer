@@ -411,6 +411,7 @@
     <div class="navtabs" id="ldSub" style="margin-bottom:14px">
       <button class="navtab active" data-lt="import" onclick="leadTab('import')">Import</button>
       <button class="navtab" data-lt="playlists" onclick="leadTab('playlists')">Playlists</button>
+      <button class="navtab" data-lt="numbers" onclick="leadTab('numbers')">Numbers</button>
       <button class="navtab" data-lt="folders" onclick="leadTab('folders')">Action folders</button>
       <button class="navtab" data-lt="fields" onclick="leadTab('fields')">Custom fields</button>
       <button class="navtab" data-lt="dnc" onclick="leadTab('dnc')">DNC list</button>
@@ -1081,8 +1082,8 @@ function leadTab(t){
   ldCurTab=t;
   $('ldSub').querySelectorAll('[data-lt]').forEach(b=>b.classList.toggle('active', b.dataset.lt===t));
   const body=$('ldBody'); body.innerHTML='<p class="dim">Loading…</p>';
-  if(!ldCampId && ['import','playlists','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
-  ({import:renderImport,playlists:renderPlaylists,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow}[t]||(()=>{}))();
+  if(!ldCampId && ['import','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
+  ({import:renderImport,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow}[t]||(()=>{}))();
 }
 
 // ── Global lead search ──
@@ -1145,58 +1146,99 @@ async function ldPreview(f){
   }catch(e){ $('ldDzText').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
 }
 
-// ── Playlists (filter builder + live count) ──
+// ── Playlists (top-level containers of campaigns + callers) ──
 const PL_FIELDS=[['state','State'],['status','Status'],['times_called','Times called'],['attempts','Attempts'],['source','Source'],['tags','Tag']];
 const PL_OPS=[['is','is'],['is_not','is not'],['between','between']];
+let plAllCampaigns=[], plAllAgents=[];
 async function renderPlaylists(){
-  let pls=[]; try{ pls=(await apiJson(`/api/admin/campaigns/${ldCampId}/playlists`)).playlists||[]; }catch(e){}
-  try{ ldCampFields=(await apiJson(`/api/admin/campaigns/${ldCampId}/fields`)).fields||[]; }catch(e){ ldCampFields=[]; }
-  const list=pls.map(p=>`<div class="card" style="margin-bottom:12px">
-    <div class="row" style="align-items:center;gap:10px"><b>${esc(p.name)}</b>
-      <span class="pill pill--faint">priority ${p.priority}</span>
-      <span class="pill pill--faint">weight ${p.weight}</span>
-      ${p.group_name?`<span class="pill pill--info">${esc(p.group_name)}</span>`:''}
-      <span class="pill pill--faint">${esc(p.selection_mode)}</span>
-      <span class="dim mono" style="margin-left:auto">${(p.filters||[]).length} filter(s)</span>
-      <button class="btn btn-sm" data-delpl="${p.id}">Delete</button></div>
-    <div class="dim mt2" style="font-size:12px">${(p.filters||[]).map(f=>`${f.field} ${f.op} ${Array.isArray(f.value)?f.value.join('–'):f.value}`).join(' · ')||'no filters (all dialable leads)'}</div>
-  </div>`).join('')||'<p class="dim">No playlists yet.</p>';
+  let pls=[];
+  try{ pls=(await apiJson('/api/admin/playlists')).playlists||[]; }catch(e){ toast(e.message,'err'); }
+  plAllCampaigns=leadCampaigns||[];
+  try{ plAllAgents=((await apiJson('/api/admin/users')).users||[]).filter(u=>u.role==='agent'); }catch(e){ plAllAgents=[]; }
+  const list=pls.map(p=>{
+    const assignedC=new Set((p.campaigns||[]).map(c=>c.id));
+    const assignedA=new Set((p.agents||[]).map(a=>a.id));
+    const campOpts=plAllCampaigns.filter(c=>!assignedC.has(c.id)).map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('');
+    const agentOpts=plAllAgents.filter(a=>!assignedA.has(a.id)).map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('');
+    const campChips=(p.campaigns||[]).map(c=>`<span class="chip">${esc(c.name)} <span data-rmcamp="${p.id}:${c.id}" style="cursor:pointer;color:var(--danger)">✕</span></span>`).join('')||'<span class="dim" style="font-size:12px">none — dials nothing</span>';
+    const agentChips=(p.agents||[]).map(a=>`<span class="chip">${esc(a.name)} <span data-rmagent="${p.id}:${a.id}" style="cursor:pointer;color:var(--danger)">✕</span></span>`).join('')||'<span class="dim" style="font-size:12px">none — no callers</span>';
+    const fSummary=(p.filters||[]).map(f=>`${f.field} ${f.op} ${Array.isArray(f.value)?f.value.join('–'):f.value}`).join(' · ')||'no filters (all dialable leads)';
+    return `<div class="card" style="margin-bottom:12px">
+      <div class="row" style="align-items:center;gap:10px">
+        <b style="font:600 15px var(--font-ui)">${esc(p.name)}</b>
+        <span class="pill pill--${p.active?'ok':'faint'}">${p.active?'active':'paused'}</span>
+        <span class="pill pill--faint">priority ${p.priority}</span>
+        <span class="mono" data-plcount="${p.id}" style="margin-left:auto;color:var(--accent)"></span>
+        <button class="btn btn-sm" data-togglepl="${p.id}:${p.active?0:1}">${p.active?'Pause':'Activate'}</button>
+        <button class="btn btn-sm btn-danger" data-delpl="${p.id}">Delete</button>
+      </div>
+      <div class="grid2 mt3" style="gap:16px">
+        <div><span class="lbl">Campaigns (leads dialed)</span><div class="chips mt2">${campChips}</div>
+          ${campOpts?`<div class="row mt2" style="gap:8px"><select class="field" data-addcamp="${p.id}"><option value="">+ Add campaign…</option>${campOpts}</select></div>`:''}</div>
+        <div><span class="lbl">Callers (assigned agents)</span><div class="chips mt2">${agentChips}</div>
+          ${agentOpts?`<div class="row mt2" style="gap:8px"><select class="field" data-addagent="${p.id}"><option value="">+ Add caller…</option>${agentOpts}</select></div>`:''}</div>
+      </div>
+      <div class="dim mt3" style="font-size:12px">Filters: ${fSummary}</div>
+    </div>`;
+  }).join('')||'<p class="dim">No playlists yet.</p>';
   $('ldBody').innerHTML=`<div class="card"><h2>New playlist</h2>
+      <p class="dim" style="font-size:12px;margin-bottom:8px">A playlist holds one or more campaigns and the agents who dial them. Available agents on a playlist call leads from its campaigns, highest-priority playlist first.</p>
       <div class="row" style="gap:12px;flex-wrap:wrap">
-        <div class="fw" style="flex:2"><span class="lbl">Name</span><input id="plName" class="field" placeholder="e.g. Fresh Florida"></div>
+        <div class="fw" style="flex:2"><span class="lbl">Name</span><input id="plName" class="field" placeholder="e.g. Kimo's list"></div>
         <div class="fw"><span class="lbl">Priority 1–9</span><input id="plPri" class="field mono" type="number" min="1" max="9" value="5"></div>
-        <div class="fw"><span class="lbl">Weight</span><input id="plWt" class="field mono" type="number" min="1" value="1"></div>
-        <div class="fw"><span class="lbl">Group</span><input id="plGrp" class="field" placeholder="optional"></div>
-        <div class="fw"><span class="lbl">DID selection</span><select id="plMode" class="field"><option value="balanced">Balanced</option><option value="strict">Strict (healthy only)</option><option value="off">Off</option></select></div>
       </div>
-      <div class="lbl mt3">Filters</div><div id="plFilters"></div>
+      <div class="lbl mt3">Filters <span class="faint">— optional, applied across all campaigns in the playlist</span></div><div id="plFilters"></div>
       <button class="btn btn-sm mt2" id="plAddFilter">+ Add filter</button>
-      <div class="row mt3" style="align-items:center;gap:12px">
-        <button class="btn btn-primary" id="plCreate">Create playlist</button>
-        <button class="btn btn-sm" id="plCount">Count matching</button>
-        <span id="plCountOut" class="mono" style="color:var(--accent)"></span>
-      </div>
+      <div class="row mt3"><button class="btn btn-primary" id="plCreate">Create playlist</button></div>
     </div>
     <div class="card mt"><h2>Playlists</h2>${list}</div>`;
   enhanceAll($('ldBody'));
   $('plAddFilter').onclick=()=>addFilterRow();
   addFilterRow();
   $('plCreate').onclick=async()=>{
-    const body={ name:$('plName').value.trim(), priority:+$('plPri').value, weight:+$('plWt').value,
-      group_name:$('plGrp').value.trim()||null, selection_mode:$('plMode').value, filters:collectFilters() };
+    const body={ name:$('plName').value.trim(), priority:+$('plPri').value, filters:collectFilters() };
     if(!body.name){ toast('Name required','err'); return; }
-    try{ await apiJson(`/api/admin/campaigns/${ldCampId}/playlists`,'POST',body); toast('Playlist created'); renderPlaylists(); }catch(e){ toast(e.message,'err'); }
+    try{ await apiJson('/api/admin/playlists','POST',body); toast('Playlist created'); renderPlaylists(); }catch(e){ toast(e.message,'err'); }
   };
-  $('plCount').onclick=async()=>{
-    try{ const j=await apiJson(`/api/admin/campaigns/${ldCampId}/playlists/count`,'POST',{filters:collectFilters()});
-      $('plCountOut').textContent=`Available leads: ${j.count}`; }catch(e){ toast(e.message,'err'); }
-  };
-  $('ldBody').querySelectorAll('[data-delpl]').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/admin/playlists/'+b.dataset.delpl,'DELETE'); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
+  const B=$('ldBody');
+  B.querySelectorAll('[data-delpl]').forEach(b=>b.onclick=async()=>{ if(!confirm('Delete this playlist?'))return; try{ await apiJson('/api/admin/playlists/'+b.dataset.delpl,'DELETE'); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
+  B.querySelectorAll('[data-togglepl]').forEach(b=>b.onclick=async()=>{ const [id,act]=b.dataset.togglepl.split(':'); try{ await apiJson('/api/admin/playlists/'+id,'PATCH',{active:act==='1'}); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
+  B.querySelectorAll('[data-addcamp]').forEach(s=>s.onchange=async()=>{ if(!s.value)return; try{ await apiJson('/api/admin/playlists/'+s.dataset.addcamp+'/campaigns','POST',{campaign_id:s.value}); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
+  B.querySelectorAll('[data-rmcamp]').forEach(x=>x.onclick=async()=>{ const [pid,cid]=x.dataset.rmcamp.split(':'); try{ await apiJson('/api/admin/playlists/'+pid+'/campaigns/'+cid,'DELETE'); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
+  B.querySelectorAll('[data-addagent]').forEach(s=>s.onchange=async()=>{ if(!s.value)return; try{ await apiJson('/api/admin/playlists/'+s.dataset.addagent+'/agents','POST',{agent_id:s.value}); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
+  B.querySelectorAll('[data-rmagent]').forEach(x=>x.onclick=async()=>{ const [pid,aid]=x.dataset.rmagent.split(':'); try{ await apiJson('/api/admin/playlists/'+pid+'/agents/'+aid,'DELETE'); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
+  // live available-leads count per playlist
+  B.querySelectorAll('[data-plcount]').forEach(async el=>{ try{ const j=await apiJson('/api/admin/playlists/'+el.dataset.plcount+'/count','POST',{}); el.textContent='Available leads: '+j.count; }catch(e){} });
 }
-function fieldOptions(){
-  const base=PL_FIELDS.map(([v,l])=>`<option value="${v}">${l}</option>`).join('');
-  const custom=ldCampFields.map(f=>`<option value="custom.${esc(f.key)}">${esc(f.label)} (custom)</option>`).join('');
-  return base+custom;
+function fieldOptions(){ return PL_FIELDS.map(([v,l])=>`<option value="${v}">${l}</option>`).join(''); }
+
+// ── Numbers (DIDs) + campaign assignment ──
+async function renderNumbers(){
+  let dids=[]; try{ dids=(await apiJson('/api/admin/dids')).dids||[]; }catch(e){ toast(e.message,'err'); }
+  const camps=leadCampaigns||[];
+  const campSel=(cur)=>`<select class="field" data-assign="__ID__"><option value="">— unassigned —</option>${camps.map(c=>`<option value="${c.id}"${c.id===cur?' selected':''}>${esc(c.name)}</option>`).join('')}</select>`;
+  const rows=dids.map(d=>`<tr>
+      <td class="mono">${esc(d.phone_number)}</td>
+      <td>${esc(d.state||'—')}</td>
+      <td><span class="pill pill--${d.active?'ok':'faint'}">${d.active?'active':'off'}</span></td>
+      <td style="min-width:200px">${campSel(d.campaign_id).replace('__ID__',d.id)}</td>
+      <td style="text-align:right"><button class="btn btn-sm btn-danger" data-deldid="${d.id}">Delete</button></td>
+    </tr>`).join('')||'<tr><td colspan="5" class="dim">No numbers yet.</td></tr>';
+  $('ldBody').innerHTML=`<div class="card"><h2>Add a number</h2>
+      <p class="dim" style="font-size:12px;margin-bottom:8px">Add your Telnyx numbers here, then assign each to a campaign. Inbound calls to an assigned number ring a random available agent working that campaign.</p>
+      <div class="row" style="gap:12px"><input id="ndNum" class="field" placeholder="+15551234567" style="max-width:220px">
+        <button class="btn btn-primary" id="ndAdd" style="flex:0 0 auto">Add number</button></div>
+      <p id="ndErr" class="err mt hidden"></p></div>
+    <div class="card mt"><h2>Numbers</h2>
+      <div class="tblwrap"><table><thead><tr><th>Number</th><th>State</th><th>Status</th><th>Assigned campaign</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div></div>`;
+  enhanceAll($('ldBody'));
+  $('ndAdd').onclick=async()=>{ $('ndErr').classList.add('hidden'); const num=$('ndNum').value.trim(); if(!num){return;}
+    try{ await apiJson('/api/admin/dids','POST',{phone_number:num}); $('ndNum').value=''; renderNumbers(); toast('Number added'); }
+    catch(e){ $('ndErr').textContent=e.message; $('ndErr').classList.remove('hidden'); } };
+  $('ldBody').querySelectorAll('[data-assign]').forEach(s=>s.onchange=async()=>{
+    try{ await apiJson('/api/admin/dids/'+s.dataset.assign,'PATCH',{campaign_id:s.value||null}); toast('Assignment saved'); }catch(e){ toast(e.message,'err'); } });
+  $('ldBody').querySelectorAll('[data-deldid]').forEach(b=>b.onclick=async()=>{ if(!confirm('Delete this number?'))return; try{ await apiJson('/api/admin/dids/'+b.dataset.deldid,'DELETE'); renderNumbers(); }catch(e){ toast(e.message,'err'); } });
 }
 function addFilterRow(){
   const wrap=$('plFilters'); const row=document.createElement('div'); row.className='row plfilter'; row.style.cssText='gap:8px;margin-top:6px;align-items:center';

@@ -367,3 +367,45 @@ create table if not exists disposition_rules (
   created_at     timestamptz not null default now()
 );
 create index if not exists disp_rules_disp_idx on disposition_rules (disposition_id, times_logged);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- v6 — Playlist-driven dialing + DID→campaign inbound routing
+-- Model: PLAYLIST holds many CAMPAIGNS and many AGENTS. Available agents on a
+-- playlist dial leads drawn from that playlist's campaigns (highest priority
+-- playlist first). Each DID belongs to at most one campaign; inbound calls on
+-- that DID ring a random available agent working the campaign.
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+-- Playlist ↔ Campaigns (many-to-many)
+create table if not exists playlist_campaigns (
+  id           uuid primary key default gen_random_uuid(),
+  playlist_id  uuid references playlists(id)  on delete cascade,
+  campaign_id  uuid references campaigns(id)  on delete cascade,
+  created_at   timestamptz not null default now(),
+  unique (playlist_id, campaign_id)
+);
+create index if not exists pl_camp_playlist_idx on playlist_campaigns (playlist_id);
+create index if not exists pl_camp_campaign_idx on playlist_campaigns (campaign_id);
+
+-- Playlist ↔ Agents (callers assigned to a playlist)
+create table if not exists playlist_agents (
+  id           uuid primary key default gen_random_uuid(),
+  playlist_id  uuid references playlists(id) on delete cascade,
+  agent_id     uuid references agents(id)    on delete cascade,
+  created_at   timestamptz not null default now(),
+  unique (playlist_id, agent_id)
+);
+create index if not exists pl_agent_playlist_idx on playlist_agents (playlist_id);
+create index if not exists pl_agent_agent_idx    on playlist_agents (agent_id);
+
+-- Playlists become standalone containers; campaign_id is now legacy/optional.
+alter table playlists alter column campaign_id drop not null;
+
+-- Backfill: fold every existing single-campaign playlist into the join table.
+insert into playlist_campaigns (playlist_id, campaign_id)
+  select id, campaign_id from playlists where campaign_id is not null
+  on conflict (playlist_id, campaign_id) do nothing;
+
+-- Assign a DID to exactly one campaign (for inbound routing). NULL = unassigned.
+alter table dids add column if not exists campaign_id uuid references campaigns(id) on delete set null;
+create index if not exists dids_campaign_idx on dids (campaign_id);
