@@ -211,3 +211,159 @@ create index if not exists audit_actor_idx on audit_log (actor_id, created_at);
 -- Office map: persisted desk positions (percentage 0-100 of the canvas).
 alter table agents add column if not exists seat_x numeric;
 alter table agents add column if not exists seat_y numeric;
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- v5: Sprint 1 — Data model + Lead Management (per BUILD_SCOPE.md).
+--     Additive + idempotent. Absorbs existing tables; keeps v4 reporting intact.
+--     Scope-locked: power dial only, DNC permanent/disposition-driven,
+--     global 10AM–9PM lead-local calling window.
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+-- ── app_settings: single global key/value store (calling window lives here) ────
+create table if not exists app_settings (
+  key         text primary key,
+  value       jsonb not null default '{}'::jsonb,
+  updated_at  timestamptz not null default now()
+);
+-- Hard rule: no lead is dialed before 10:00 or after 21:00 in their LOCAL time.
+insert into app_settings (key, value)
+  values ('calling_window', '{"start_hour":10,"end_hour":21}'::jsonb)
+  on conflict (key) do nothing;
+
+-- ── dids: the outbound number pool (admin adds Telnyx numbers manually) ────────
+create table if not exists dids (
+  id           uuid primary key default gen_random_uuid(),
+  phone_number text not null unique,
+  area_code    text,
+  state        text,
+  carrier      text,
+  daily_cap    int not null default 100,     -- presets 75/100/150/200/none(null)
+  health       text not null default 'HEALTHY', -- HEALTHY | SUSPECT | RESTING | RETIRED
+  rest_until   timestamptz,                   -- auto-rest expiry
+  active       boolean not null default true,
+  created_at   timestamptz not null default now()
+);
+create index if not exists dids_state_idx  on dids (state, active);
+create index if not exists dids_health_idx on dids (health);
+
+-- Per-DID per-day counters — feeds daily caps + rolling answer-rate health.
+create table if not exists did_daily_stats (
+  did_id   uuid references dids(id) on delete cascade,
+  day      date not null,
+  carrier  text not null default '',   -- '' = all; per DID×carrier rows too
+  dials    int not null default 0,
+  answers  int not null default 0,
+  primary key (did_id, day, carrier)
+);
+
+-- ── campaign_fields: custom CRM fields per campaign + lead-card layout ─────────
+create table if not exists campaign_fields (
+  id           uuid primary key default gen_random_uuid(),
+  campaign_id  uuid references campaigns(id) on delete cascade,
+  key          text not null,            -- stored under leads.custom[key]
+  label        text not null,
+  type         text not null default 'text', -- text | number | date | select | phone
+  options      jsonb not null default '[]'::jsonb, -- for select
+  position     int not null default 0,   -- lead-card layout order
+  show_on_card boolean not null default true,
+  created_at   timestamptz not null default now(),
+  unique (campaign_id, key)
+);
+
+-- ── action_folders: Appointments / Hot Leads / Follow-ups (admin-definable) ────
+create table if not exists action_folders (
+  id           uuid primary key default gen_random_uuid(),
+  campaign_id  uuid references campaigns(id) on delete cascade, -- null = global
+  name         text not null,
+  position     int not null default 0,
+  created_at   timestamptz not null default now()
+);
+
+-- Membership: a lead can sit in many folders (manual click-to-call from any).
+create table if not exists lead_folders (
+  lead_id    uuid references leads(id) on delete cascade,
+  folder_id  uuid references action_folders(id) on delete cascade,
+  added_at   timestamptz not null default now(),
+  primary key (lead_id, folder_id)
+);
+
+-- ── playlists: filter-driven lead selection with weighted groups + priority ────
+create table if not exists playlists (
+  id             uuid primary key default gen_random_uuid(),
+  campaign_id    uuid references campaigns(id) on delete cascade,
+  name           text not null,
+  priority       int not null default 5,      -- 1 (highest) .. 9 (lowest)
+  weight         int not null default 1,       -- weighting within a group
+  group_name     text,                         -- weighted-group bucket
+  filters        jsonb not null default '[]'::jsonb,
+                 -- [{field, op, value}] op: is | is_not | between
+  selection_mode text not null default 'balanced', -- strict | balanced | off (DID health)
+  active         boolean not null default true,
+  created_at     timestamptz not null default now()
+);
+create index if not exists playlists_campaign_idx on playlists (campaign_id, active, priority);
+
+-- ── import_batches: one row per CSV upload (drives the import summary) ─────────
+create table if not exists import_batches (
+  id           uuid primary key default gen_random_uuid(),
+  campaign_id  uuid references campaigns(id) on delete cascade,
+  filename     text,
+  total        int not null default 0,
+  inserted     int not null default 0,
+  duplicates   int not null default 0,   -- deduped by phone
+  dnc_removed  int not null default 0,   -- "N removed — on your DNC list"
+  invalid      int not null default 0,   -- rejected numbers (rejects file)
+  created_by   uuid references agents(id),
+  created_at   timestamptz not null default now()
+);
+
+-- ── leads: tags, ownership, import provenance, source ─────────────────────────
+alter table leads add column if not exists tags            text[] not null default '{}';
+alter table leads add column if not exists owner_agent_id  uuid references agents(id);
+alter table leads add column if not exists import_batch_id uuid references import_batches(id);
+alter table leads add column if not exists source          text;
+alter table leads add column if not exists times_called    int not null default 0; -- distinct from attempts; playlist filterable
+
+-- Global lead search (phone / name / address) across campaigns.
+create extension if not exists pg_trgm;
+create index if not exists leads_name_trgm on leads using gin ((coalesce(first_name,'')||' '||coalesce(last_name,'')) gin_trgm_ops);
+create index if not exists leads_addr_trgm on leads using gin (coalesce(address,'') gin_trgm_ops);
+create index if not exists leads_tags_idx  on leads using gin (tags);
+create index if not exists leads_owner_idx on leads (owner_agent_id);
+
+-- ── disposition_defs: the disposition catalog (Sprint 2 uses; defined here) ────
+-- Included in Sprint 1 so the schema is complete; Sprint 2 wires the engine.
+create table if not exists disposition_defs (
+  id              uuid primary key default gen_random_uuid(),
+  campaign_id     uuid references campaigns(id) on delete cascade, -- null = global
+  parent_id       uuid references disposition_defs(id),            -- category nesting
+  name            text not null,
+  abbreviation    text,
+  color           text,           -- status palette token
+  hotkey          text,           -- '1'..'9'
+  position        int not null default 0,
+  hidden          boolean not null default false,
+  end_call        boolean not null default true,   -- end vs keep call
+  is_dnc          boolean not null default false,  -- permanent DNC (the only entry path)
+  is_callback     boolean not null default false,  -- opens callback picker
+  take_ownership  text not null default 'none',    -- none | allow | force
+  action_folder_id uuid references action_folders(id), -- transfer-to-folder
+  require_notes   boolean not null default false,
+  apply_tags      text[] not null default '{}',
+  announce        boolean not null default false,  -- announce-to-floor toast
+  created_at      timestamptz not null default now()
+);
+create index if not exists disp_defs_campaign_idx on disposition_defs (campaign_id, hidden, position);
+
+-- ── disposition_rules: escalating recycling by times-logged ───────────────────
+-- Global 4h (240min) minimum re-dial safety net is the default delay.
+create table if not exists disposition_rules (
+  id             uuid primary key default gen_random_uuid(),
+  disposition_id uuid references disposition_defs(id) on delete cascade,
+  times_logged   int not null default 1,       -- fires when logged this many times
+  action         text not null default 'recycle', -- recycle | exhaust | dnc | folder
+  delay_minutes  int not null default 240,      -- >= 240 enforced by engine
+  action_folder_id uuid references action_folders(id),
+  created_at     timestamptz not null default now()
+);
+create index if not exists disp_rules_disp_idx on disposition_rules (disposition_id, times_logged);
