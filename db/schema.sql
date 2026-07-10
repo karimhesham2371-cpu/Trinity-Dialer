@@ -416,3 +416,37 @@ create index if not exists dids_campaign_idx on dids (campaign_id);
 -- power dialing (no abandoned calls); higher cuts inter-call wait but can drop
 -- extra legs when a human answers first. Enforced range 1-5 in the app layer.
 alter table playlists add column if not exists lines_per_agent int;
+
+-- v8 — Disposition-driven DNC + recycle policy.
+-- expires_at: when set, the DNC entry auto-expires (e.g. 90 days after a sale).
+-- NULL = permanent (explicit DNC disposition or 4-strike auto-DNC).
+alter table dnc_list add column if not exists expires_at timestamptz;
+create index if not exists dnc_expires_idx on dnc_list (expires_at);
+
+-- Per-phone activity across ALL campaigns: anchors the 10-day recycle window
+-- (first_dial_at) and counts negative-outcome strikes toward the 4-strike DNC.
+create table if not exists phone_activity (
+  phone         text primary key,
+  first_dial_at timestamptz,
+  neg_strikes   int not null default 0,
+  last_disp_at  timestamptz,
+  updated_at    timestamptz not null default now()
+);
+
+-- Atomic strike bump: increments neg_strikes (or inserts at 1), preserving the
+-- earliest first_dial_at, and returns the updated row.
+create or replace function bump_phone_strike(p_phone text)
+returns phone_activity
+language plpgsql as $$
+declare r phone_activity;
+begin
+  insert into phone_activity (phone, neg_strikes, first_dial_at, last_disp_at, updated_at)
+    values (p_phone, 1, now(), now(), now())
+  on conflict (phone) do update
+    set neg_strikes   = phone_activity.neg_strikes + 1,
+        first_dial_at = coalesce(phone_activity.first_dial_at, now()),
+        last_disp_at  = now(),
+        updated_at    = now()
+  returning * into r;
+  return r;
+end $$;

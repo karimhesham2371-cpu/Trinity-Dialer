@@ -56,6 +56,18 @@ const DEFAULT_DISPOSITIONS = [
 ];
 const DEFAULT_RECYCLE = { no_answer: { hours: 4, max: 5 }, busy: { minutes: 20, max: 8 } };
 
+// ── Disposition → DNC / recycle policy (Karim's rules) ────────────────────────
+//  • Sale / appointment (positive outcome): DNC for 90 days, then auto-removed.
+//  • DNC disposition: permanent DNC, only an admin can clear it.
+//  • Any other outcome (not available / voicemail / not interested / …): the
+//    number stays re-dialable for 10 days from the FIRST dial. Each such
+//    disposition is a "strike"; 4 strikes on a phone (across ALL campaigns)
+//    → permanent DNC. After the 10-day window with < 4 strikes → EXHAUSTED.
+const NEG_STRIKE_LIMIT      = 4;
+const RECYCLE_WINDOW_DAYS   = 10;
+const POSITIVE_DNC_DAYS     = 90;
+const DEFAULT_NEG_REDIAL_MS = 24 * 3600e3;   // spacing between redials when a disposition has no explicit recycle rule
+
 // In-memory runtime keyed by agent id (single instance — required for pacing).
 // { state, sip, agentLeg, conferenceId, leadLeg, leadId, leadNumber, fromNumber }
 const rt = {};
@@ -273,6 +285,64 @@ function scheduleWrapReturn(agentId, seconds) {
     // Only auto-advance if still wrapping on a connected softphone.
     if (s.state === 'WRAP_UP' && s.conferenceId) { s.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
   }, seconds * 1000);
+}
+
+// ── DNC + phone-strike helpers ────────────────────────────────────────────────
+// A positive outcome (sale / appointment / lead) whose regex mirrors the wrap rule.
+function isPositiveDisp(disp) {
+  if (!disp) return false;
+  if (disp.positive === true || disp.long_wrap === true) return true;
+  return LONG_WRAP_RE.test(`${disp.code || ''} ${disp.label || ''}`);
+}
+// Add a number to the DNC list permanently (expires_at NULL). merge-duplicates so
+// a pre-existing temporary entry is upgraded to permanent.
+function dncPermanent(phone, reason) {
+  if (!phone) return;
+  sbReq('POST', 'dnc_list?on_conflict=phone',
+    { phone, reason: reason || 'internal', source: 'agent', expires_at: null },
+    'resolution=merge-duplicates,return=minimal').catch(e => console.error('[dncPermanent]', e.message));
+}
+// Add a number to the DNC list with an auto-expiry. ignore-duplicates so we never
+// shorten (or overwrite) an existing permanent/earlier entry.
+function dncTemporary(phone, days, reason) {
+  if (!phone) return;
+  sbReq('POST', 'dnc_list?on_conflict=phone',
+    { phone, reason: reason || 'converted', source: 'agent',
+      expires_at: new Date(Date.now() + days * 86400e3).toISOString() },
+    'resolution=ignore-duplicates,return=minimal').catch(e => console.error('[dncTemporary]', e.message));
+}
+// Atomically bump a phone's negative-strike counter (across campaigns) and return
+// the updated { neg_strikes, first_dial_at }. Falls back gracefully on error.
+async function bumpPhoneStrike(phone) {
+  try {
+    const r = await sbReq('POST', 'rpc/bump_phone_strike', { p_phone: phone });
+    return Array.isArray(r) ? r[0] : r;
+  } catch (e) { console.error('[bumpPhoneStrike]', e.message); return { neg_strikes: 1, first_dial_at: null }; }
+}
+// Record the first-ever dial of a phone (ignore-duplicates keeps the earliest).
+function markFirstDial(phone) {
+  if (!phone || !SB_HOST) return;
+  sbReq('POST', 'phone_activity?on_conflict=phone',
+    { phone, first_dial_at: new Date().toISOString() },
+    'resolution=ignore-duplicates,return=minimal').catch(() => {});
+}
+// Periodic sweep: drop DNC entries whose 90-day (or other) expiry has passed and
+// clear the dnc flag on any leads carrying that number.
+async function sweepExpiredDnc() {
+  if (!SB_HOST) return;
+  try {
+    const nowIso = new Date().toISOString();
+    const expired = await sbSelect('dnc_list', `expires_at=lt.${nowIso}&select=phone`);
+    if (!expired || !expired.length) return;
+    const phones = expired.map(r => r.phone).filter(Boolean);
+    for (let i = 0; i < phones.length; i += 100) {
+      const chunk = phones.slice(i, i + 100);
+      const inList = chunk.map(p => `"${p}"`).join(',');
+      await sbDelete('dnc_list', `phone=in.(${inList})&expires_at=lt.${nowIso}`);
+      await sbUpdate('leads', `phone=in.(${inList})&dnc=eq.true`, { dnc: false }).catch(() => {});
+    }
+    console.log(`[dncSweep] removed ${phones.length} expired DNC entr${phones.length === 1 ? 'y' : 'ies'}`);
+  } catch (e) { console.error('[dncSweep]', e.message); }
 }
 
 // Rebuild `rt` from the agents table on boot (durable-state recovery).
@@ -1524,29 +1594,46 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
     sbLog('dispositions', { lead_id: leadId, agent_id: req.user.id, campaign_id: lead.campaign_id,
       code, notes: notes || null, callback_at: callback_at || null });
 
-    // Decide the lead's next status.
+    // Decide the lead's next status + DNC policy (see the rules block near the top).
     const patch = { last_outcome: code };
     if (notes != null) patch.notes_last = undefined; // reserved; notes live on dispositions
     if (disp.is_dnc) {
+      // Explicit Do-Not-Call → permanent DNC (only an admin can clear it).
       patch.status = 'DNC'; patch.dnc = true;
-      sbReq('POST', 'dnc_list', { phone: lead.phone, reason: 'internal', source: 'agent' },
-        'resolution=ignore-duplicates,return=minimal').catch(() => {});
+      dncPermanent(lead.phone, 'internal');
+    } else if (isPositiveDisp(disp)) {
+      // Sale / appointment / lead → converted, DNC for 90 days then auto-removed.
+      patch.status = disp.outcome || 'DONE'; patch.dnc = true;
+      dncTemporary(lead.phone, POSITIVE_DNC_DAYS, 'converted');
     } else if (disp.is_callback) {
       patch.status = 'CALLBACK';
       patch.next_callback_at = callback_at || new Date(Date.now() + 3600e3).toISOString();
       patch.assigned_agent_id = req.user.id; // route callback back to this agent
-    } else if (disp.recycle) {
-      const rule = (cfg.recycle_rules || DEFAULT_RECYCLE)[disp.recycle] || {};
-      const max = lead.max_attempts || rule.max || 5;
-      if ((lead.attempts || 0) >= max) {
-        patch.status = 'EXHAUSTED';
-      } else {
-        patch.status = 'NEW';
-        const ms = rule.hours ? rule.hours * 3600e3 : (rule.minutes ? rule.minutes * 60e3 : 3600e3);
-        patch.next_callback_at = new Date(Date.now() + ms).toISOString();
-      }
     } else {
-      patch.status = disp.outcome || 'DONE';
+      // Every other outcome (not available / voicemail / not interested / …):
+      // one strike. 4 strikes on the phone (any campaign) → permanent DNC.
+      // Otherwise keep it re-dialable, but only within 10 days of the first dial.
+      const act = await bumpPhoneStrike(lead.phone);
+      const strikes = (act && act.neg_strikes) || 1;
+      if (strikes >= NEG_STRIKE_LIMIT) {
+        patch.status = 'DNC'; patch.dnc = true;
+        dncPermanent(lead.phone, 'strike-limit');
+        // Propagate DNC to every other lead row sharing this number.
+        sbUpdate('leads', `phone=eq.${encodeURIComponent(lead.phone)}&dnc=eq.false`,
+          { dnc: true, status: 'DNC' }).catch(() => {});
+      } else {
+        const firstDial = (act && act.first_dial_at) ? new Date(act.first_dial_at).getTime() : Date.now();
+        const windowEnd = firstDial + RECYCLE_WINDOW_DAYS * 86400e3;
+        const rule = disp.recycle ? ((cfg.recycle_rules || DEFAULT_RECYCLE)[disp.recycle] || {}) : {};
+        const ms = rule.hours ? rule.hours * 3600e3 : (rule.minutes ? rule.minutes * 60e3 : DEFAULT_NEG_REDIAL_MS);
+        const next = Date.now() + ms;
+        if (next >= windowEnd) {
+          patch.status = 'EXHAUSTED';   // next redial would fall outside the 10-day window
+        } else {
+          patch.status = 'NEW';
+          patch.next_callback_at = new Date(next).toISOString();
+        }
+      }
     }
     await sbUpdate('leads', `id=eq.${leadId}`, patch).catch(e => console.error('[disp:lead]', e.message));
     audit(req.user, 'DISPOSITION', { target_type: 'lead', target_id: leadId, meta: { code, next_status: patch.status, phone: lead.phone } });
@@ -1627,7 +1714,11 @@ async function dialLead(agentId, lead) {
   // source of truth; if a number slipped through (flag not yet synced), catch
   // it here, sync the flag, and bail without dialing.
   try {
-    const hit = await sbSelect('dnc_list', `phone=eq.${encodeURIComponent(lead.phone)}&select=phone&limit=1`);
+    // Ignore entries whose expiry has passed (e.g. a 90-day post-sale DNC) even if
+    // the periodic sweep hasn't cleared them yet.
+    const nowIso = new Date().toISOString();
+    const hit = await sbSelect('dnc_list',
+      `phone=eq.${encodeURIComponent(lead.phone)}&or=(expires_at.is.null,expires_at.gt.${nowIso})&select=phone&limit=1`);
     if (hit && hit.length) {
       await sbUpdate('leads', `id=eq.${lead.id}`, { dnc: true, status: 'DNC' }).catch(() => {});
       console.log(`[pacing] DNC skip ${lead.phone}`);
@@ -1659,6 +1750,7 @@ async function dialLead(agentId, lead) {
   await sbUpdate('leads', `id=eq.${lead.id}`,
     { status: 'IN_PROGRESS', attempts: (lead.attempts || 0) + 1, last_attempt_at: new Date().toISOString(), assigned_agent_id: agentId })
     .catch(e => console.error('[dialLead:update]', e.message));
+  markFirstDial(lead.phone);   // stamps first_dial_at once — anchors the 10-day recycle window
   // Open a calls row for history/recording linkage.
   sbLog('calls', { lead_id: lead.id, agent_id: agentId, campaign_id: lead.campaign_id,
     telnyx_call_control_id: ccid, from_number: from, to_number: lead.phone, direction: 'outbound' });
@@ -2138,4 +2230,6 @@ server.listen(PORT, async () => {
   setInterval(refreshCallerPool, 5 * 60 * 1000);
   setInterval(loadCallingWindow, 5 * 60 * 1000);
   setInterval(loadDialerConfig, 60 * 1000);
+  sweepExpiredDnc();
+  setInterval(sweepExpiredDnc, 10 * 60 * 1000);   // auto-remove expired (e.g. 90-day) DNC entries
 });
