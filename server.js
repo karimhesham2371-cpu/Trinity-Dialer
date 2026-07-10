@@ -1525,7 +1525,11 @@ app.post('/webhooks/telnyx', async (req, res) => {
   }
 
   console.log(`[wh] ${event} role=${role || '-'} agent=${agentId ? agentId.slice(0, 8) : '-'} ccid=${ccid ? ccid.slice(-8) : '-'}` +
-              (payload.result ? ` result=${payload.result}` : ''));
+              (payload.result ? ` result=${payload.result}` : '') +
+              (payload.hangup_cause ? ` hangup_cause=${payload.hangup_cause}` : '') +
+              (payload.hangup_source ? ` src=${payload.hangup_source}` : '') +
+              (payload.sip_hangup_cause ? ` sip=${payload.sip_hangup_cause}` : '') +
+              (payload.to ? ` to=${payload.to}` : ''));
   sbLog('call_events', { event_type: event, telnyx_call_control_id: ccid, client_state: cs, payload });
 
   try {
