@@ -113,3 +113,18 @@ create table if not exists call_events (
   received_at             timestamptz not null default now()
 );
 create index if not exists call_events_ccid_idx on call_events (telnyx_call_control_id);
+
+-- ── v2: auth + multi-user + campaign assignment ─────────────────────────────
+alter table agents    add column if not exists role          text not null default 'agent';   -- agent | admin
+alter table agents    add column if not exists password_hash text;
+alter table agents    add column if not exists active        boolean not null default true;
+alter table campaigns add column if not exists status        text not null default 'DRAFT';    -- DRAFT | RUNNING | PAUSED | STOPPED
+alter table campaigns add column if not exists caller_ids    jsonb not null default '[]'::jsonb; -- optional per-campaign DID pool override
+
+create table if not exists campaign_agents (
+  id           uuid primary key default gen_random_uuid(),
+  campaign_id  uuid references campaigns(id) on delete cascade,
+  agent_id     uuid references agents(id)    on delete cascade,
+  created_at   timestamptz not null default now(),
+  unique (campaign_id, agent_id)
+);

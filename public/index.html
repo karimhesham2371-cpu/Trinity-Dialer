@@ -3,155 +3,324 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Trinity Dialer — Agent</title>
+<title>Trinity Dialer</title>
 <style>
   :root { --bg:#0e1116; --panel:#171c24; --line:#232a35; --txt:#e6edf3; --mut:#8b95a5;
           --grn:#2ea043; --red:#da3633; --blu:#2f81f7; --amber:#d29922; }
   * { box-sizing:border-box; }
   body { margin:0; font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
-  .wrap { max-width:520px; margin:32px auto; padding:0 16px; }
-  h1 { font-size:20px; margin:0 0 4px; }
+  a { color:var(--blu); }
+  .wrap { max-width:920px; margin:28px auto; padding:0 16px; }
+  .narrow { max-width:440px; }
+  h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:15px; margin:0 0 12px; }
   .sub { color:var(--mut); margin:0 0 20px; }
+  .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
+  .top .who { color:var(--mut); font-size:13px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
   label { display:block; font-size:12px; color:var(--mut); margin:0 0 4px; }
   input, select { width:100%; padding:9px 11px; background:#0e1116; border:1px solid var(--line);
                   border-radius:8px; color:var(--txt); font-size:14px; }
-  .row { display:flex; gap:10px; }
-  .row > * { flex:1; }
+  .row { display:flex; gap:10px; } .row > * { flex:1; }
   button { padding:10px 14px; border:0; border-radius:8px; font-size:14px; font-weight:600;
            cursor:pointer; color:#fff; background:var(--blu); }
   button:disabled { opacity:.4; cursor:not-allowed; }
-  button.grn { background:var(--grn); } button.red { background:var(--red); } button.gray{ background:#30363d; }
+  button.grn { background:var(--grn); } button.red { background:var(--red); }
+  button.amber { background:var(--amber); color:#111; } button.gray { background:#30363d; }
+  button.sm { padding:6px 10px; font-size:12px; }
   .status { display:flex; align-items:center; gap:8px; font-weight:600; }
   .dot { width:10px; height:10px; border-radius:50%; background:var(--mut); }
-  .dot.on { background:var(--grn); } .dot.busy { background:var(--amber); } .dot.call{ background:var(--blu); }
-  .pill { font-size:12px; padding:2px 8px; border-radius:99px; background:#0e1116; border:1px solid var(--line); color:var(--mut); }
+  .dot.on { background:var(--grn); } .dot.busy { background:var(--amber); } .dot.call { background:var(--blu); }
+  .pill { font-size:11px; padding:2px 8px; border-radius:99px; background:#0e1116; border:1px solid var(--line); color:var(--mut); }
+  .pill.RUNNING { color:var(--grn); border-color:var(--grn); } .pill.PAUSED { color:var(--amber); border-color:var(--amber); }
+  .pill.STOPPED,.pill.DRAFT { color:var(--mut); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--mut); font-weight:600; font-size:12px; }
   #log { font:12px/1.5 ui-monospace,Menlo,monospace; color:var(--mut); background:#0b0e13;
-         border:1px solid var(--line); border-radius:8px; padding:10px; height:150px; overflow:auto; white-space:pre-wrap; }
-  .mt { margin-top:12px; }
+         border:1px solid var(--line); border-radius:8px; padding:10px; height:130px; overflow:auto; white-space:pre-wrap; }
+  .mt { margin-top:12px; } .muted { color:var(--mut); } .err { color:var(--red); font-size:13px; }
+  .hidden { display:none; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { font-size:12px; padding:3px 8px; border-radius:99px; background:#0e1116; border:1px solid var(--line); display:flex; gap:6px; align-items:center; }
+  .chip b { color:var(--txt); font-weight:600; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media(max-width:680px){ .grid2 { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
-<div class="wrap">
+
+<!-- ═══ LOGIN ═══ -->
+<div id="viewLogin" class="wrap narrow">
   <h1>Trinity Dialer</h1>
-  <p class="sub">Agent softphone · Phase 1</p>
-
+  <p class="sub">Sign in</p>
   <div class="card">
-    <div class="row">
-      <div>
-        <label>Access token</label>
-        <input id="accessTok" type="password" placeholder="WH_TOKEN" />
-      </div>
-      <div style="flex:0 0 120px">
-        <label>Agent</label>
-        <select id="agentSlot"><option value="1">Agent 1</option><option value="2">Agent 2</option></select>
-      </div>
-    </div>
-    <button id="btnConnect" class="mt" style="width:100%">Connect softphone</button>
+    <label>Email / username</label>
+    <input id="liEmail" autocomplete="username" />
+    <label class="mt">Password</label>
+    <input id="liPass" type="password" autocomplete="current-password" />
+    <button id="btnLogin" class="mt" style="width:100%">Sign in</button>
+    <p id="liErr" class="err mt hidden"></p>
   </div>
+</div>
 
-  <div class="card">
-    <div class="status"><span id="dot" class="dot"></span><span id="stateTxt">Not connected</span>
-      <span id="regPill" class="pill" style="margin-left:auto">unregistered</span></div>
-    <button id="btnAvail" class="grn mt" style="width:100%" disabled>Go Available</button>
+<!-- ═══ AGENT ═══ -->
+<div id="viewAgent" class="wrap narrow hidden">
+  <div class="top">
+    <div><h1>Trinity Dialer</h1><div class="who" id="agWho"></div></div>
+    <button class="gray sm" onclick="logout()">Sign out</button>
   </div>
-
   <div class="card">
-    <label>Lead number</label>
-    <input id="dialNum" type="tel" placeholder="+1..." />
+    <div class="status"><span id="agDot" class="dot"></span><span id="agState">Connecting…</span>
+      <span id="agReg" class="pill" style="margin-left:auto">softphone: —</span></div>
+    <div class="muted mt" id="agLead">No active call</div>
     <div class="row mt">
-      <button id="btnDial" disabled>Dial</button>
-      <button id="btnHang" class="red" disabled>Hang up</button>
+      <button id="agHang" class="red" disabled>Hang up</button>
+      <button id="agBreak" class="amber">Go on break</button>
+    </div>
+    <p class="muted mt" style="font-size:12px">Auto-dial runs whenever you're Available and your campaign is Running. No action needed.</p>
+  </div>
+  <div id="log"></div>
+</div>
+
+<!-- ═══ ADMIN ═══ -->
+<div id="viewAdmin" class="wrap hidden">
+  <div class="top">
+    <div><h1>Trinity Dialer — Admin</h1><div class="who" id="adWho"></div></div>
+    <button class="gray sm" onclick="logout()">Sign out</button>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>Users</h2>
+      <table id="usersTbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>State</th></tr></thead><tbody></tbody></table>
+      <div class="mt"><b style="font-size:13px">Add user</b></div>
+      <div class="row mt"><input id="uName" placeholder="Name" /><input id="uEmail" placeholder="Email / username" /></div>
+      <div class="row mt">
+        <input id="uPass" placeholder="Password" />
+        <select id="uRole"><option value="agent">agent</option><option value="admin">admin</option></select>
+      </div>
+      <button id="btnAddUser" class="mt" style="width:100%">Create user (+ Telnyx credential)</button>
+      <p id="uErr" class="err mt hidden"></p>
+    </div>
+
+    <div class="card">
+      <h2>New campaign</h2>
+      <label>Campaign name</label>
+      <input id="cName" placeholder="e.g. Florida FSBO June" />
+      <button id="btnAddCamp" class="mt" style="width:100%">Create campaign</button>
+      <p class="muted mt" style="font-size:12px">After creating: assign agents, upload a lead CSV, then Start.</p>
     </div>
   </div>
 
-  <div id="log"></div>
+  <div class="card">
+    <h2>Campaigns</h2>
+    <div id="campList"></div>
+  </div>
 </div>
 
 <audio id="remoteAudio" autoplay></audio>
 <script src="https://unpkg.com/@telnyx/webrtc/lib/bundle.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
-function log(m){ const el=$('log'); el.textContent += (new Date().toLocaleTimeString()+'  '+m+'\n'); el.scrollTop=el.scrollHeight; }
+let TOKEN = localStorage.getItem('trinity_token') || '';
+let USER  = JSON.parse(localStorage.getItem('trinity_user') || 'null');
+let client=null, poll=null, serverState='OFFLINE', usersCache=[];
 
-let client=null, currentCall=null, agent='1', accessTok='', poll=null, serverState='OFFLINE';
+function log(m){ const el=$('log'); if(!el) return; el.textContent += (new Date().toLocaleTimeString()+'  '+m+'\n'); el.scrollTop=el.scrollHeight; }
 
-function api(pathQ, opts){ return fetch(pathQ + (pathQ.includes('?')?'&':'?') + 'token=' + encodeURIComponent(accessTok), opts); }
-
-function setState(s){
-  serverState = s;
-  const dot=$('dot'), t=$('stateTxt');
-  const map={ OFFLINE:['','Offline'], CONNECTING:['busy','Connecting…'], AVAILABLE:['on','Available'],
-              DIALING:['busy','Dialing…'], ON_CALL:['call','On call'] };
-  const [cls,txt]=map[s]||['','—'];
-  dot.className='dot '+cls; t.textContent=txt;
-  $('btnDial').disabled = (s!=='AVAILABLE');
-  $('btnHang').disabled = !(s==='DIALING'||s==='ON_CALL');
-  $('btnAvail').disabled = (s!=='OFFLINE') || !client;
+async function api(path, opts={}) {
+  opts.headers = Object.assign({ 'Authorization':'Bearer '+TOKEN }, opts.headers||{});
+  const r = await fetch(path, opts);
+  if (r.status===401){ logout(); throw new Error('unauthorized'); }
+  return r;
+}
+async function apiJson(path, method='GET', body){
+  const opts = { method };
+  if (body!==undefined){ opts.headers={'Content-Type':'application/json'}; opts.body=JSON.stringify(body); }
+  const r = await api(path, opts); const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error||('HTTP '+r.status));
+  return j;
 }
 
-// Resolve the UMD global regardless of exact name
-function getTelnyxRTC(){
-  const g = window.TelnyxWebRTC || window.telnyxWebRTC || window.TelnyxRTC || window.telnyx;
-  if (!g) return null;
-  return g.TelnyxRTC || (g.default && g.default.TelnyxRTC) || g;
-}
+function show(view){ ['Login','Agent','Admin'].forEach(v=>$('view'+v).classList.toggle('hidden', v.toLowerCase()!==view)); }
+function logout(){ localStorage.removeItem('trinity_token'); localStorage.removeItem('trinity_user'); TOKEN=''; USER=null; if(poll)clearInterval(poll); if(client){try{client.disconnect();}catch{}} show('login'); }
 
-$('btnConnect').onclick = async () => {
-  accessTok = $('accessTok').value.trim();
-  agent = $('agentSlot').value;
-  if (!accessTok) { log('enter access token'); return; }
-  const TelnyxRTC = getTelnyxRTC();
-  if (!TelnyxRTC) { log('ERROR: Telnyx WebRTC SDK not loaded'); return; }
+// ── Login ──
+$('btnLogin').onclick = async () => {
+  $('liErr').classList.add('hidden');
+  const email=$('liEmail').value.trim(), password=$('liPass').value;
+  if(!email||!password) return;
   try {
-    log('fetching login token for agent '+agent+'…');
-    const r = await api('/api/agent/token?agent='+agent);
-    if (!r.ok){ log('token error '+r.status); return; }
-    const { login_token, name } = await r.json();
-    log('got token for '+name+', connecting…');
+    const r = await fetch('/api/login',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email,password}) });
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.error||'login failed');
+    TOKEN=j.token; USER=j.user;
+    localStorage.setItem('trinity_token',TOKEN); localStorage.setItem('trinity_user',JSON.stringify(USER));
+    route();
+  } catch(e){ $('liErr').textContent=e.message; $('liErr').classList.remove('hidden'); }
+};
+$('liPass').addEventListener('keydown', e=>{ if(e.key==='Enter') $('btnLogin').click(); });
 
-    client = new TelnyxRTC({ login_token });
+function route(){
+  if(!TOKEN||!USER){ show('login'); return; }
+  if(USER.role==='admin'){ show('admin'); $('adWho').textContent=USER.name+' · '+USER.email; loadAdmin(); }
+  else { show('agent'); $('agWho').textContent=USER.name+' · '+USER.email; startAgent(); }
+}
+
+// ── Agent softphone ──
+function getTelnyxRTC(){ const g=window.TelnyxWebRTC||window.telnyxWebRTC||window.TelnyxRTC||window.telnyx; if(!g)return null; return g.TelnyxRTC||(g.default&&g.default.TelnyxRTC)||g; }
+
+function setAgentUI(s){
+  serverState=s;
+  const map={ OFFLINE:['','Offline'], CONNECTING:['busy','Connecting…'], AVAILABLE:['on','Available'],
+              CLAIMING:['busy','Preparing call…'], DIALING:['busy','Dialing lead…'], ON_CALL:['call','On call'] };
+  const [cls,txt]=map[s]||['','—'];
+  $('agDot').className='dot '+cls; $('agState').textContent=txt;
+  $('agHang').disabled = !(s==='DIALING'||s==='ON_CALL');
+}
+
+async function startAgent(){
+  setAgentUI('CONNECTING');
+  const TelnyxRTC = getTelnyxRTC();
+  if(!TelnyxRTC){ log('ERROR: Telnyx WebRTC SDK not loaded'); return; }
+  try {
+    log('fetching softphone token…');
+    const j = await apiJson('/api/agent/token');
+    log('got token for '+j.name+', connecting…');
+    client = new TelnyxRTC({ login_token: j.login_token });
     client.remoteElement = 'remoteAudio';
-    client.on('telnyx.ready', () => { $('regPill').textContent='registered'; log('registered ✓'); startPoll(); setState(serverState); });
-    client.on('telnyx.error', (e) => log('telnyx.error: '+(e&&e.error&&e.error.message||JSON.stringify(e))));
-    client.on('telnyx.socket.close', () => { $('regPill').textContent='disconnected'; });
-    client.on('telnyx.notification', (n) => {
-      if (n.type==='callUpdate' && n.call){
-        currentCall = n.call;
-        const st = n.call.state;
-        log('call: '+st+' ('+(n.call.direction||'')+')');
-        if (st==='ringing' && n.call.direction==='inbound'){ log('auto-answering agent leg'); n.call.answer(); }
+    client.on('telnyx.ready', async () => {
+      $('agReg').textContent='softphone: registered';
+      log('registered ✓ — going available');
+      try { const a = await apiJson('/api/agent/available','POST',{}); log('available -> '+(a.state||'ok')); } catch(e){ log('available error: '+e.message); }
+      startPoll();
+    });
+    client.on('telnyx.error', e => log('telnyx.error: '+(e&&e.error&&e.error.message||JSON.stringify(e))));
+    client.on('telnyx.socket.close', () => { $('agReg').textContent='softphone: disconnected'; });
+    client.on('telnyx.notification', n => {
+      if(n.type==='callUpdate' && n.call){
+        const st=n.call.state;
+        log('softphone call: '+st+' ('+(n.call.direction||'')+')');
+        if(st==='ringing' && n.call.direction==='inbound'){ log('auto-answering agent leg'); n.call.answer(); }
       }
     });
     client.connect();
   } catch(e){ log('connect failed: '+e.message); }
-};
-
-$('btnAvail').onclick = async () => {
-  log('going available…');
-  const r = await api('/api/agent/available', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent}) });
-  const j = await r.json(); log('available -> '+(j.state||j.error||'ok'));
-};
-$('btnDial').onclick = async () => {
-  const to = $('dialNum').value.trim(); if(!to){ log('enter a number'); return; }
-  log('dialing '+to+'…');
-  const r = await api('/api/dial', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent,to}) });
-  const j = await r.json(); if(!r.ok) log('dial error: '+(j.error||r.status)); else log('originated '+j.call_control_id);
-};
-$('btnHang').onclick = async () => {
-  log('hangup…');
-  await api('/api/hangup', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent}) });
-};
+}
 
 function startPoll(){
-  if (poll) clearInterval(poll);
+  if(poll) clearInterval(poll);
   poll = setInterval(async () => {
-    try { const r = await api('/api/agent/status?agent='+agent); if(r.ok){ const j=await r.json(); if(j.state!==serverState) setState(j.state); } } catch{}
+    try {
+      const j = await apiJson('/api/agent/status');
+      if(j.state!==serverState) setAgentUI(j.state);
+      $('agLead').textContent = j.leadNumber ? ('Calling '+j.leadNumber+(j.fromNumber?(' · caller ID '+j.fromNumber):'')) : 'No active call';
+    } catch {}
   }, 1500);
 }
 
-setState('OFFLINE');
-window.addEventListener('load', () => { if(!getTelnyxRTC()) log('warning: SDK global not found yet'); else log('SDK loaded'); });
+$('agHang').onclick = async () => { log('hangup…'); try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ log(e.message); } };
+$('agBreak').onclick = async () => {
+  if($('agBreak').dataset.on==='1'){ // resume
+    $('agBreak').textContent='Go on break'; $('agBreak').dataset.on=''; $('agBreak').className='amber';
+    startAgent();
+  } else {
+    try{ await apiJson('/api/agent/offline','POST',{}); }catch(e){ log(e.message); }
+    if(client){ try{client.disconnect();}catch{} } if(poll)clearInterval(poll);
+    setAgentUI('OFFLINE'); $('agReg').textContent='softphone: —'; $('agLead').textContent='On break';
+    $('agBreak').textContent='Resume'; $('agBreak').dataset.on='1'; $('agBreak').className='grn';
+  }
+};
+
+// ── Admin ──
+async function loadAdmin(){ await Promise.all([loadUsers(), loadCampaigns()]); }
+
+async function loadUsers(){
+  const j = await apiJson('/api/admin/users'); usersCache=j.users;
+  const tb=$('usersTbl').querySelector('tbody'); tb.innerHTML='';
+  j.users.forEach(u=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${esc(u.name)}</td><td class="muted">${esc(u.email||'')}</td><td>${u.role}</td><td><span class="pill">${u.state||'OFFLINE'}</span></td>`;
+    tb.appendChild(tr);
+  });
+}
+$('btnAddUser').onclick = async () => {
+  $('uErr').classList.add('hidden');
+  const body={ name:$('uName').value.trim(), email:$('uEmail').value.trim(), password:$('uPass').value, role:$('uRole').value };
+  if(!body.name||!body.email||!body.password){ $('uErr').textContent='fill all fields'; $('uErr').classList.remove('hidden'); return; }
+  $('btnAddUser').disabled=true; $('btnAddUser').textContent='Creating…';
+  try { await apiJson('/api/admin/users','POST',body); $('uName').value=$('uEmail').value=$('uPass').value=''; await loadUsers(); }
+  catch(e){ $('uErr').textContent=e.message; $('uErr').classList.remove('hidden'); }
+  finally { $('btnAddUser').disabled=false; $('btnAddUser').textContent='Create user (+ Telnyx credential)'; }
+};
+
+$('btnAddCamp').onclick = async () => {
+  const name=$('cName').value.trim(); if(!name) return;
+  $('btnAddCamp').disabled=true;
+  try { await apiJson('/api/admin/campaigns','POST',{name}); $('cName').value=''; await loadCampaigns(); }
+  catch(e){ alert(e.message); } finally { $('btnAddCamp').disabled=false; }
+};
+
+async function loadCampaigns(){
+  const j = await apiJson('/api/admin/campaigns');
+  const wrap=$('campList'); wrap.innerHTML='';
+  if(!j.campaigns.length){ wrap.innerHTML='<div class="muted">No campaigns yet.</div>'; return; }
+  const agents = usersCache.filter(u=>u.role==='agent');
+  j.campaigns.forEach(c=>{
+    const el=document.createElement('div'); el.className='card'; el.style.marginBottom='12px';
+    const assigned = c.agent_ids||[];
+    const st = c.lead_status||{};
+    const statusLine = Object.keys(st).length ? Object.entries(st).map(([k,v])=>k+':'+v).join('  ') : 'no leads';
+    el.innerHTML = `
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <b style="font-size:15px">${esc(c.name)}</b>
+        <span class="pill ${c.status}">${c.status}</span>
+        <span class="muted" style="margin-left:auto;font-size:12px">${c.lead_total} leads · ${statusLine}</span>
+      </div>
+      <div class="chips" data-assigned></div>
+      <div class="row mt">
+        <select data-agentsel>${agents.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
+        <button class="sm" data-assign style="flex:0 0 auto">Assign agent</button>
+      </div>
+      <div class="row mt">
+        <input type="file" accept=".csv" data-csv />
+        <button class="sm gray" data-upload style="flex:0 0 auto">Upload leads CSV</button>
+      </div>
+      <div class="row mt">
+        <button class="grn sm" data-act="start">Start</button>
+        <button class="amber sm" data-act="pause">Pause</button>
+        <button class="red sm" data-act="stop">Stop</button>
+        <button class="gray sm" data-act="reset">Reset</button>
+      </div>
+      <div class="muted mt" data-msg style="font-size:12px"></div>`;
+    // assigned chips
+    const chips = el.querySelector('[data-assigned]');
+    if(assigned.length){
+      assigned.forEach(aid=>{
+        const u=usersCache.find(x=>x.id===aid); const chip=document.createElement('span'); chip.className='chip';
+        chip.innerHTML=`<b>${esc(u?u.name:aid.slice(0,8))}</b> <span data-rm style="cursor:pointer;color:var(--red)">✕</span>`;
+        chip.querySelector('[data-rm]').onclick=async()=>{ await apiJson(`/api/admin/campaigns/${c.id}/agents/${aid}`,'DELETE'); loadCampaigns(); };
+        chips.appendChild(chip);
+      });
+    } else chips.innerHTML='<span class="muted" style="font-size:12px">no agents assigned</span>';
+
+    const msg=(m)=>{ el.querySelector('[data-msg]').textContent=m; };
+    el.querySelector('[data-assign]').onclick=async()=>{ const aid=el.querySelector('[data-agentsel]').value; if(!aid)return; try{ await apiJson(`/api/admin/campaigns/${c.id}/agents`,'POST',{agent_id:aid}); loadCampaigns(); }catch(e){ msg(e.message); } };
+    el.querySelector('[data-upload]').onclick=async()=>{
+      const f=el.querySelector('[data-csv]').files[0]; if(!f){ msg('choose a CSV first'); return; }
+      msg('uploading…');
+      const text=await f.text();
+      try{ const r=await api(`/api/admin/campaigns/${c.id}/leads`,{ method:'POST', headers:{'Content-Type':'text/csv'}, body:text }); const jj=await r.json(); if(!r.ok)throw new Error(jj.error||'upload failed'); msg(`inserted ${jj.inserted} leads${jj.skipped?(' · skipped '+jj.skipped):''}`); loadCampaigns(); }catch(e){ msg(e.message); }
+    };
+    el.querySelectorAll('[data-act]').forEach(b=>b.onclick=async()=>{ try{ await apiJson(`/api/admin/campaigns/${c.id}/${b.dataset.act}`,'POST',{}); loadCampaigns(); }catch(e){ msg(e.message); } });
+    wrap.appendChild(el);
+  });
+}
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// boot
+route();
 </script>
 </body>
 </html>
