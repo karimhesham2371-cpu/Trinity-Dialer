@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Trinity Dialer — Agent</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171c24; --line:#232a35; --txt:#e6edf3; --mut:#8b95a5;
+          --grn:#2ea043; --red:#da3633; --blu:#2f81f7; --amber:#d29922; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  .wrap { max-width:520px; margin:32px auto; padding:0 16px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--mut); margin:0 0 20px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:0 0 4px; }
+  input, select { width:100%; padding:9px 11px; background:#0e1116; border:1px solid var(--line);
+                  border-radius:8px; color:var(--txt); font-size:14px; }
+  .row { display:flex; gap:10px; }
+  .row > * { flex:1; }
+  button { padding:10px 14px; border:0; border-radius:8px; font-size:14px; font-weight:600;
+           cursor:pointer; color:#fff; background:var(--blu); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button.grn { background:var(--grn); } button.red { background:var(--red); } button.gray{ background:#30363d; }
+  .status { display:flex; align-items:center; gap:8px; font-weight:600; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--mut); }
+  .dot.on { background:var(--grn); } .dot.busy { background:var(--amber); } .dot.call{ background:var(--blu); }
+  .pill { font-size:12px; padding:2px 8px; border-radius:99px; background:#0e1116; border:1px solid var(--line); color:var(--mut); }
+  #log { font:12px/1.5 ui-monospace,Menlo,monospace; color:var(--mut); background:#0b0e13;
+         border:1px solid var(--line); border-radius:8px; padding:10px; height:150px; overflow:auto; white-space:pre-wrap; }
+  .mt { margin-top:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Trinity Dialer</h1>
+  <p class="sub">Agent softphone · Phase 1</p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Access token</label>
+        <input id="accessTok" type="password" placeholder="WH_TOKEN" />
+      </div>
+      <div style="flex:0 0 120px">
+        <label>Agent</label>
+        <select id="agentSlot"><option value="1">Agent 1</option><option value="2">Agent 2</option></select>
+      </div>
+    </div>
+    <button id="btnConnect" class="mt" style="width:100%">Connect softphone</button>
+  </div>
+
+  <div class="card">
+    <div class="status"><span id="dot" class="dot"></span><span id="stateTxt">Not connected</span>
+      <span id="regPill" class="pill" style="margin-left:auto">unregistered</span></div>
+    <button id="btnAvail" class="grn mt" style="width:100%" disabled>Go Available</button>
+  </div>
+
+  <div class="card">
+    <label>Lead number</label>
+    <input id="dialNum" type="tel" placeholder="+1..." />
+    <div class="row mt">
+      <button id="btnDial" disabled>Dial</button>
+      <button id="btnHang" class="red" disabled>Hang up</button>
+    </div>
+  </div>
+
+  <div id="log"></div>
+</div>
+
+<audio id="remoteAudio" autoplay></audio>
+<script src="https://unpkg.com/@telnyx/webrtc/lib/bundle.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+function log(m){ const el=$('log'); el.textContent += (new Date().toLocaleTimeString()+'  '+m+'\n'); el.scrollTop=el.scrollHeight; }
+
+let client=null, currentCall=null, agent='1', accessTok='', poll=null, serverState='OFFLINE';
+
+function api(pathQ, opts){ return fetch(pathQ + (pathQ.includes('?')?'&':'?') + 'token=' + encodeURIComponent(accessTok), opts); }
+
+function setState(s){
+  serverState = s;
+  const dot=$('dot'), t=$('stateTxt');
+  const map={ OFFLINE:['','Offline'], CONNECTING:['busy','Connecting…'], AVAILABLE:['on','Available'],
+              DIALING:['busy','Dialing…'], ON_CALL:['call','On call'] };
+  const [cls,txt]=map[s]||['','—'];
+  dot.className='dot '+cls; t.textContent=txt;
+  $('btnDial').disabled = (s!=='AVAILABLE');
+  $('btnHang').disabled = !(s==='DIALING'||s==='ON_CALL');
+  $('btnAvail').disabled = (s!=='OFFLINE') || !client;
+}
+
+// Resolve the UMD global regardless of exact name
+function getTelnyxRTC(){
+  const g = window.TelnyxWebRTC || window.telnyxWebRTC || window.TelnyxRTC || window.telnyx;
+  if (!g) return null;
+  return g.TelnyxRTC || (g.default && g.default.TelnyxRTC) || g;
+}
+
+$('btnConnect').onclick = async () => {
+  accessTok = $('accessTok').value.trim();
+  agent = $('agentSlot').value;
+  if (!accessTok) { log('enter access token'); return; }
+  const TelnyxRTC = getTelnyxRTC();
+  if (!TelnyxRTC) { log('ERROR: Telnyx WebRTC SDK not loaded'); return; }
+  try {
+    log('fetching login token for agent '+agent+'…');
+    const r = await api('/api/agent/token&agent='+agent);
+    if (!r.ok){ log('token error '+r.status); return; }
+    const { login_token, name } = await r.json();
+    log('got token for '+name+', connecting…');
+
+    client = new TelnyxRTC({ login_token });
+    client.remoteElement = 'remoteAudio';
+    client.on('telnyx.ready', () => { $('regPill').textContent='registered'; log('registered ✓'); startPoll(); setState(serverState); });
+    client.on('telnyx.error', (e) => log('telnyx.error: '+(e&&e.error&&e.error.message||JSON.stringify(e))));
+    client.on('telnyx.socket.close', () => { $('regPill').textContent='disconnected'; });
+    client.on('telnyx.notification', (n) => {
+      if (n.type==='callUpdate' && n.call){
+        currentCall = n.call;
+        const st = n.call.state;
+        log('call: '+st+' ('+(n.call.direction||'')+')');
+        if (st==='ringing' && n.call.direction==='inbound'){ log('auto-answering agent leg'); n.call.answer(); }
+      }
+    });
+    client.connect();
+  } catch(e){ log('connect failed: '+e.message); }
+};
+
+$('btnAvail').onclick = async () => {
+  log('going available…');
+  const r = await api('/api/agent/available', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent}) });
+  const j = await r.json(); log('available -> '+(j.state||j.error||'ok'));
+};
+$('btnDial').onclick = async () => {
+  const to = $('dialNum').value.trim(); if(!to){ log('enter a number'); return; }
+  log('dialing '+to+'…');
+  const r = await api('/api/dial', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent,to}) });
+  const j = await r.json(); if(!r.ok) log('dial error: '+(j.error||r.status)); else log('originated '+j.call_control_id);
+};
+$('btnHang').onclick = async () => {
+  log('hangup…');
+  await api('/api/hangup', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({agent}) });
+};
+
+function startPoll(){
+  if (poll) clearInterval(poll);
+  poll = setInterval(async () => {
+    try { const r = await api('/api/agent/status&agent='+agent); if(r.ok){ const j=await r.json(); if(j.state!==serverState) setState(j.state); } } catch{}
+  }, 1500);
+}
+
+setState('OFFLINE');
+window.addEventListener('load', () => { if(!getTelnyxRTC()) log('warning: SDK global not found yet'); else log('SDK loaded'); });
+</script>
+</body>
+</html>
