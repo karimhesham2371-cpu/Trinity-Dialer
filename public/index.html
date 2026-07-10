@@ -1359,11 +1359,27 @@ async function renderNumbers(){
       <td style="min-width:200px">${campSel(d.campaign_id).replace('__ID__',d.id)}</td>
       <td style="text-align:right"><button class="btn btn-sm btn-danger" data-deldid="${d.id}">Delete</button></td>
     </tr>`).join('')||'<tr><td colspan="5" class="dim">No numbers yet.</td></tr>';
-  $('ldBody').innerHTML=`<div class="card"><h2>Add a number</h2>
-      <p class="dim" style="font-size:12px;margin-bottom:8px">Add your Telnyx numbers here, then assign each to a campaign. Inbound calls to an assigned number ring a random available agent working that campaign.</p>
+  $('ldBody').innerHTML=`<div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center;gap:12px">
+        <h2 style="margin:0">Add a number</h2>
+        <div class="row" style="gap:8px;flex:0 0 auto">
+          <button class="btn btn-sm" id="ndSync">Sync from Telnyx</button>
+          <button class="btn btn-sm btn-primary" id="ndOrderToggle">Order numbers</button>
+        </div>
+      </div>
+      <p class="dim" style="font-size:12px;margin:8px 0">Add a number you already own, <b>Sync from Telnyx</b> to import every number on this dialer's connection, or <b>Order numbers</b> to buy new ones. Then assign each to a campaign — inbound calls to an assigned number ring a random available agent working that campaign.</p>
       <div class="row" style="gap:12px"><input id="ndNum" class="field" placeholder="+15551234567" style="max-width:220px">
         <button class="btn btn-primary" id="ndAdd" style="flex:0 0 auto">Add number</button></div>
       <p id="ndErr" class="err mt hidden"></p></div>
+    <div class="card mt hidden" id="orderPanel">
+      <h2>Order new numbers</h2>
+      <p class="dim" style="font-size:12px;margin:6px 0 10px">Search Telnyx inventory by area code. Ordering <b>charges your Telnyx account</b> and assigns the number to this dialer automatically. Prices below are per number.</p>
+      <div class="row" style="gap:8px;align-items:flex-end">
+        <div class="fw" style="flex:0 0 160px"><span class="lbl">Area code</span><input id="ocArea" class="field mono" placeholder="415" maxlength="3" inputmode="numeric"></div>
+        <button class="btn btn-primary" id="ocSearch" style="flex:0 0 auto">Search</button>
+      </div>
+      <div id="ocResults" class="mt3"></div>
+    </div>
     <div class="card mt"><h2>Numbers</h2>
       <div class="tblwrap"><table><thead><tr><th>Number</th><th>State</th><th>Status</th><th>Assigned campaign</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table></div></div>`;
@@ -1371,9 +1387,61 @@ async function renderNumbers(){
   $('ndAdd').onclick=async()=>{ $('ndErr').classList.add('hidden'); const num=$('ndNum').value.trim(); if(!num){return;}
     try{ await apiJson('/api/admin/dids','POST',{phone_number:num}); $('ndNum').value=''; renderNumbers(); toast('Number added'); }
     catch(e){ $('ndErr').textContent=e.message; $('ndErr').classList.remove('hidden'); } };
+  $('ndSync').onclick=async()=>{ const b=$('ndSync'); b.disabled=true; b.textContent='Syncing…';
+    try{ const j=await apiJson('/api/admin/telnyx/sync','POST',{}); toast(`Synced — ${j.added} new of ${j.owned} on Telnyx`); renderNumbers(); }
+    catch(e){ toast(e.message,'err'); b.disabled=false; b.textContent='Sync from Telnyx'; } };
+  $('ndOrderToggle').onclick=()=>{ $('orderPanel').classList.toggle('hidden'); if(!$('orderPanel').classList.contains('hidden')) $('ocArea').focus(); };
+  $('ocSearch').onclick=searchAvailableNumbers;
+  $('ocArea').addEventListener('keydown',e=>{ if(e.key==='Enter') searchAvailableNumbers(); });
   $('ldBody').querySelectorAll('[data-assign]').forEach(s=>s.onchange=async()=>{
     try{ await apiJson('/api/admin/dids/'+s.dataset.assign,'PATCH',{campaign_id:s.value||null}); toast('Assignment saved'); }catch(e){ toast(e.message,'err'); } });
   $('ldBody').querySelectorAll('[data-deldid]').forEach(b=>b.onclick=async()=>{ if(!confirm('Delete this number?'))return; try{ await apiJson('/api/admin/dids/'+b.dataset.deldid,'DELETE'); renderNumbers(); }catch(e){ toast(e.message,'err'); } });
+}
+let availNumbers=[];
+const money=(v,c)=>{ const n=parseFloat(v); return isNaN(n)?'—':(c==='USD'||!c?'$':'')+n.toFixed(2)+(c&&c!=='USD'?' '+c:''); };
+async function searchAvailableNumbers(){
+  const area=($('ocArea').value||'').replace(/\D/g,'').slice(0,3);
+  const R=$('ocResults');
+  if(area.length!==3){ R.innerHTML='<p class="err">Enter a 3-digit area code.</p>'; return; }
+  R.innerHTML='<p class="dim">Searching Telnyx…</p>';
+  try{
+    const j=await apiJson('/api/admin/telnyx/available?area_code='+area+'&limit=25');
+    availNumbers=j.numbers||[];
+    if(!availNumbers.length){ R.innerHTML='<p class="dim">No numbers available for area code '+esc(area)+'.</p>'; return; }
+    const rows=availNumbers.map((n,i)=>`<tr>
+        <td><input type="checkbox" class="ocChk" data-i="${i}"></td>
+        <td class="mono">${esc(n.phone_number)}</td>
+        <td class="dim">${esc(n.region||'—')}</td>
+        <td class="mono">${money(n.upfront_cost,n.currency)}</td>
+        <td class="mono">${money(n.monthly_cost,n.currency)}/mo</td>
+      </tr>`).join('');
+    R.innerHTML=`<div class="tblwrap"><table><thead><tr><th></th><th>Number</th><th>Region</th><th>Upfront</th><th>Monthly</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="row mt3" style="justify-content:space-between;align-items:center;gap:12px">
+        <span id="ocSummary" class="dim" style="font-size:13px">None selected</span>
+        <button class="btn btn-primary" id="ocOrder" disabled>Order selected</button>
+      </div>`;
+    enhanceAll(R);
+    const upd=()=>{ const sel=[...R.querySelectorAll('.ocChk:checked')].map(c=>availNumbers[+c.dataset.i]);
+      const up=sel.reduce((s,n)=>s+(parseFloat(n.upfront_cost)||0),0);
+      const mo=sel.reduce((s,n)=>s+(parseFloat(n.monthly_cost)||0),0);
+      $('ocSummary').textContent=sel.length?`${sel.length} selected — ${money(up)} upfront + ${money(mo)}/mo`:'None selected';
+      $('ocOrder').disabled=!sel.length; };
+    R.querySelectorAll('.ocChk').forEach(c=>c.onchange=upd);
+    $('ocOrder').onclick=()=>orderSelectedNumbers(R);
+  }catch(e){ R.innerHTML='<p class="err">'+esc(e.message)+'</p>'; }
+}
+async function orderSelectedNumbers(R){
+  const sel=[...R.querySelectorAll('.ocChk:checked')].map(c=>availNumbers[+c.dataset.i]);
+  if(!sel.length) return;
+  const up=sel.reduce((s,n)=>s+(parseFloat(n.upfront_cost)||0),0);
+  const mo=sel.reduce((s,n)=>s+(parseFloat(n.monthly_cost)||0),0);
+  if(!confirm(`Order ${sel.length} number(s) on Telnyx?\n\nUpfront: ${money(up)}\nMonthly: ${money(mo)}/mo\n\nThis charges your Telnyx account.`)) return;
+  const btn=$('ocOrder'); btn.disabled=true; btn.textContent='Ordering…';
+  try{
+    const j=await apiJson('/api/admin/telnyx/order','POST',{phone_numbers:sel.map(n=>n.phone_number)});
+    toast(`Ordered ${j.ordered.length} number(s) — status ${j.status}`);
+    renderNumbers();
+  }catch(e){ toast(e.message,'err'); btn.disabled=false; btn.textContent='Order selected'; }
 }
 function addFilterRow(){
   const wrap=$('plFilters'); const row=document.createElement('div'); row.className='row plfilter'; row.style.cssText='gap:8px;margin-top:6px;align-items:center';

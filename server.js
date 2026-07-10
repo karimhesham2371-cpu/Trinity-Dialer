@@ -994,6 +994,105 @@ app.delete('/api/admin/dids/:id', auth, adminOnly, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ══ TELNYX NUMBER MANAGEMENT ═════════════════════════════════════════════════════
+// Every number the Telnyx account owns on THIS dialer's Call-Control connection.
+async function telnyxListOwned() {
+  if (!TELNYX_KEY || !CONNECTION_ID) return [];
+  const out = [];
+  for (let page = 1; page <= 40; page++) {   // hard cap 10k numbers
+    const r = await telnyx('GET',
+      `/phone_numbers?filter[connection_id]=${CONNECTION_ID}&page[number]=${page}&page[size]=250`);
+    const rows = r.data || [];
+    for (const n of rows) out.push({
+      id: n.id, phone_number: n.phone_number, status: n.status,
+      connection_id: n.connection_id || null,
+    });
+    if (rows.length < 250) break;
+  }
+  return out;
+}
+
+// List owned numbers, flagged with whether they're already imported into `dids`.
+app.get('/api/admin/telnyx/numbers', auth, adminOnly, async (_req, res) => {
+  try {
+    const [owned, dids] = await Promise.all([
+      telnyxListOwned(), sbSelect('dids', 'select=phone_number'),
+    ]);
+    const have = new Set((dids || []).map(d => d.phone_number));
+    res.json({ numbers: owned.map(n => ({ ...n, in_dialer: have.has(n.phone_number) })) });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+// Pull every owned number on the connection into `dids` (skips ones already there).
+app.post('/api/admin/telnyx/sync', auth, adminOnly, async (req, res) => {
+  try {
+    const owned = await telnyxListOwned();
+    let added = 0;
+    for (const n of owned) {
+      const num = n.phone_number; if (!num) continue;
+      const area = areaCodeOf(num);
+      const derived = deriveFromAreaCode(area || '');
+      const r = await sbReq('POST', 'dids?on_conflict=phone_number',
+        { phone_number: num, area_code: area, state: derived.state || null, active: true },
+        'resolution=ignore-duplicates,return=representation');
+      if (Array.isArray(r) && r.length) added++;   // representation returns only new inserts
+    }
+    audit(req.user, 'SYNC_DIDS', { target_type: 'did', meta: { owned: owned.length, added } });
+    res.json({ ok: true, owned: owned.length, added });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+// Search Telnyx inventory for available numbers by area code, with per-number cost.
+app.get('/api/admin/telnyx/available', auth, adminOnly, async (req, res) => {
+  if (!TELNYX_KEY) return res.status(400).json({ error: 'Telnyx not configured' });
+  const area = String(req.query.area_code || '').replace(/[^\d]/g, '').slice(0, 3);
+  if (area.length !== 3) return res.status(400).json({ error: 'area_code must be 3 digits' });
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+  try {
+    const r = await telnyx('GET',
+      `/available_phone_numbers?filter[national_destination_code]=${area}` +
+      `&filter[country_code]=US&filter[features][]=voice&filter[limit]=${limit}`);
+    const numbers = (r.data || []).map(n => ({
+      phone_number: n.phone_number,
+      upfront_cost: n.cost_information && n.cost_information.upfront_cost,
+      monthly_cost: n.cost_information && n.cost_information.monthly_cost,
+      currency: (n.cost_information && n.cost_information.currency) || 'USD',
+      region: (n.region_information || []).map(x => x.region_name).filter(Boolean).join(', '),
+    }));
+    res.json({ numbers });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+// Purchase one or more numbers on Telnyx, assign them to this dialer's connection,
+// and import them into `dids`. Actual billing happens on the Telnyx account.
+app.post('/api/admin/telnyx/order', auth, adminOnly, async (req, res) => {
+  if (!TELNYX_KEY || !CONNECTION_ID) return res.status(400).json({ error: 'Telnyx not configured' });
+  const list = Array.isArray(req.body && req.body.phone_numbers) ? req.body.phone_numbers : [];
+  const nums = [...new Set(list.map(x => normPhone(String(x || ''))).filter(Boolean))];
+  if (!nums.length) return res.status(400).json({ error: 'phone_numbers required' });
+  if (nums.length > 10) return res.status(400).json({ error: 'max 10 numbers per order' });
+  try {
+    const order = await telnyx('POST', '/number_orders', {
+      phone_numbers: nums.map(phone_number => ({ phone_number })),
+      connection_id: CONNECTION_ID,   // voice assignment happens here, on Telnyx
+    });
+    const od = order.data || {};
+    // Import ordered numbers into dids so they're immediately usable in the dialer.
+    let added = 0;
+    for (const num of nums) {
+      const area = areaCodeOf(num);
+      const derived = deriveFromAreaCode(area || '');
+      const r = await sbReq('POST', 'dids?on_conflict=phone_number',
+        { phone_number: num, area_code: area, state: derived.state || null, active: true },
+        'resolution=ignore-duplicates,return=representation');
+      if (Array.isArray(r) && r.length) added++;
+    }
+    refreshCallerPool().catch(() => {});
+    audit(req.user, 'ORDER_DIDS', { target_type: 'did', meta: { numbers: nums, order_id: od.id, status: od.status } });
+    res.json({ ok: true, order_id: od.id || null, status: od.status || 'pending', ordered: nums, added });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 // ── DNC list management (view / search / export / remove w/ confirm) ──────────
 app.get('/api/admin/dnc', auth, adminOnly, async (req, res) => {
   const q = String(req.query.q || '').replace(/[^\d]/g, '');
