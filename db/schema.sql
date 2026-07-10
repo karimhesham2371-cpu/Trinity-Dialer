@@ -409,3 +409,10 @@ insert into playlist_campaigns (playlist_id, campaign_id)
 -- Assign a DID to exactly one campaign (for inbound routing). NULL = unassigned.
 alter table dids add column if not exists campaign_id uuid references campaigns(id) on delete set null;
 create index if not exists dids_campaign_idx on dids (campaign_id);
+
+-- v7 — Per-playlist CPA (calls-per-agent) override.
+-- How many leads to ring SIMULTANEOUSLY for each free agent working this
+-- playlist. NULL = inherit the global default (app_settings 'dialer'). 1 = pure
+-- power dialing (no abandoned calls); higher cuts inter-call wait but can drop
+-- extra legs when a human answers first. Enforced range 1-5 in the app layer.
+alter table playlists add column if not exists lines_per_agent int;

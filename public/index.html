@@ -1296,6 +1296,11 @@ async function renderPlaylists(){
         <b style="font:600 15px var(--font-ui)">${esc(p.name)}</b>
         <span class="pill pill--${p.active?'ok':'faint'}">${p.active?'active':'paused'}</span>
         <span class="pill pill--faint">priority ${p.priority}</span>
+        <label class="dim" style="font-size:12px;display:flex;align-items:center;gap:5px">CPA
+          <select class="field" data-plcpa="${p.id}" style="padding:2px 6px;height:auto;width:auto">
+            <option value=""${p.lines_per_agent==null?' selected':''}>Default</option>
+            ${[1,2,3,4,5].map(n=>`<option value="${n}"${p.lines_per_agent===n?' selected':''}>${n}</option>`).join('')}
+          </select></label>
         <span class="mono" data-plcount="${p.id}" style="margin-left:auto;color:var(--accent)"></span>
         <button class="btn btn-sm" data-togglepl="${p.id}:${p.active?0:1}">${p.active?'Pause':'Activate'}</button>
         <button class="btn btn-sm btn-danger" data-delpl="${p.id}">Delete</button>
@@ -1314,6 +1319,7 @@ async function renderPlaylists(){
       <div class="row" style="gap:12px;flex-wrap:wrap">
         <div class="fw" style="flex:2"><span class="lbl">Name</span><input id="plName" class="field" placeholder="e.g. Kimo's list"></div>
         <div class="fw"><span class="lbl">Priority 1–9</span><input id="plPri" class="field mono" type="number" min="1" max="9" value="5"></div>
+        <div class="fw"><span class="lbl">CPA (calls/agent)</span><select id="plCpa" class="field"><option value="">Default (global)</option><option value="1">1 — power</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select></div>
       </div>
       <div class="lbl mt3">Filters <span class="faint">— optional, applied across all campaigns in the playlist</span></div><div id="plFilters"></div>
       <button class="btn btn-sm mt2" id="plAddFilter">+ Add filter</button>
@@ -1325,12 +1331,14 @@ async function renderPlaylists(){
   addFilterRow();
   $('plCreate').onclick=async()=>{
     const body={ name:$('plName').value.trim(), priority:+$('plPri').value, filters:collectFilters() };
+    if($('plCpa').value) body.lines_per_agent=+$('plCpa').value;
     if(!body.name){ toast('Name required','err'); return; }
     try{ await apiJson('/api/admin/playlists','POST',body); toast('Playlist created'); renderPlaylists(); }catch(e){ toast(e.message,'err'); }
   };
   const B=$('ldBody');
   B.querySelectorAll('[data-delpl]').forEach(b=>b.onclick=async()=>{ if(!confirm('Delete this playlist?'))return; try{ await apiJson('/api/admin/playlists/'+b.dataset.delpl,'DELETE'); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
   B.querySelectorAll('[data-togglepl]').forEach(b=>b.onclick=async()=>{ const [id,act]=b.dataset.togglepl.split(':'); try{ await apiJson('/api/admin/playlists/'+id,'PATCH',{active:act==='1'}); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
+  B.querySelectorAll('[data-plcpa]').forEach(s=>s.onchange=async()=>{ try{ await apiJson('/api/admin/playlists/'+s.dataset.plcpa,'PATCH',{lines_per_agent:s.value===''?null:+s.value}); toast('CPA updated'); }catch(e){ toast(e.message,'err'); } });
   B.querySelectorAll('[data-addcamp]').forEach(s=>s.onchange=async()=>{ if(!s.value)return; try{ await apiJson('/api/admin/playlists/'+s.dataset.addcamp+'/campaigns','POST',{campaign_id:s.value}); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
   B.querySelectorAll('[data-rmcamp]').forEach(x=>x.onclick=async()=>{ const [pid,cid]=x.dataset.rmcamp.split(':'); try{ await apiJson('/api/admin/playlists/'+pid+'/campaigns/'+cid,'DELETE'); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
   B.querySelectorAll('[data-addagent]').forEach(s=>s.onchange=async()=>{ if(!s.value)return; try{ await apiJson('/api/admin/playlists/'+s.dataset.addagent+'/agents','POST',{agent_id:s.value}); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });

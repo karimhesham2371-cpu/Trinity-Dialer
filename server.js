@@ -875,20 +875,27 @@ app.get('/api/admin/playlists', auth, adminOnly, async (_req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/api/admin/playlists', auth, adminOnly, async (req, res) => {
-  const { name, priority, filters, selection_mode } = req.body || {};
+  const { name, priority, filters, selection_mode, lines_per_agent } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
+  const lpaRaw = parseInt(lines_per_agent, 10);
+  const lpa = (lpaRaw >= 1 && lpaRaw <= 5) ? lpaRaw : null;   // null = inherit global default
   try {
     const [row] = await sbInsert('playlists', {
       name, priority: Math.min(9, Math.max(1, priority || 5)),
       filters: filters || [], selection_mode: selection_mode || 'balanced',
+      lines_per_agent: lpa,
     });
     audit(req.user, 'ADD_PLAYLIST', { target_type: 'playlist', target_id: row.id, meta: { name } });
     res.json({ ok: true, playlist: row });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.patch('/api/admin/playlists/:pid', auth, adminOnly, async (req, res) => {
-  const allow = ['name','priority','weight','group_name','filters','selection_mode','active'];
+  const allow = ['name','priority','weight','group_name','filters','selection_mode','active','lines_per_agent'];
   const patch = {}; for (const k of allow) if (k in (req.body || {})) patch[k] = req.body[k];
+  if ('lines_per_agent' in patch) {
+    const n = parseInt(patch.lines_per_agent, 10);
+    patch.lines_per_agent = (n >= 1 && n <= 5) ? n : null;   // null = inherit global default
+  }
   try { const [row] = await sbUpdate('playlists', `id=eq.${req.params.pid}`, patch); res.json({ ok: true, playlist: row }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1595,7 +1602,7 @@ async function pacingTick() {
       if (!st || !st.conferenceId || st.leadLeg || st.inbound) return false;
       if (st.state !== 'AVAILABLE' && st.state !== 'DIALING') return false;
       const inFlight = st.pending ? Object.keys(st.pending).length : 0;
-      return inFlight < DIALER.lines_per_agent;
+      return inFlight < 5;   // hard max; real per-playlist CPA enforced in the loop
     });
     if (!freeAgents.length) return;
     const nowIso = new Date().toISOString();
@@ -1603,7 +1610,7 @@ async function pacingTick() {
     // Snapshot the routing model once per tick.
     const [runningCamps, playlists, plCamps, plAgents, legacyAssigns] = await Promise.all([
       sbSelect('campaigns', 'status=eq.RUNNING&select=id'),
-      sbSelect('playlists', 'active=eq.true&select=id,priority,filters'),
+      sbSelect('playlists', 'active=eq.true&select=id,priority,filters,lines_per_agent'),
       sbSelect('playlist_campaigns', 'select=playlist_id,campaign_id'),
       sbSelect('playlist_agents', 'select=playlist_id,agent_id'),
       sbSelect('campaign_agents', 'select=campaign_id,agent_id'),
@@ -1630,7 +1637,15 @@ async function pacingTick() {
       (legacyByAgent[agent_id] ||= []).push(campaign_id);
     }
 
+    // Per-playlist CPA (calls-per-agent). A playlist may override the global
+    // DIALER.lines_per_agent; null/invalid on the playlist = inherit global.
+    const cpaOf = (pl) => {
+      const n = pl && pl.lines_per_agent;
+      return (n >= 1 && n <= 5) ? n : DIALER.lines_per_agent;
+    };
+
     // Pick the next dialable lead for one agent, honouring its playlist priority.
+    // Returns { lead, playlist } (playlist is null for legacy campaign_agents).
     const pickLead = async (agentId) => {
       const agentPlaylists = playlistsByAgent[agentId];
       if (agentPlaylists && agentPlaylists.length) {
@@ -1638,26 +1653,34 @@ async function pacingTick() {
           const cids = campsByPlaylist[p.id];
           if (!cids || !cids.length) continue;
           const lead = await nextDialableLead(cids, p.filters, nowIso);
-          if (lead) return lead;
+          if (lead) return { lead, playlist: p };
         }
-        return null;
+        return { lead: null, playlist: null };
       }
-      return nextDialableLead(legacyByAgent[agentId] || [], [], nowIso);
+      return { lead: await nextDialableLead(legacyByAgent[agentId] || [], [], nowIso), playlist: null };
     };
 
     for (const agentId of freeAgents) {
       const st = rt[agentId];
       if (!st || !st.conferenceId || st.leadLeg || st.inbound) continue;
       if (st.state !== 'AVAILABLE' && st.state !== 'DIALING') continue;
-      // Top the agent up to `lines_per_agent` simultaneous ringing legs. Each
-      // dialLead marks its lead IN_PROGRESS before the next pick, so we never
-      // ring the same number twice.
-      let need = DIALER.lines_per_agent - (st.pending ? Object.keys(st.pending).length : 0);
+      const inFlight = st.pending ? Object.keys(st.pending).length : 0;
+      // First pick decides which playlist (and therefore which CPA) applies to
+      // this agent this tick. Each dialLead marks its lead IN_PROGRESS before the
+      // next pick, so we never ring the same number twice.
+      const first = await pickLead(agentId);
+      if (!first.lead) continue;                          // no dialable lead for this agent
+      const cpa = cpaOf(first.playlist);
+      if (inFlight >= cpa) continue;                       // already at this playlist's CPA
+      try { await dialLead(agentId, first.lead); }
+      catch (e) { console.error('[pacing:dial]', e.message); continue; }
+      // Top up to the playlist's CPA with additional simultaneous legs.
+      let need = cpa - inFlight - 1;
       while (need-- > 0) {
-        if (st.leadLeg || st.inbound) break;             // connected mid-loop → stop dialing
-        const lead = await pickLead(agentId);
-        if (!lead) break;                                 // no more leads for this agent
-        try { await dialLead(agentId, lead); }
+        if (st.leadLeg || st.inbound) break;              // connected mid-loop → stop dialing
+        const nxt = await pickLead(agentId);
+        if (!nxt.lead) break;                              // no more leads for this agent
+        try { await dialLead(agentId, nxt.lead); }
         catch (e) { console.error('[pacing:dial]', e.message); break; }
       }
     }
