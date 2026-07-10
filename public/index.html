@@ -1067,10 +1067,9 @@ function renderCallsTable(rows, emptyMsg){
       <td class="mono">${callTalk(r)}</td><td>${rec}</td></tr>`; }).join('');
   $('repBody').innerHTML=`<div class="tblwrap"><table><thead><tr><th>Time</th><th>Agent</th><th>From</th><th>To</th><th>Talk</th><th>Recording</th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
-async function listenRec(btn,id){ try{ const j=await apiJson('/api/admin/reports/recording/'+id);
-  btn.closest('td').innerHTML=`<audio class="mini" controls autoplay src="${j.url}"></audio>`; }catch(e){ toast(e.message,'err'); } }
-async function dlRec(id){ try{ const j=await apiJson('/api/admin/reports/recording/'+id+'?download=1');
-  const a=document.createElement('a'); a.href=j.url; a.target='_blank'; a.download=''; document.body.appendChild(a); a.click(); a.remove(); }catch(e){ toast(e.message,'err'); } }
+function recStreamUrl(id,dl){ return '/api/admin/reports/recording/'+id+'/stream?token='+encodeURIComponent(TOKEN)+(dl?'&download=1':''); }
+function listenRec(btn,id){ btn.closest('td').innerHTML=`<audio class="mini" controls autoplay src="${recStreamUrl(id,false)}"></audio>`; }
+function dlRec(id){ const a=document.createElement('a'); a.href=recStreamUrl(id,true); a.download=''; document.body.appendChild(a); a.click(); a.remove(); }
 function initCalls(){
   $('repFilters').innerHTML=`
     <div class="fw"><span class="lbl">From</span><input id="fClFrom" class="field" type="datetime-local"></div>

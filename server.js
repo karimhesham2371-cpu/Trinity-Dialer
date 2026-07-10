@@ -169,8 +169,11 @@ function signToken(a) {
 }
 function auth(req, res, next) {
   const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
-  if (!m) return res.sendStatus(401);
-  try { req.user = jwt.verify(m[1], JWT_SECRET); next(); }
+  // Header token normally; fall back to ?token= for browser-native GETs
+  // (e.g. <audio src>, download links) that can't set an Authorization header.
+  const token = m ? m[1] : (req.query && req.query.token);
+  if (!token) return res.sendStatus(401);
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
   catch { return res.sendStatus(401); }
 }
 function adminOnly(req, res, next) {
@@ -1211,6 +1214,38 @@ app.get('/api/admin/reports/recording/:id', auth, adminOnly, async (req, res) =>
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Stream a recording THROUGH the server so the browser can play/download it.
+// Telnyx `recording_urls` (api.telnyx.com) require an Authorization: Bearer header
+// that an <audio> tag / anchor can't send — so those play as 0:00/0:00 if handed
+// to the browser directly. We fetch server-side (with the key when needed) and
+// pipe the bytes back over our own https origin. Auth via ?token= (see auth()).
+app.get('/api/admin/reports/recording/:id/stream', auth, adminOnly, async (req, res) => {
+  try {
+    const rows = await sbSelect('calls', `id=eq.${req.params.id}&select=id,recording_url,to_number`);
+    const c = rows[0];
+    if (!c || !c.recording_url) return res.status(404).json({ error: 'no recording' });
+    const isTelnyx = /telnyx\.com/i.test(c.recording_url);
+    const upstream = await fetch(c.recording_url, {
+      headers: isTelnyx ? { 'Authorization': `Bearer ${TELNYX_KEY}` } : {},
+    });
+    if (!upstream.ok || !upstream.body) {
+      return res.status(502).json({ error: `recording fetch ${upstream.status}` });
+    }
+    const download = req.query.download === '1';
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'audio/mpeg');
+    const len = upstream.headers.get('content-length'); if (len) res.setHeader('Content-Length', len);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    if (download) {
+      const safe = String(c.to_number || 'recording').replace(/[^0-9a-z_+-]/gi, '');
+      res.setHeader('Content-Disposition', `attachment; filename="call_${safe}.mp3"`);
+    }
+    audit(req.user, download ? 'CALL_DOWNLOAD' : 'CALL_LISTEN',
+      { target_type: 'call', target_id: c.id, meta: { to: c.to_number } });
+    const { Readable } = require('stream');
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // 5) Office Map — seats + live status. GET floor, POST a seat position.
 app.get('/api/admin/floor', auth, adminOnly, async (_req, res) => {
   try {
@@ -1740,8 +1775,11 @@ app.post('/webhooks/telnyx', async (req, res) => {
   try {
     // Recording saved -> attach URL to the calls row for in-browser playback.
     if (event === 'call.recording.saved') {
-      const url = (payload.recording_urls && (payload.recording_urls.mp3 || payload.recording_urls.wav)) ||
-                  (payload.public_recording_urls && (payload.public_recording_urls.mp3 || payload.public_recording_urls.wav)) || null;
+      // Prefer public_recording_urls (browser-playable, no auth) over recording_urls
+      // (api.telnyx.com, needs Bearer). The /stream proxy handles either, but this
+      // keeps stored URLs directly usable too.
+      const url = (payload.public_recording_urls && (payload.public_recording_urls.mp3 || payload.public_recording_urls.wav)) ||
+                  (payload.recording_urls && (payload.recording_urls.mp3 || payload.recording_urls.wav)) || null;
       if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
         { recording_url: url, recording_id: payload.recording_id || null }).catch(() => {});
       return;
