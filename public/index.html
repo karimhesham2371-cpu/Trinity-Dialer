@@ -269,7 +269,6 @@
       <button id="auxBtn" class="btn btn-sm" disabled>Offline</button>
       <div id="auxMenu" class="auxMenu hidden">
         <button data-aux="READY"><span class="dot dot--ok"></span> Ready</button>
-        <button data-aux="WRAP_UP"><span class="dot dot--warn"></span> Wrap up <span class="auxHint">3 min</span></button>
         <button data-aux="BREAK"><span class="dot dot--warn"></span> Break <span class="auxHint">15 min</span></button>
       </div>
     </div>
@@ -472,7 +471,7 @@ const $ = (id) => document.getElementById(id);
 let TOKEN = localStorage.getItem('trinity_token') || '';
 let USER  = JSON.parse(localStorage.getItem('trinity_user') || 'null');
 let client=null, ws=null, serverState='OFFLINE', usersCache=[];
-let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null;
+let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null, serverWrapUntil=0;
 let dispositions=[], curCampaign=null, pendingCb=null;
 
 function log(m){ const el=$('log'); if(!el) return; el.textContent += (new Date().toLocaleTimeString([], {hour12:false})+'  '+m+'\n'); el.scrollTop=el.scrollHeight; }
@@ -589,20 +588,22 @@ function applyState(s, snap){
   ['cMute','cHold','cPad'].forEach(id=>$(id).disabled=!live);
   $('cHang').disabled=!(s==='ON_CALL'||s==='DIALING');
   if(snap&&snap.onCallSince) onCallSince=snap.onCallSince;
+  if(snap&&snap.wrapUntil) serverWrapUntil=snap.wrapUntil;
 
   if(s==='ON_CALL'){ $('bannerState').textContent='Connected — live'; $('bannerSub').textContent='Speak now.'; $('timer').style.color='var(--ok)'; startTimer(); loadContext(); if(prev!=='ON_CALL') beep(); }
   // Background dialing (ReadyMode-style): the lead is dialed silently and the
   // agent keeps a "waiting" screen — no contact details are revealed until the
   // lead actually answers and the call goes live (ON_CALL).
   else if(s==='DIALING'||s==='CLAIMING'){ $('bannerState').textContent='Waiting for next call…'; $('bannerSub').textContent='Dialing in the background.'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL'||curLeadId) clearLead(); }
-  else if(s==='WRAP_UP'){ $('bannerState').textContent = curLeadId?'Wrap-up — disposition required':'Wrap-up'; $('bannerSub').textContent='Auto-returns to Ready when the timer ends.'; stopTimer(); $('dispReq').classList.toggle('hidden', !curLeadId); }
+  else if(s==='WRAP_UP'){ $('bannerState').textContent='Wrap-up'; $('bannerSub').textContent='Auto-returns to Ready when the timer ends.'; stopTimer(); $('dispReq').classList.toggle('hidden', !curLeadId); }
   else if(s==='AVAILABLE'){ $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
   else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
   else { $('bannerState').textContent=u.txt; }
 
-  // AUX auto-return timers + button label (covers manual and post-call wrap).
-  if(s==='WRAP_UP') ensureAuxTimer('WRAP_UP');
-  else if(s==='BREAK') ensureAuxTimer('BREAK');
+  // AUX countdowns: WRAP_UP is server-timed (display only — the server flips it
+  // back to Ready); BREAK is client-timed and auto-returns to Ready at 15 min.
+  if(s==='WRAP_UP') ensureWrapTimer(serverWrapUntil);
+  else if(s==='BREAK') ensureBreakTimer();
   else clearAuxTimer();
   renderAuxBtn(s);
 }
@@ -708,9 +709,11 @@ $('cbSave').onclick=async()=>{ if(!pendingCb) return; const v=$('cbTime').value;
 async function submitDisposition(code, callback_at){
   try{
     const notes=$('notes').value.trim();
-    await apiJson('/api/agent/disposition','POST',{code, notes, callback_at, lead_id:curLeadId});
+    const j=await apiJson('/api/agent/disposition','POST',{code, notes, callback_at, lead_id:curLeadId});
     toast('Saved '+code); $('dispReq').classList.add('hidden');
-    const w=$('wrapMsg'); w.classList.remove('hidden'); w.textContent='Advancing to next lead…';
+    const secs=(j&&j.wrap_seconds)||3;
+    const w=$('wrapMsg'); w.classList.remove('hidden');
+    w.textContent = secs>=60 ? `Wrap-up — ${Math.round(secs/60)} min for paperwork` : 'Advancing to next lead…';
     setTimeout(()=>w.classList.add('hidden'),2500);
   }catch(e){ toast(e.message,'err'); }
 }
@@ -756,23 +759,31 @@ $('cPad').onclick=()=>$('padWrap').classList.toggle('hidden');
 $('cHang').onclick=async()=>{ try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ toast(e.message,'err'); } };
 document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/agent/dtmf','POST',{digits:b.textContent}); log('DTMF '+b.textContent); }catch(e){ toast(e.message,'err'); } });
 
-// ── AUX status dropdown (Ready / Wrap up / Break) ───────────────────────────
-// Ready  → AVAILABLE, receives calls immediately.
-// Wrap up→ paused, max 3 min, auto-returns to Ready.
-// Break  → paused, max 15 min, auto-returns to Ready.
-// Timers are driven off the server state so the automatic post-call wrap is
-// capped the same way. The softphone stays connected in every AUX state.
-const AUX_MAX = { WRAP_UP: 3*60, BREAK: 15*60 };
+// ── AUX status dropdown (Ready / Break) ─────────────────────────────────────
+// Ready → AVAILABLE, receives calls immediately.
+// Break → paused, max 15 min, auto-returns to Ready (client-timed).
+// Wrap-up is NOT in this menu — it's automated by the server after every call
+// (3s default; 3 min for appointment/sale/lead) and just displays a countdown.
+const BREAK_MAX = 15*60;
 let auxTimerInt=null, auxKind=null, auxDeadline=0;
 function clearAuxTimer(){ if(auxTimerInt){clearInterval(auxTimerInt);auxTimerInt=null;} auxKind=null; auxDeadline=0; }
-function ensureAuxTimer(kind){
-  if(auxKind===kind && auxTimerInt) return;           // already counting this state
-  clearAuxTimer();
-  auxKind=kind; auxDeadline=Date.now()+AUX_MAX[kind]*1000;
+// BREAK: client-driven auto-return to Ready at 15 min.
+function ensureBreakTimer(){
+  if(auxKind==='BREAK' && auxTimerInt) return;
+  clearAuxTimer(); auxKind='BREAK'; auxDeadline=Date.now()+BREAK_MAX*1000;
   auxTimerInt=setInterval(()=>{
     if(Date.now()>=auxDeadline){ clearAuxTimer(); setAux('READY'); return; }
     renderAuxBtn(serverState);
   },500);
+}
+// WRAP_UP: display-only countdown to the server's deadline. The server flips the
+// agent back to AVAILABLE itself, so we never call setAux here.
+function ensureWrapTimer(deadlineMs){
+  clearAuxTimer(); auxKind='WRAP_UP'; auxDeadline=deadlineMs||Date.now();
+  auxTimerInt=setInterval(()=>{
+    if(Date.now()>=auxDeadline){ clearAuxTimer(); renderAuxBtn(serverState); return; }
+    renderAuxBtn(serverState);
+  },250);
 }
 function auxRemainMs(){ return Math.max(0, auxDeadline-Date.now()); }
 function fmtMS(ms){ const s=Math.ceil(ms/1000); return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
@@ -801,8 +812,8 @@ async function setAux(target){
     catch(e){ toast(e.message,'err'); }
     return;
   }
-  const st = target; // WRAP_UP | BREAK
-  try{ await apiJson('/api/agent/aux','POST',{state:st}); ensureAuxTimer(st); applyState(st); }
+  // Only BREAK is agent-selectable (Wrap-up is automated server-side).
+  try{ await apiJson('/api/agent/aux','POST',{state:'BREAK'}); ensureBreakTimer(); applyState('BREAK'); }
   catch(e){ toast(e.message,'err'); }
 }
 $('auxBtn').onclick = (e)=>{

@@ -219,6 +219,38 @@ async function setAgentState(id, state) {
   wsAgentSnapshot(id);   // push to the agent's own socket + the admin floor
 }
 
+// ── Wrap-up cooldown ─────────────────────────────────────────────────────────
+// Wrap-up is automated (agents can't self-select it). After every call the
+// agent gets a short breather before the pacer feeds the next lead: 3s by
+// default, but 3 minutes when the call was dispositioned as a positive outcome
+// (appointment / sale / lead) so they can finish paperwork. Server-authoritative
+// so it survives a client refresh and correctly gates pacing (WRAP_UP is not
+// dialable). The client renders the countdown off `wrapUntil` in the snapshot.
+const WRAP_SHORT_SEC = 3, WRAP_LONG_SEC = 180;
+const LONG_WRAP_RE = /appointment|appt|(^|[^a-z])sale([^a-z]|$)|(^|[^a-z])lead([^a-z]|$)/i;
+function wrapSecondsFor(disp) {
+  if (!disp) return WRAP_SHORT_SEC;
+  if (disp.long_wrap === true) return WRAP_LONG_SEC;
+  return LONG_WRAP_RE.test(`${disp.code || ''} ${disp.label || ''}`) ? WRAP_LONG_SEC : WRAP_SHORT_SEC;
+}
+function clearWrapTimer(st) {
+  if (st && st.wrapTimer) { clearTimeout(st.wrapTimer); st.wrapTimer = null; }
+  if (st) st.wrapUntil = 0;
+}
+function scheduleWrapReturn(agentId, seconds) {
+  const st = rt[agentId];
+  if (!st) return;
+  clearWrapTimer(st);
+  st.wrapUntil = Date.now() + seconds * 1000;
+  st.wrapTimer = setTimeout(async () => {
+    const s = rt[agentId];
+    if (!s) return;
+    s.wrapTimer = null; s.wrapUntil = 0;
+    // Only auto-advance if still wrapping on a connected softphone.
+    if (s.state === 'WRAP_UP' && s.conferenceId) { s.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
+  }, seconds * 1000);
+}
+
 // Rebuild `rt` from the agents table on boot (durable-state recovery).
 async function rehydrateRt() {
   if (!SB_HOST) return;
@@ -278,7 +310,7 @@ function wsToAgent(id, obj) { for (const c of wsClients) if (c.userId === id) ws
 function agentSnapshot(id) {
   const st = rt[id] || { state: 'OFFLINE' };
   return { agentId: id, state: st.state, leadId: st.leadId || null, leadNumber: st.leadNumber || null,
-           fromNumber: st.fromNumber || null, onCallSince: st.onCallSince || null };
+           fromNumber: st.fromNumber || null, onCallSince: st.onCallSince || null, wrapUntil: st.wrapUntil || null };
 }
 // Push one agent's state to that agent and to every admin (floor view).
 function wsAgentSnapshot(id) {
@@ -1221,12 +1253,14 @@ app.post('/api/agent/aux', auth, async (req, res) => {
   const id = req.user.id;
   const st = rt[id];
   const want = String((req.body && req.body.state) || '').toUpperCase();
-  if (!['AVAILABLE', 'WRAP_UP', 'BREAK'].includes(want))
+  // Wrap-up is automated (set by call-end / disposition), never agent-selected.
+  if (!['AVAILABLE', 'BREAK'].includes(want))
     return res.status(400).json({ error: 'invalid aux state' });
   if (!st || !st.conferenceId)
     return res.status(409).json({ error: 'softphone not connected' });
   if (['DIALING', 'CLAIMING', 'ON_CALL'].includes(st.state))
     return res.status(409).json({ error: 'busy on a call' });
+  clearWrapTimer(st);   // manual Ready/Break cancels any pending wrap auto-return
   // Returning to Ready with an undispositioned lead still attached (e.g. the
   // wrap-up timer expired): release the leftover leg so the pacer starts clean.
   if (want === 'AVAILABLE' && st.leadId) {
@@ -1335,13 +1369,23 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
     await sbUpdate('leads', `id=eq.${leadId}`, patch).catch(e => console.error('[disp:lead]', e.message));
     audit(req.user, 'DISPOSITION', { target_type: 'lead', target_id: leadId, meta: { code, next_status: patch.status, phone: lead.phone } });
 
-    // Hang up the lead leg if still up, then move agent to AVAILABLE.
+    // Hang up the lead leg if still up, then run the wrap-up cooldown before the
+    // pacer feeds the next call: 3s by default, 3 minutes for a positive outcome
+    // (appointment / sale / lead) so the agent can finish paperwork.
+    let wrapSec = WRAP_SHORT_SEC;
     if (st) {
       if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});
       st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
-      if (st.state !== 'OFFLINE') { st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE'; await setAgentState(req.user.id, st.state); }
+      if (st.state !== 'OFFLINE' && st.conferenceId) {
+        wrapSec = wrapSecondsFor(disp);
+        st.state = 'WRAP_UP';
+        await setAgentState(req.user.id, 'WRAP_UP');
+        scheduleWrapReturn(req.user.id, wrapSec);
+      } else if (st.state !== 'OFFLINE') {
+        st.state = 'OFFLINE'; await setAgentState(req.user.id, 'OFFLINE');
+      }
     }
-    res.json({ ok: true, next_status: patch.status });
+    res.json({ ok: true, next_status: patch.status, wrap_seconds: wrapSec });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1671,10 +1715,11 @@ app.post('/webhooks/telnyx', async (req, res) => {
           if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
           console.log(`[bridge] inbound ended, agent ${agentId.slice(0, 8)} AVAILABLE`);
         } else if (talked) {
-          // Require a disposition: hold the agent in WRAP_UP; keep leadId so
-          // /api/agent/context + /disposition resolve the right lead.
-          if (st.state !== 'OFFLINE') { st.state = 'WRAP_UP'; await setAgentState(agentId, 'WRAP_UP'); }
-          console.log(`[bridge] call ended (talked), agent ${agentId.slice(0, 8)} WRAP_UP awaiting disposition`);
+          // Automated wrap-up: hold WRAP_UP with a 3s auto-return; keep leadId so
+          // /api/agent/context + /disposition resolve the right lead. A positive
+          // disposition (appointment/sale/lead) extends the window to 3 minutes.
+          if (st.state !== 'OFFLINE') { st.state = 'WRAP_UP'; await setAgentState(agentId, 'WRAP_UP'); scheduleWrapReturn(agentId, WRAP_SHORT_SEC); }
+          console.log(`[bridge] call ended (talked), agent ${agentId.slice(0, 8)} WRAP_UP (${WRAP_SHORT_SEC}s)`);
         } else {
           // Never reached a human (no-answer/machine). System dispositions, auto-advance.
           if (cs && cs.leadId)
