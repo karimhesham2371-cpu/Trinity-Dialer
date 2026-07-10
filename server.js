@@ -42,6 +42,19 @@ const CALLER_IDS_ENV     = (process.env.CALLER_IDS || '').split(',').map(s => s.
 const TELNYX_BASE = 'https://api.telnyx.com/v2';
 const SIP_DOMAIN  = 'sip.telnyx.com';
 
+// Default one-click dispositions (used when a campaign hasn't customised its own).
+// outcome: final lead status. is_callback/is_dnc/recycle drive special handling.
+const DEFAULT_DISPOSITIONS = [
+  { code: 'SALE',           label: 'Sale / Appt',    color: '#2ea043', hotkey: '1', outcome: 'DONE' },
+  { code: 'CALLBACK',       label: 'Callback',       color: '#2f81f7', hotkey: '2', is_callback: true },
+  { code: 'NOT_INTERESTED', label: 'Not Interested', color: '#8b95a5', hotkey: '3', outcome: 'DONE' },
+  { code: 'NO_ANSWER',      label: 'No Answer',      color: '#d29922', hotkey: '4', recycle: 'no_answer' },
+  { code: 'VOICEMAIL',      label: 'Left Voicemail', color: '#a371f7', hotkey: '5', recycle: 'no_answer' },
+  { code: 'WRONG_NUMBER',   label: 'Wrong Number',   color: '#f0883e', hotkey: '6', outcome: 'BAD_NUMBER' },
+  { code: 'DNC',            label: 'Do Not Call',    color: '#da3633', hotkey: '7', is_dnc: true },
+];
+const DEFAULT_RECYCLE = { no_answer: { hours: 4, max: 5 }, busy: { minutes: 20, max: 8 } };
+
 // In-memory runtime keyed by agent id (single instance — required for pacing).
 // { state, sip, agentLeg, conferenceId, leadLeg, leadId, leadNumber, fromNumber }
 const rt = {};
@@ -339,16 +352,25 @@ app.post('/api/admin/campaigns/:id/leads', auth, adminOnly, async (req, res) => 
   try {
     const rows = parseCsv(csv);
     if (!rows.length) return res.status(400).json({ error: 'no rows parsed' });
+    const KNOWN = new Set(['phone','number','phone_number','first_name','firstname','first','last_name','lastname','last','address','state']);
     const leads = rows
-      .map(r => ({
-        campaign_id: req.params.id,
-        phone: normPhone(r.phone || r.number || r.phone_number || ''),
-        first_name: r.first_name || r.firstname || r.first || null,
-        last_name:  r.last_name  || r.lastname  || r.last  || null,
-        address:    r.address || null,
-        state:      r.state || null,
-        status: 'NEW',
-      }))
+      .map(r => {
+        const phone = normPhone(r.phone || r.number || r.phone_number || '');
+        // preserve any extra columns as merge fields
+        const custom = {};
+        for (const k of Object.keys(r)) if (!KNOWN.has(k) && r[k]) custom[k] = r[k];
+        return {
+          campaign_id: req.params.id,
+          phone,
+          first_name: r.first_name || r.firstname || r.first || null,
+          last_name:  r.last_name  || r.lastname  || r.last  || null,
+          address:    r.address || null,
+          state:      r.state || null,
+          area_code:  areaCodeOf(phone),
+          custom,
+          status: 'NEW',
+        };
+      })
       .filter(l => l.phone);
     if (!leads.length) return res.status(400).json({ error: 'no valid phone numbers found' });
     // insert in chunks
@@ -443,7 +465,124 @@ app.post('/api/agent/hangup', auth, async (req, res) => {
 
 app.get('/api/agent/status', auth, (req, res) => {
   const st = rt[req.user.id] || { state: 'OFFLINE' };
-  res.json({ state: st.state, leadNumber: st.leadNumber || null, leadId: st.leadId || null, fromNumber: st.fromNumber || null });
+  res.json({ state: st.state, leadNumber: st.leadNumber || null, leadId: st.leadId || null,
+             fromNumber: st.fromNumber || null, onCallSince: st.onCallSince || null });
+});
+
+// Load a campaign's config, filling in defaults for unset dialer fields.
+async function campaignConfig(id) {
+  if (!id) return null;
+  const rows = await sbSelect('campaigns', `id=eq.${id}&select=*`).catch(() => []);
+  const c = rows[0];
+  if (!c) return null;
+  return {
+    ...c,
+    dispositions: Array.isArray(c.dispositions) && c.dispositions.length ? c.dispositions : DEFAULT_DISPOSITIONS,
+    recycle_rules: c.recycle_rules && Object.keys(c.recycle_rules).length ? c.recycle_rules : DEFAULT_RECYCLE,
+    wrap_seconds: c.wrap_seconds != null ? c.wrap_seconds : 5,
+    script: c.script || '',
+  };
+}
+function mergeScript(script, lead) {
+  if (!script) return '';
+  const map = { first_name: lead.first_name, last_name: lead.last_name, phone: lead.phone,
+    address: lead.address, state: lead.state, ...(lead.custom || {}) };
+  return script.replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, k) => (map[k] != null && map[k] !== '' ? map[k] : `—`));
+}
+
+// Everything the agent screen needs about the current lead: full record, campaign
+// script (merged), disposition buttons, wrap timer, and this lead's contact history.
+app.get('/api/agent/context', auth, async (req, res) => {
+  const st = rt[req.user.id];
+  if (!st || !st.leadId) return res.json({ state: st ? st.state : 'OFFLINE', lead: null });
+  try {
+    const leadRows = await sbSelect('leads', `id=eq.${st.leadId}&select=*`);
+    const lead = leadRows[0];
+    if (!lead) return res.json({ state: st.state, lead: null });
+    const cfg = await campaignConfig(lead.campaign_id);
+    const history = await sbSelect('dispositions',
+      `lead_id=eq.${st.leadId}&select=code,notes,callback_at,created_at&order=created_at.desc&limit=20`).catch(() => []);
+    res.json({
+      state: st.state, onCallSince: st.onCallSince || null,
+      lead: { ...lead, custom: lead.custom || {} },
+      caller_id: st.fromNumber || null,
+      campaign: cfg ? { id: cfg.id, name: cfg.name, wrap_seconds: cfg.wrap_seconds,
+        dispositions: cfg.dispositions, script: cfg.script, script_merged: mergeScript(cfg.script, lead) } : null,
+      history,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Record a disposition. Applies callback/DNC/recycle rules, then moves the agent
+// from WRAP_UP back to AVAILABLE (auto-advance on the client after wrap timer).
+app.post('/api/agent/disposition', auth, async (req, res) => {
+  const st = rt[req.user.id];
+  const { code, notes, callback_at } = req.body || {};
+  const leadId = (st && st.leadId) || (req.body && req.body.lead_id);
+  if (!code) return res.status(400).json({ error: 'code required' });
+  if (!leadId) return res.status(400).json({ error: 'no lead to disposition' });
+  try {
+    const leadRows = await sbSelect('leads', `id=eq.${leadId}&select=*`);
+    const lead = leadRows[0];
+    if (!lead) return res.status(404).json({ error: 'lead not found' });
+    const cfg = await campaignConfig(lead.campaign_id);
+    const disp = (cfg.dispositions || DEFAULT_DISPOSITIONS).find(d => d.code === code) || { code, outcome: 'DONE' };
+
+    // Record the disposition row.
+    sbLog('dispositions', { lead_id: leadId, agent_id: req.user.id, campaign_id: lead.campaign_id,
+      code, notes: notes || null, callback_at: callback_at || null });
+
+    // Decide the lead's next status.
+    const patch = { last_outcome: code };
+    if (notes != null) patch.notes_last = undefined; // reserved; notes live on dispositions
+    if (disp.is_dnc) {
+      patch.status = 'DNC'; patch.dnc = true;
+      sbReq('POST', 'dnc_list', { phone: lead.phone, reason: 'internal', source: 'agent' },
+        'resolution=ignore-duplicates,return=minimal').catch(() => {});
+    } else if (disp.is_callback) {
+      patch.status = 'CALLBACK';
+      patch.next_callback_at = callback_at || new Date(Date.now() + 3600e3).toISOString();
+      patch.assigned_agent_id = req.user.id; // route callback back to this agent
+    } else if (disp.recycle) {
+      const rule = (cfg.recycle_rules || DEFAULT_RECYCLE)[disp.recycle] || {};
+      const max = lead.max_attempts || rule.max || 5;
+      if ((lead.attempts || 0) >= max) {
+        patch.status = 'EXHAUSTED';
+      } else {
+        patch.status = 'NEW';
+        const ms = rule.hours ? rule.hours * 3600e3 : (rule.minutes ? rule.minutes * 60e3 : 3600e3);
+        patch.next_callback_at = new Date(Date.now() + ms).toISOString();
+      }
+    } else {
+      patch.status = disp.outcome || 'DONE';
+    }
+    await sbUpdate('leads', `id=eq.${leadId}`, patch).catch(e => console.error('[disp:lead]', e.message));
+
+    // Hang up the lead leg if still up, then move agent to AVAILABLE.
+    if (st) {
+      if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});
+      st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
+      if (st.state !== 'OFFLINE') { st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE'; await setAgentState(req.user.id, st.state); }
+    }
+    res.json({ ok: true, next_status: patch.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// In-call controls (lead leg). Mute is handled client-side on the WebRTC mic.
+app.post('/api/agent/dtmf', auth, async (req, res) => {
+  const st = rt[req.user.id];
+  const digits = String((req.body && req.body.digits) || '').replace(/[^0-9*#]/g, '');
+  if (!st || !st.leadLeg) return res.status(400).json({ error: 'no active lead call' });
+  if (!digits) return res.status(400).json({ error: 'no digits' });
+  try { await telnyx('POST', `/calls/${st.leadLeg}/actions/send_dtmf`, { digits }); res.json({ ok: true }); }
+  catch (e) { res.status(502).json({ error: e.message }); }
+});
+app.post('/api/agent/hold', auth, async (req, res) => {
+  const st = rt[req.user.id];
+  const on = !!(req.body && req.body.on);
+  if (!st || !st.leadLeg) return res.status(400).json({ error: 'no active lead call' });
+  try { await telnyx('POST', `/calls/${st.leadLeg}/actions/${on ? 'hold' : 'unhold'}`, {}); res.json({ ok: true, hold: on }); }
+  catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 // ══ PACING ENGINE ════════════════════════════════════════════════════════════════
@@ -589,17 +728,23 @@ app.post('/webhooks/telnyx', async (req, res) => {
       const st = rt[agentId];
       const wasLead = role === 'lead' || st.leadLeg === ccid;
       if (wasLead) {
-        // if lead never bridged, mark NO_ANSWER (unless already MACHINE/CONTACTED)
-        if (cs && cs.leadId) {
-          const status = st.state === 'ON_CALL' ? 'DONE' : null;
-          if (status) sbUpdate('leads', `id=eq.${cs.leadId}`, { status }).catch(() => {});
-          else sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.IN_PROGRESS`, { status: 'NO_ANSWER' }).catch(() => {});
-        }
+        const talked = st.state === 'ON_CALL';   // agent actually spoke to a human
         if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
           { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
-        st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
-        if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
-        console.log(`[bridge] lead ended, agent ${agentId.slice(0, 8)} AVAILABLE`);
+        st.leadLeg = null; st.leadNumber = null; st.fromNumber = null; st.onCallSince = null;
+        if (talked) {
+          // Require a disposition: hold the agent in WRAP_UP; keep leadId so
+          // /api/agent/context + /disposition resolve the right lead.
+          if (st.state !== 'OFFLINE') { st.state = 'WRAP_UP'; await setAgentState(agentId, 'WRAP_UP'); }
+          console.log(`[bridge] call ended (talked), agent ${agentId.slice(0, 8)} WRAP_UP awaiting disposition`);
+        } else {
+          // Never reached a human (no-answer/machine). System dispositions, auto-advance.
+          if (cs && cs.leadId)
+            sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.IN_PROGRESS`, { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+          st.leadId = null;
+          if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
+          console.log(`[bridge] no-answer, agent ${agentId.slice(0, 8)} AVAILABLE`);
+        }
       } else if (role === 'agent' || st.agentLeg === ccid) {
         rt[agentId] = { state: 'OFFLINE' };
         await setAgentState(agentId, 'OFFLINE');

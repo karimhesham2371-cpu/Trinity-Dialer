@@ -4,129 +4,286 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Trinity Dialer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#0e1116; --panel:#171c24; --line:#232a35; --txt:#e6edf3; --mut:#8b95a5;
-          --grn:#2ea043; --red:#da3633; --blu:#2f81f7; --amber:#d29922; }
-  * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
-  a { color:var(--blu); }
-  .wrap { max-width:920px; margin:28px auto; padding:0 16px; }
-  .narrow { max-width:440px; }
-  h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:15px; margin:0 0 12px; }
-  .sub { color:var(--mut); margin:0 0 20px; }
-  .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
-  .top .who { color:var(--mut); font-size:13px; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
-  label { display:block; font-size:12px; color:var(--mut); margin:0 0 4px; }
-  input, select { width:100%; padding:9px 11px; background:#0e1116; border:1px solid var(--line);
-                  border-radius:8px; color:var(--txt); font-size:14px; }
-  .row { display:flex; gap:10px; } .row > * { flex:1; }
-  button { padding:10px 14px; border:0; border-radius:8px; font-size:14px; font-weight:600;
-           cursor:pointer; color:#fff; background:var(--blu); }
-  button:disabled { opacity:.4; cursor:not-allowed; }
-  button.grn { background:var(--grn); } button.red { background:var(--red); }
-  button.amber { background:var(--amber); color:#111; } button.gray { background:#30363d; }
-  button.sm { padding:6px 10px; font-size:12px; }
-  .status { display:flex; align-items:center; gap:8px; font-weight:600; }
-  .dot { width:10px; height:10px; border-radius:50%; background:var(--mut); }
-  .dot.on { background:var(--grn); } .dot.busy { background:var(--amber); } .dot.call { background:var(--blu); }
-  .pill { font-size:11px; padding:2px 8px; border-radius:99px; background:#0e1116; border:1px solid var(--line); color:var(--mut); }
-  .pill.RUNNING { color:var(--grn); border-color:var(--grn); } .pill.PAUSED { color:var(--amber); border-color:var(--amber); }
-  .pill.STOPPED,.pill.DRAFT { color:var(--mut); }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
-  th { color:var(--mut); font-weight:600; font-size:12px; }
-  #log { font:12px/1.5 ui-monospace,Menlo,monospace; color:var(--mut); background:#0b0e13;
-         border:1px solid var(--line); border-radius:8px; padding:10px; height:130px; overflow:auto; white-space:pre-wrap; }
-  .mt { margin-top:12px; } .muted { color:var(--mut); } .err { color:var(--red); font-size:13px; }
-  .hidden { display:none; }
-  .chips { display:flex; flex-wrap:wrap; gap:6px; }
-  .chip { font-size:12px; padding:3px 8px; border-radius:99px; background:#0e1116; border:1px solid var(--line); display:flex; gap:6px; align-items:center; }
-  .chip b { color:var(--txt); font-weight:600; }
-  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
-  @media(max-width:680px){ .grid2 { grid-template-columns:1fr; } }
+  :root{
+    --bg:#0a0f1a; --bg2:#0d131f; --panel:#111826; --panel2:#0e1522; --line:#1e2836;
+    --line2:#28344a; --txt:#e8eef7; --mut:#8792a6; --mut2:#5c6678;
+    --acc:#3b82f6; --acc-h:#2f6fe0; --grn:#22c55e; --red:#ef4444; --amber:#f59e0b;
+    --purple:#a371f7; --orange:#f0883e; --radius:12px;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;font:14px/1.5 Inter,system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt);
+       -webkit-font-smoothing:antialiased}
+  ::selection{background:rgba(59,130,246,.35)}
+  a{color:var(--acc)}
+  .hidden{display:none!important}
+  .mut{color:var(--mut)} .mut2{color:var(--mut2)}
+  .err{color:var(--red);font-size:13px}
+  /* buttons */
+  .btn{appearance:none;border:1px solid var(--line2);background:#16202f;color:var(--txt);
+       padding:9px 14px;border-radius:10px;font:600 13px Inter;cursor:pointer;transition:.12s;display:inline-flex;
+       align-items:center;gap:7px;justify-content:center}
+  .btn:hover{border-color:#3a4a63;background:#1a2637}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .btn-primary{background:var(--acc);border-color:transparent;color:#fff}
+  .btn-primary:hover{background:var(--acc-h)}
+  .btn-grn{background:var(--grn);border-color:transparent;color:#04140a}
+  .btn-red{background:var(--red);border-color:transparent;color:#fff}
+  .btn-amber{background:var(--amber);border-color:transparent;color:#1b1200}
+  .btn-ghost{background:transparent;border-color:var(--line)}
+  .btn-sm{padding:6px 10px;font-size:12px;border-radius:8px}
+  .btn-lg{padding:12px 18px;font-size:14px}
+  .btn-block{width:100%}
+  /* inputs */
+  .field{width:100%;padding:10px 12px;background:var(--bg2);border:1px solid var(--line2);border-radius:10px;
+         color:var(--txt);font:14px Inter;outline:none;transition:.12s}
+  .field:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+  textarea.field{resize:vertical;min-height:70px;line-height:1.5}
+  label.lbl{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);margin:0 0 6px;font-weight:600}
+  select.field{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%238792a6' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center}
+  /* cards / panels */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
+  .pill{font-size:11px;font-weight:600;padding:3px 9px;border-radius:99px;background:#0e1522;border:1px solid var(--line2);color:var(--mut)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--mut2);display:inline-block;flex:0 0 auto}
+  .dot.on{background:var(--grn);box-shadow:0 0 0 3px rgba(34,197,94,.18)}
+  .dot.busy{background:var(--amber);box-shadow:0 0 0 3px rgba(245,158,11,.18)}
+  .dot.call{background:var(--acc);box-shadow:0 0 0 3px rgba(59,130,246,.18)}
+  .dot.off{background:var(--mut2)}
+  .row{display:flex;gap:10px}.row>*{flex:1}
+  .mt{margin-top:12px}.mt2{margin-top:8px}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  /* toast */
+  #toasts{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px;z-index:100}
+  .toast{background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:11px 14px;font-size:13px;box-shadow:var(--shadow);animation:slideIn .2s;max-width:320px}
+  .toast.err{border-color:var(--red)}
+  @keyframes slideIn{from{transform:translateX(20px);opacity:0}}
+
+  /* ===== LOGIN ===== */
+  #viewLogin{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .loginCard{width:100%;max-width:380px}
+  .brand{display:flex;align-items:center;gap:10px;margin-bottom:22px}
+  .brand .mark{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--acc),#7c3aed);display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff}
+  .brand h1{font-size:18px;margin:0;font-weight:700}
+
+  /* ===== APP CHROME ===== */
+  .appbar{height:56px;display:flex;align-items:center;gap:14px;padding:0 18px;border-bottom:1px solid var(--line);background:var(--bg2);position:sticky;top:0;z-index:20}
+  .appbar .brand{margin:0}
+  .appbar .sp{flex:1}
+  .who{font-size:13px;color:var(--mut)}
+
+  /* ===== AGENT 3-PANEL ===== */
+  #viewAgent{height:100vh;display:flex;flex-direction:column}
+  .agentGrid{flex:1;display:grid;grid-template-columns:320px 1fr 340px;gap:14px;padding:14px;overflow:hidden}
+  .col{display:flex;flex-direction:column;gap:14px;min-height:0;overflow:auto}
+  .panelTitle{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);font-weight:700;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+  /* script */
+  #scriptBody{white-space:pre-wrap;line-height:1.7;font-size:14.5px;color:#dbe4f0}
+  #scriptBody .mf{color:var(--acc);font-weight:600}
+  /* lead card */
+  .leadName{font-size:22px;font-weight:700;margin:0}
+  .leadPhone{font-size:19px;font-weight:600;color:#fff;letter-spacing:.02em}
+  .kv{display:grid;grid-template-columns:96px 1fr;gap:6px 12px;font-size:13.5px}
+  .kv .k{color:var(--mut)}
+  .hist{display:flex;flex-direction:column;gap:0}
+  .hist .h{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
+  .hist .h:first-child{border-top:0}
+  .hbadge{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;height:fit-content;white-space:nowrap}
+  /* call state banner */
+  .callBanner{display:flex;align-items:center;gap:14px;padding:14px 16px;border-radius:var(--radius);border:1px solid var(--line2);background:linear-gradient(180deg,#121b2b,#0e1522)}
+  .callBanner .big{font-size:16px;font-weight:700}
+  .timer{font-variant-numeric:tabular-nums;font-size:22px;font-weight:700;letter-spacing:.02em}
+  /* controls */
+  .ctrlGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .ctrlBtn{flex-direction:column;gap:6px;padding:14px 8px;font-size:12px}
+  .ctrlBtn .ic{font-size:20px;line-height:1}
+  .ctrlBtn.active{border-color:var(--amber);background:rgba(245,158,11,.12);color:var(--amber)}
+  /* dispositions */
+  .dispGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .dispBtn{display:flex;align-items:center;gap:9px;padding:11px 12px;border-radius:10px;border:1px solid var(--line2);
+           background:#131c2b;cursor:pointer;font:600 13px Inter;color:var(--txt);text-align:left;transition:.1s}
+  .dispBtn:hover{border-color:var(--line2);filter:brightness(1.15)}
+  .dispBtn .hk{margin-left:auto;font-size:11px;color:var(--mut);border:1px solid var(--line2);border-radius:5px;padding:1px 6px;font-weight:600}
+  .dispBtn .sw{width:10px;height:10px;border-radius:3px;flex:0 0 auto}
+  .dialpad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .dialpad button{padding:12px;font-size:16px;font-weight:600;border-radius:10px;border:1px solid var(--line2);background:#131c2b;color:var(--txt);cursor:pointer}
+  .dialpad button:hover{background:#1a2637}
+  #log{font:12px/1.55 ui-monospace,Menlo,monospace;color:var(--mut);background:#080c14;border:1px solid var(--line);border-radius:10px;padding:10px;height:110px;overflow:auto;white-space:pre-wrap}
+  .empty{color:var(--mut2);font-size:13px;text-align:center;padding:26px 10px}
+  @media(max-width:1100px){ .agentGrid{grid-template-columns:1fr;overflow:auto} .col{overflow:visible} }
+
+  /* ===== ADMIN ===== */
+  .wrap{max-width:960px;margin:22px auto;padding:0 16px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr}}
+  h2{font-size:14px;margin:0 0 12px;font-weight:700}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
+  th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  .chips{display:flex;flex-wrap:wrap;gap:6px}
+  .chip{font-size:12px;padding:3px 9px;border-radius:99px;background:#0e1522;border:1px solid var(--line2);display:flex;gap:7px;align-items:center}
+  .chip b{font-weight:600}
+  .pill.RUNNING{color:var(--grn);border-color:rgba(34,197,94,.4)}
+  .pill.PAUSED{color:var(--amber);border-color:rgba(245,158,11,.4)}
+  .pill.STOPPED,.pill.DRAFT{color:var(--mut)}
 </style>
 </head>
 <body>
 
 <!-- ═══ LOGIN ═══ -->
-<div id="viewLogin" class="wrap narrow">
-  <h1>Trinity Dialer</h1>
-  <p class="sub">Sign in</p>
-  <div class="card">
-    <label>Email / username</label>
-    <input id="liEmail" autocomplete="username" />
-    <label class="mt">Password</label>
-    <input id="liPass" type="password" autocomplete="current-password" />
-    <button id="btnLogin" class="mt" style="width:100%">Sign in</button>
+<div id="viewLogin">
+  <div class="loginCard card">
+    <div class="brand"><div class="mark">T</div><h1>Trinity Dialer</h1></div>
+    <label class="lbl">Email / username</label>
+    <input id="liEmail" class="field" autocomplete="username" />
+    <label class="lbl mt">Password</label>
+    <input id="liPass" class="field" type="password" autocomplete="current-password" />
+    <button id="btnLogin" class="btn btn-primary btn-block mt">Sign in</button>
     <p id="liErr" class="err mt hidden"></p>
   </div>
 </div>
 
 <!-- ═══ AGENT ═══ -->
-<div id="viewAgent" class="wrap narrow hidden">
-  <div class="top">
-    <div><h1>Trinity Dialer</h1><div class="who" id="agWho"></div></div>
-    <button class="gray sm" onclick="logout()">Sign out</button>
+<div id="viewAgent" class="hidden">
+  <div class="appbar">
+    <div class="brand"><div class="mark">T</div><h1>Trinity</h1></div>
+    <span id="agState" class="pill"><span class="dot"></span> Offline</span>
+    <span id="agConn" class="pill">softphone: —</span>
+    <div class="sp"></div>
+    <span class="who" id="agWho"></span>
+    <button id="agBreak" class="btn btn-sm btn-amber">Break</button>
+    <button class="btn btn-sm btn-ghost" onclick="logout()">Sign out</button>
   </div>
-  <div class="card">
-    <div class="status"><span id="agDot" class="dot"></span><span id="agState">Connecting…</span>
-      <span id="agReg" class="pill" style="margin-left:auto">softphone: —</span></div>
-    <div class="muted mt" id="agLead">No active call</div>
-    <div class="row mt">
-      <button id="agHang" class="red" disabled>Hang up</button>
-      <button id="agBreak" class="amber">Go on break</button>
+
+  <div class="agentGrid">
+    <!-- LEFT: script -->
+    <div class="col">
+      <div class="card" style="flex:1">
+        <p class="panelTitle">Script</p>
+        <div id="scriptBody" class="empty">No active call.</div>
+      </div>
     </div>
-    <p class="muted mt" style="font-size:12px">Auto-dial runs whenever you're Available and your campaign is Running. No action needed.</p>
+
+    <!-- CENTER: lead -->
+    <div class="col">
+      <div id="callBanner" class="callBanner">
+        <span id="bannerDot" class="dot"></span>
+        <div><div id="bannerState" class="big">Waiting…</div><div id="bannerSub" class="mut" style="font-size:12px">Auto-dial runs when you're Available.</div></div>
+        <div class="sp" style="flex:1"></div>
+        <div id="timer" class="timer hidden">00:00</div>
+      </div>
+
+      <div class="card" style="flex:1">
+        <p class="panelTitle">Lead</p>
+        <div id="leadCard" class="empty">No lead yet. You'll be connected automatically.</div>
+      </div>
+
+      <div class="card">
+        <p class="panelTitle">Notes</p>
+        <textarea id="notes" class="field" placeholder="Type notes for this contact…"></textarea>
+      </div>
+
+      <div class="card">
+        <p class="panelTitle">History</p>
+        <div id="history" class="empty">No previous contact.</div>
+      </div>
+    </div>
+
+    <!-- RIGHT: controls + dispositions -->
+    <div class="col">
+      <div class="card">
+        <p class="panelTitle">Call controls</p>
+        <div class="ctrlGrid">
+          <button id="cMute" class="btn ctrlBtn" disabled><span class="ic">🎙️</span><span>Mute</span></button>
+          <button id="cHold" class="btn ctrlBtn" disabled><span class="ic">⏸️</span><span>Hold</span></button>
+          <button id="cPad"  class="btn ctrlBtn" disabled><span class="ic">⌨️</span><span>Dialpad</span></button>
+          <button id="cHang" class="btn ctrlBtn btn-red" disabled><span class="ic">📵</span><span>Hang up</span></button>
+        </div>
+        <div id="padWrap" class="mt hidden">
+          <div class="dialpad">
+            <button>1</button><button>2</button><button>3</button>
+            <button>4</button><button>5</button><button>6</button>
+            <button>7</button><button>8</button><button>9</button>
+            <button>*</button><button>0</button><button>#</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="flex:1">
+        <p class="panelTitle">Disposition <span id="dispReq" class="pill hidden" style="color:var(--amber);border-color:var(--amber)">required</span></p>
+        <div id="dispGrid" class="dispGrid"></div>
+        <div id="cbWrap" class="mt hidden">
+          <label class="lbl">Callback time</label>
+          <input id="cbTime" class="field" type="datetime-local" />
+          <button id="cbSave" class="btn btn-primary btn-block mt2">Save callback</button>
+        </div>
+        <div id="wrapMsg" class="mut mt hidden" style="font-size:12px"></div>
+      </div>
+
+      <div class="card">
+        <p class="panelTitle">Activity</p>
+        <div id="log"></div>
+      </div>
+    </div>
   </div>
-  <div id="log"></div>
 </div>
 
 <!-- ═══ ADMIN ═══ -->
-<div id="viewAdmin" class="wrap hidden">
-  <div class="top">
-    <div><h1>Trinity Dialer — Admin</h1><div class="who" id="adWho"></div></div>
-    <button class="gray sm" onclick="logout()">Sign out</button>
+<div id="viewAdmin" class="hidden">
+  <div class="appbar">
+    <div class="brand"><div class="mark">T</div><h1>Trinity — Admin</h1></div>
+    <div class="sp"></div>
+    <span class="who" id="adWho"></span>
+    <button class="btn btn-sm btn-ghost" onclick="logout()">Sign out</button>
   </div>
-
-  <div class="grid2">
-    <div class="card">
-      <h2>Users</h2>
-      <table id="usersTbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>State</th></tr></thead><tbody></tbody></table>
-      <div class="mt"><b style="font-size:13px">Add user</b></div>
-      <div class="row mt"><input id="uName" placeholder="Name" /><input id="uEmail" placeholder="Email / username" /></div>
-      <div class="row mt">
-        <input id="uPass" placeholder="Password" />
-        <select id="uRole"><option value="agent">agent</option><option value="admin">admin</option></select>
+  <div class="wrap">
+    <div class="grid2">
+      <div class="card">
+        <h2>Users</h2>
+        <table id="usersTbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>State</th></tr></thead><tbody></tbody></table>
+        <div class="mt"><b style="font-size:13px">Add user</b></div>
+        <div class="row mt"><input id="uName" class="field" placeholder="Name" /><input id="uEmail" class="field" placeholder="Email / username" /></div>
+        <div class="row mt">
+          <input id="uPass" class="field" placeholder="Password" />
+          <select id="uRole" class="field"><option value="agent">agent</option><option value="admin">admin</option></select>
+        </div>
+        <button id="btnAddUser" class="btn btn-primary btn-block mt">Create user (+ Telnyx credential)</button>
+        <p id="uErr" class="err mt hidden"></p>
       </div>
-      <button id="btnAddUser" class="mt" style="width:100%">Create user (+ Telnyx credential)</button>
-      <p id="uErr" class="err mt hidden"></p>
+      <div class="card">
+        <h2>New campaign</h2>
+        <label class="lbl">Campaign name</label>
+        <input id="cName" class="field" placeholder="e.g. Florida FSBO June" />
+        <button id="btnAddCamp" class="btn btn-primary btn-block mt">Create campaign</button>
+        <p class="mut mt" style="font-size:12px">After creating: assign agents, upload a lead CSV, then Start.</p>
+      </div>
     </div>
-
-    <div class="card">
-      <h2>New campaign</h2>
-      <label>Campaign name</label>
-      <input id="cName" placeholder="e.g. Florida FSBO June" />
-      <button id="btnAddCamp" class="mt" style="width:100%">Create campaign</button>
-      <p class="muted mt" style="font-size:12px">After creating: assign agents, upload a lead CSV, then Start.</p>
+    <div class="card mt">
+      <h2>Campaigns</h2>
+      <div id="campList"></div>
     </div>
-  </div>
-
-  <div class="card">
-    <h2>Campaigns</h2>
-    <div id="campList"></div>
   </div>
 </div>
 
 <audio id="remoteAudio" autoplay></audio>
+<div id="toasts"></div>
 <script src="https://unpkg.com/@telnyx/webrtc/lib/bundle.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 let TOKEN = localStorage.getItem('trinity_token') || '';
 let USER  = JSON.parse(localStorage.getItem('trinity_user') || 'null');
-let client=null, poll=null, serverState='OFFLINE', usersCache=[];
+let client=null, ws=null, serverState='OFFLINE', usersCache=[];
+let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null;
+let dispositions=[], curCampaign=null, pendingCb=null;
 
 function log(m){ const el=$('log'); if(!el) return; el.textContent += (new Date().toLocaleTimeString()+'  '+m+'\n'); el.scrollTop=el.scrollHeight; }
+function toast(m,isErr){ const t=document.createElement('div'); t.className='toast'+(isErr?' err':''); t.textContent=m; $('toasts').appendChild(t); setTimeout(()=>t.remove(),4200); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function api(path, opts={}) {
   opts.headers = Object.assign({ 'Authorization':'Bearer '+TOKEN }, opts.headers||{});
@@ -143,7 +300,8 @@ async function apiJson(path, method='GET', body){
 }
 
 function show(view){ ['Login','Agent','Admin'].forEach(v=>$('view'+v).classList.toggle('hidden', v.toLowerCase()!==view)); }
-function logout(){ localStorage.removeItem('trinity_token'); localStorage.removeItem('trinity_user'); TOKEN=''; USER=null; if(poll)clearInterval(poll); if(client){try{client.disconnect();}catch{}} show('login'); }
+function logout(){ localStorage.removeItem('trinity_token'); localStorage.removeItem('trinity_user'); TOKEN=''; USER=null;
+  if(ws){try{ws.close();}catch{}} if(client){try{client.disconnect();}catch{}} if(timerInt)clearInterval(timerInt); show('login'); }
 
 // ── Login ──
 $('btnLogin').onclick = async () => {
@@ -164,25 +322,53 @@ $('liPass').addEventListener('keydown', e=>{ if(e.key==='Enter') $('btnLogin').c
 function route(){
   if(!TOKEN||!USER){ show('login'); return; }
   if(USER.role==='admin'){ show('admin'); $('adWho').textContent=USER.name+' · '+USER.email; loadAdmin(); }
-  else { show('agent'); $('agWho').textContent=USER.name+' · '+USER.email; startAgent(); }
+  else { show('agent'); $('agWho').textContent=USER.name; startAgent(); }
 }
 
-// ── Agent softphone ──
+// ═══════════ AGENT ═══════════
 function getTelnyxRTC(){ const g=window.TelnyxWebRTC||window.telnyxWebRTC||window.TelnyxRTC||window.telnyx; if(!g)return null; return g.TelnyxRTC||(g.default&&g.default.TelnyxRTC)||g; }
 
-function setAgentUI(s){
-  serverState=s;
-  const map={ OFFLINE:['','Offline'], CONNECTING:['busy','Connecting…'], AVAILABLE:['on','Available'],
-              CLAIMING:['busy','Preparing call…'], DIALING:['busy','Dialing lead…'], ON_CALL:['call','On call'] };
-  const [cls,txt]=map[s]||['','—'];
-  $('agDot').className='dot '+cls; $('agState').textContent=txt;
-  $('agHang').disabled = !(s==='DIALING'||s==='ON_CALL');
+function openWs(){
+  try{ if(ws) ws.close(); }catch{}
+  const proto = location.protocol==='https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
+  ws.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
+    if(m.type==='agent.state'){ applyState(m.state, m); } };
+  ws.onclose = ()=>{ /* reconnect while logged in as agent */ if(TOKEN&&USER&&USER.role==='agent') setTimeout(openWs, 2500); };
 }
 
+const STATE_UI = {
+  OFFLINE:['off','Offline'], CONNECTING:['busy','Connecting…'], AVAILABLE:['on','Available'],
+  CLAIMING:['busy','Preparing…'], DIALING:['busy','Dialing…'], ON_CALL:['call','On call'], WRAP_UP:['busy','Wrap-up'],
+};
+function applyState(s, snap){
+  const prev=serverState; serverState=s;
+  const [cls,txt]=STATE_UI[s]||['off','—'];
+  $('agState').innerHTML=`<span class="dot ${cls}"></span> ${txt}`;
+  const dot=$('bannerDot'); dot.className='dot '+cls;
+  // controls enabled only on live call
+  const live = (s==='ON_CALL');
+  ['cMute','cHold','cPad'].forEach(id=>$(id).disabled=!live);
+  $('cHang').disabled=!(s==='ON_CALL'||s==='DIALING');
+  if(snap&&snap.onCallSince) onCallSince=snap.onCallSince;
+
+  if(s==='ON_CALL'){ $('bannerState').textContent='Connected — live'; $('bannerSub').textContent='Speak now.'; startTimer(); loadContext(); }
+  else if(s==='DIALING'||s==='CLAIMING'){ $('bannerState').textContent='Dialing lead…'; $('bannerSub').textContent=snap&&snap.leadNumber?('Calling '+snap.leadNumber):''; stopTimer(); loadContext(); }
+  else if(s==='WRAP_UP'){ $('bannerState').textContent='Wrap-up — disposition required'; $('bannerSub').textContent='Pick an outcome to continue.'; stopTimer(); $('dispReq').classList.remove('hidden'); }
+  else if(s==='AVAILABLE'){ $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
+  else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
+}
+
+function startTimer(){ if(timerInt) clearInterval(timerInt); $('timer').classList.remove('hidden');
+  timerInt=setInterval(()=>{ const base=onCallSince||Date.now(); const s=Math.max(0,Math.floor((Date.now()-base)/1000));
+    $('timer').textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); },500); }
+function stopTimer(){ if(timerInt){clearInterval(timerInt);timerInt=null;} $('timer').classList.add('hidden'); $('timer').textContent='00:00'; }
+
 async function startAgent(){
-  setAgentUI('CONNECTING');
+  applyState('CONNECTING');
+  openWs();
   const TelnyxRTC = getTelnyxRTC();
-  if(!TelnyxRTC){ log('ERROR: Telnyx WebRTC SDK not loaded'); return; }
+  if(!TelnyxRTC){ log('ERROR: Telnyx WebRTC SDK not loaded'); toast('Softphone SDK failed to load',true); return; }
   try {
     log('fetching softphone token…');
     const j = await apiJson('/api/agent/token');
@@ -190,136 +376,194 @@ async function startAgent(){
     client = new TelnyxRTC({ login_token: j.login_token });
     client.remoteElement = 'remoteAudio';
     client.on('telnyx.ready', async () => {
-      $('agReg').textContent='softphone: registered';
+      $('agConn').textContent='softphone: registered';
       log('registered ✓ — going available');
-      try { const a = await apiJson('/api/agent/available','POST',{}); log('available -> '+(a.state||'ok')); } catch(e){ log('available error: '+e.message); }
-      startPoll();
+      try { await apiJson('/api/agent/available','POST',{}); } catch(e){ log('available error: '+e.message); }
     });
     client.on('telnyx.error', e => log('telnyx.error: '+(e&&e.error&&e.error.message||JSON.stringify(e))));
-    client.on('telnyx.socket.close', () => { $('agReg').textContent='softphone: disconnected'; });
+    client.on('telnyx.socket.close', () => { $('agConn').textContent='softphone: disconnected'; });
     client.on('telnyx.notification', n => {
       if(n.type==='callUpdate' && n.call){
         const st=n.call.state;
-        log('softphone call: '+st+' ('+(n.call.direction||'')+')');
-        if(st==='ringing' && n.call.direction==='inbound'){ log('auto-answering agent leg'); n.call.answer(); }
+        if(st==='ringing' && n.call.direction==='inbound'){ log('auto-answering agent leg'); agentCall=n.call; n.call.answer(); }
+        if(st==='active' && n.call.direction==='inbound'){ agentCall=n.call; }
+        if(st==='hangup' && n.call===agentCall){ agentCall=null; }
       }
     });
     client.connect();
-  } catch(e){ log('connect failed: '+e.message); }
+  } catch(e){ log('connect failed: '+e.message); toast(e.message,true); }
 }
 
-function startPoll(){
-  if(poll) clearInterval(poll);
-  poll = setInterval(async () => {
-    try {
-      const j = await apiJson('/api/agent/status');
-      if(j.state!==serverState) setAgentUI(j.state);
-      $('agLead').textContent = j.leadNumber ? ('Calling '+j.leadNumber+(j.fromNumber?(' · caller ID '+j.fromNumber):'')) : 'No active call';
-    } catch {}
-  }, 1500);
+async function loadContext(){
+  try{
+    const j=await apiJson('/api/agent/context');
+    if(!j.lead){ return; }
+    curLeadId=j.lead.id; curCampaign=j.campaign;
+    renderLead(j.lead, j.caller_id);
+    renderScript(j.campaign);
+    renderHistory(j.history||[]);
+    renderDispositions(j.campaign&&j.campaign.dispositions||[]);
+  }catch(e){ /* transient */ }
 }
 
-$('agHang').onclick = async () => { log('hangup…'); try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ log(e.message); } };
+function renderLead(l, callerId){
+  const name=[l.first_name,l.last_name].filter(Boolean).join(' ')||'Unknown contact';
+  const custom=l.custom||{};
+  const extra=Object.keys(custom).filter(k=>custom[k]!=null&&custom[k]!=='').map(k=>`<div class="k">${esc(k)}</div><div>${esc(custom[k])}</div>`).join('');
+  $('leadCard').classList.remove('empty');
+  $('leadCard').innerHTML=`
+    <h3 class="leadName">${esc(name)}</h3>
+    <div class="leadPhone mt2">${esc(l.phone||'')}</div>
+    <div class="kv mt">
+      ${l.address?`<div class="k">Address</div><div>${esc(l.address)}</div>`:''}
+      ${l.state?`<div class="k">State</div><div>${esc(l.state)}</div>`:''}
+      <div class="k">Attempts</div><div>${l.attempts||0}</div>
+      ${callerId?`<div class="k">Caller ID</div><div>${esc(callerId)}</div>`:''}
+      ${extra}
+    </div>`;
+  $('notes').value='';
+}
+function renderScript(c){
+  if(!c||!c.script){ $('scriptBody').className='empty'; $('scriptBody').textContent='No script set for this campaign.'; return; }
+  $('scriptBody').className='';
+  // show merged text, but highlight what were merge fields
+  $('scriptBody').innerHTML=esc(c.script_merged||c.script);
+}
+function renderHistory(h){
+  if(!h.length){ $('history').className='empty'; $('history').textContent='No previous contact.'; return; }
+  $('history').className='hist';
+  $('history').innerHTML=h.map(x=>{
+    const d=dispositions.find(d=>d.code===x.code); const color=d?d.color:'#8792a6';
+    return `<div class="h"><span class="hbadge" style="background:${color}22;color:${color}">${esc(x.code)}</span>
+      <div><div>${esc(x.notes||'—')}</div><div class="mut2" style="font-size:11px">${new Date(x.created_at).toLocaleString()}</div></div></div>`;
+  }).join('');
+}
+function renderDispositions(list){
+  dispositions=list||[];
+  const g=$('dispGrid'); g.innerHTML='';
+  dispositions.forEach(d=>{
+    const b=document.createElement('button'); b.className='dispBtn';
+    b.innerHTML=`<span class="sw" style="background:${d.color||'#8792a6'}"></span>${esc(d.label||d.code)}${d.hotkey?`<span class="hk">${esc(d.hotkey)}</span>`:''}`;
+    b.onclick=()=>chooseDisposition(d);
+    g.appendChild(b);
+  });
+}
+
+async function chooseDisposition(d){
+  if(d.is_callback){ pendingCb=d; $('cbWrap').classList.remove('hidden');
+    const dt=new Date(Date.now()+3600e3); dt.setMinutes(dt.getMinutes()-dt.getTimezoneOffset());
+    $('cbTime').value=dt.toISOString().slice(0,16); return; }
+  await submitDisposition(d.code, null);
+}
+$('cbSave').onclick=async()=>{ if(!pendingCb) return; const v=$('cbTime').value; if(!v){toast('Pick a time',true);return;}
+  await submitDisposition(pendingCb.code, new Date(v).toISOString()); $('cbWrap').classList.add('hidden'); pendingCb=null; };
+
+async function submitDisposition(code, callback_at){
+  try{
+    const notes=$('notes').value.trim();
+    await apiJson('/api/agent/disposition','POST',{code, notes, callback_at, lead_id:curLeadId});
+    toast('Saved: '+code); $('dispReq').classList.add('hidden');
+    const w=$('wrapMsg'); w.classList.remove('hidden'); w.textContent='Advancing to next lead…';
+    setTimeout(()=>w.classList.add('hidden'),2500);
+  }catch(e){ toast(e.message,true); }
+}
+function clearLead(){
+  curLeadId=null; $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
+  $('scriptBody').className='empty'; $('scriptBody').textContent='No active call.';
+  $('history').className='empty'; $('history').textContent='No previous contact.';
+  $('dispGrid').innerHTML=''; $('notes').value=''; $('cbWrap').classList.add('hidden');
+}
+
+// call controls
+$('cMute').onclick=()=>toggleMute();
+function toggleMute(){ if(!agentCall) return; muted=!muted; try{ muted?agentCall.muteAudio():agentCall.unmuteAudio(); }catch{}
+  $('cMute').classList.toggle('active',muted); $('cMute').querySelector('span:last-child').textContent=muted?'Unmute':'Mute'; }
+$('cHold').onclick=async()=>{ held=!held; try{ await apiJson('/api/agent/hold','POST',{on:held}); }catch(e){ held=!held; toast(e.message,true); return; }
+  $('cHold').classList.toggle('active',held); $('cHold').querySelector('span:last-child').textContent=held?'Resume':'Hold'; };
+$('cPad').onclick=()=>$('padWrap').classList.toggle('hidden');
+$('cHang').onclick=async()=>{ try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ toast(e.message,true); } };
+document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/agent/dtmf','POST',{digits:b.textContent}); log('DTMF '+b.textContent); }catch(e){ toast(e.message,true); } });
+
 $('agBreak').onclick = async () => {
-  if($('agBreak').dataset.on==='1'){ // resume
-    $('agBreak').textContent='Go on break'; $('agBreak').dataset.on=''; $('agBreak').className='amber';
-    startAgent();
-  } else {
+  if($('agBreak').dataset.on==='1'){ $('agBreak').textContent='Break'; $('agBreak').dataset.on=''; $('agBreak').className='btn btn-sm btn-amber'; startAgent(); }
+  else {
     try{ await apiJson('/api/agent/offline','POST',{}); }catch(e){ log(e.message); }
-    if(client){ try{client.disconnect();}catch{} } if(poll)clearInterval(poll);
-    setAgentUI('OFFLINE'); $('agReg').textContent='softphone: —'; $('agLead').textContent='On break';
-    $('agBreak').textContent='Resume'; $('agBreak').dataset.on='1'; $('agBreak').className='grn';
+    if(client){try{client.disconnect();}catch{}} applyState('OFFLINE'); $('agConn').textContent='softphone: —';
+    $('agBreak').textContent='Resume'; $('agBreak').dataset.on='1'; $('agBreak').className='btn btn-sm btn-grn';
   }
 };
 
-// ── Admin ──
-async function loadAdmin(){ await Promise.all([loadUsers(), loadCampaigns()]); }
+// hotkeys: number keys = dispositions (in WRAP_UP/ON_CALL); space = mute on call
+document.addEventListener('keydown', e=>{
+  if(serverState==='OFFLINE'||!$('viewAgent')||$('viewAgent').classList.contains('hidden')) return;
+  const tag=(e.target.tagName||'').toLowerCase(); if(tag==='input'||tag==='textarea'||tag==='select') return;
+  if(e.code==='Space' && serverState==='ON_CALL'){ e.preventDefault(); toggleMute(); return; }
+  if(/^[0-9]$/.test(e.key) && (serverState==='WRAP_UP'||serverState==='ON_CALL')){
+    const d=dispositions.find(x=>String(x.hotkey)===e.key); if(d){ e.preventDefault(); chooseDisposition(d); }
+  }
+});
 
+// ═══════════ ADMIN (unchanged from MVP) ═══════════
+async function loadAdmin(){ await Promise.all([loadUsers(), loadCampaigns()]); }
 async function loadUsers(){
   const j = await apiJson('/api/admin/users'); usersCache=j.users;
   const tb=$('usersTbl').querySelector('tbody'); tb.innerHTML='';
-  j.users.forEach(u=>{
-    const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${esc(u.name)}</td><td class="muted">${esc(u.email||'')}</td><td>${u.role}</td><td><span class="pill">${u.state||'OFFLINE'}</span></td>`;
-    tb.appendChild(tr);
-  });
+  j.users.forEach(u=>{ const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${esc(u.name)}</td><td class="mut">${esc(u.email||'')}</td><td>${u.role}</td><td><span class="pill">${u.state||'OFFLINE'}</span></td>`;
+    tb.appendChild(tr); });
 }
 $('btnAddUser').onclick = async () => {
   $('uErr').classList.add('hidden');
   const body={ name:$('uName').value.trim(), email:$('uEmail').value.trim(), password:$('uPass').value, role:$('uRole').value };
   if(!body.name||!body.email||!body.password){ $('uErr').textContent='fill all fields'; $('uErr').classList.remove('hidden'); return; }
   $('btnAddUser').disabled=true; $('btnAddUser').textContent='Creating…';
-  try { await apiJson('/api/admin/users','POST',body); $('uName').value=$('uEmail').value=$('uPass').value=''; await loadUsers(); }
+  try { await apiJson('/api/admin/users','POST',body); $('uName').value=$('uEmail').value=$('uPass').value=''; await loadUsers(); toast('User created'); }
   catch(e){ $('uErr').textContent=e.message; $('uErr').classList.remove('hidden'); }
   finally { $('btnAddUser').disabled=false; $('btnAddUser').textContent='Create user (+ Telnyx credential)'; }
 };
-
 $('btnAddCamp').onclick = async () => {
-  const name=$('cName').value.trim(); if(!name) return;
-  $('btnAddCamp').disabled=true;
-  try { await apiJson('/api/admin/campaigns','POST',{name}); $('cName').value=''; await loadCampaigns(); }
-  catch(e){ alert(e.message); } finally { $('btnAddCamp').disabled=false; }
+  const name=$('cName').value.trim(); if(!name) return; $('btnAddCamp').disabled=true;
+  try { await apiJson('/api/admin/campaigns','POST',{name}); $('cName').value=''; await loadCampaigns(); toast('Campaign created'); }
+  catch(e){ toast(e.message,true); } finally { $('btnAddCamp').disabled=false; }
 };
-
 async function loadCampaigns(){
   const j = await apiJson('/api/admin/campaigns');
   const wrap=$('campList'); wrap.innerHTML='';
-  if(!j.campaigns.length){ wrap.innerHTML='<div class="muted">No campaigns yet.</div>'; return; }
+  if(!j.campaigns.length){ wrap.innerHTML='<div class="mut">No campaigns yet.</div>'; return; }
   const agents = usersCache.filter(u=>u.role==='agent');
   j.campaigns.forEach(c=>{
     const el=document.createElement('div'); el.className='card'; el.style.marginBottom='12px';
-    const assigned = c.agent_ids||[];
-    const st = c.lead_status||{};
+    const assigned = c.agent_ids||[]; const st=c.lead_status||{};
     const statusLine = Object.keys(st).length ? Object.entries(st).map(([k,v])=>k+':'+v).join('  ') : 'no leads';
     el.innerHTML = `
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-        <b style="font-size:15px">${esc(c.name)}</b>
-        <span class="pill ${c.status}">${c.status}</span>
-        <span class="muted" style="margin-left:auto;font-size:12px">${c.lead_total} leads · ${statusLine}</span>
-      </div>
+        <b style="font-size:15px">${esc(c.name)}</b><span class="pill ${c.status}">${c.status}</span>
+        <span class="mut" style="margin-left:auto;font-size:12px">${c.lead_total} leads · ${statusLine}</span></div>
       <div class="chips" data-assigned></div>
+      <div class="row mt"><select class="field" data-agentsel>${agents.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
+        <button class="btn btn-sm" data-assign style="flex:0 0 auto">Assign agent</button></div>
+      <div class="row mt"><input class="field" type="file" accept=".csv" data-csv />
+        <button class="btn btn-sm btn-ghost" data-upload style="flex:0 0 auto">Upload leads CSV</button></div>
       <div class="row mt">
-        <select data-agentsel>${agents.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
-        <button class="sm" data-assign style="flex:0 0 auto">Assign agent</button>
-      </div>
-      <div class="row mt">
-        <input type="file" accept=".csv" data-csv />
-        <button class="sm gray" data-upload style="flex:0 0 auto">Upload leads CSV</button>
-      </div>
-      <div class="row mt">
-        <button class="grn sm" data-act="start">Start</button>
-        <button class="amber sm" data-act="pause">Pause</button>
-        <button class="red sm" data-act="stop">Stop</button>
-        <button class="gray sm" data-act="reset">Reset</button>
-      </div>
-      <div class="muted mt" data-msg style="font-size:12px"></div>`;
-    // assigned chips
+        <button class="btn btn-sm btn-grn" data-act="start">Start</button>
+        <button class="btn btn-sm btn-amber" data-act="pause">Pause</button>
+        <button class="btn btn-sm btn-red" data-act="stop">Stop</button>
+        <button class="btn btn-sm btn-ghost" data-act="reset">Reset</button></div>
+      <div class="mut mt" data-msg style="font-size:12px"></div>`;
     const chips = el.querySelector('[data-assigned]');
-    if(assigned.length){
-      assigned.forEach(aid=>{
-        const u=usersCache.find(x=>x.id===aid); const chip=document.createElement('span'); chip.className='chip';
-        chip.innerHTML=`<b>${esc(u?u.name:aid.slice(0,8))}</b> <span data-rm style="cursor:pointer;color:var(--red)">✕</span>`;
-        chip.querySelector('[data-rm]').onclick=async()=>{ await apiJson(`/api/admin/campaigns/${c.id}/agents/${aid}`,'DELETE'); loadCampaigns(); };
-        chips.appendChild(chip);
-      });
-    } else chips.innerHTML='<span class="muted" style="font-size:12px">no agents assigned</span>';
-
+    if(assigned.length){ assigned.forEach(aid=>{ const u=usersCache.find(x=>x.id===aid); const chip=document.createElement('span'); chip.className='chip';
+      chip.innerHTML=`<b>${esc(u?u.name:aid.slice(0,8))}</b> <span data-rm style="cursor:pointer;color:var(--red)">✕</span>`;
+      chip.querySelector('[data-rm]').onclick=async()=>{ await apiJson(`/api/admin/campaigns/${c.id}/agents/${aid}`,'DELETE'); loadCampaigns(); }; chips.appendChild(chip); }); }
+    else chips.innerHTML='<span class="mut" style="font-size:12px">no agents assigned</span>';
     const msg=(m)=>{ el.querySelector('[data-msg]').textContent=m; };
     el.querySelector('[data-assign]').onclick=async()=>{ const aid=el.querySelector('[data-agentsel]').value; if(!aid)return; try{ await apiJson(`/api/admin/campaigns/${c.id}/agents`,'POST',{agent_id:aid}); loadCampaigns(); }catch(e){ msg(e.message); } };
-    el.querySelector('[data-upload]').onclick=async()=>{
-      const f=el.querySelector('[data-csv]').files[0]; if(!f){ msg('choose a CSV first'); return; }
-      msg('uploading…');
-      const text=await f.text();
-      try{ const r=await api(`/api/admin/campaigns/${c.id}/leads`,{ method:'POST', headers:{'Content-Type':'text/csv'}, body:text }); const jj=await r.json(); if(!r.ok)throw new Error(jj.error||'upload failed'); msg(`inserted ${jj.inserted} leads${jj.skipped?(' · skipped '+jj.skipped):''}`); loadCampaigns(); }catch(e){ msg(e.message); }
-    };
+    el.querySelector('[data-upload]').onclick=async()=>{ const f=el.querySelector('[data-csv]').files[0]; if(!f){ msg('choose a CSV first'); return; } msg('uploading…');
+      const text=await f.text(); try{ const r=await api(`/api/admin/campaigns/${c.id}/leads`,{ method:'POST', headers:{'Content-Type':'text/csv'}, body:text }); const jj=await r.json(); if(!r.ok)throw new Error(jj.error||'upload failed'); msg(`inserted ${jj.inserted} leads${jj.skipped?(' · skipped '+jj.skipped):''}`); loadCampaigns(); }catch(e){ msg(e.message); } };
     el.querySelectorAll('[data-act]').forEach(b=>b.onclick=async()=>{ try{ await apiJson(`/api/admin/campaigns/${c.id}/${b.dataset.act}`,'POST',{}); loadCampaigns(); }catch(e){ msg(e.message); } });
     wrap.appendChild(el);
   });
 }
 
-function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-
-// boot
 route();
 </script>
 </body>
