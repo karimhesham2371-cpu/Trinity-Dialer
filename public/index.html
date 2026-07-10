@@ -191,6 +191,45 @@
   .tbtn.on--ok{background:var(--ok-tint);border-color:transparent}
   .tbtn.on--warn{background:var(--warn-tint);border-color:transparent}
   .tbtn.on--danger{background:var(--danger-tint);border-color:transparent}
+  /* ── admin nav tabs ── */
+  .navtabs{display:flex;gap:4px}
+  .navtab{background:transparent;border:none;color:var(--text-dim);font:600 13px var(--font-ui);cursor:pointer;
+          padding:0 12px;height:32px;border-radius:8px}
+  .navtab:hover{background:var(--surface-2);color:var(--text)}
+  .navtab.active{color:var(--accent-ink);background:var(--accent)}
+  .wrap.wide{max-width:1200px}
+  /* ── reports landing tiles ── */
+  .rgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  @media(max-width:900px){.rgrid{grid-template-columns:1fr 1fr}}
+  @media(max-width:600px){.rgrid{grid-template-columns:1fr}}
+  .rtile{text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px}
+  .rtile:hover{border-color:var(--border-strong);background:var(--surface-2)}
+  .rtile h3{font:600 15px var(--font-ui);margin:0 0 6px}
+  .rtile p{font-size:12.5px;color:var(--text-dim);margin:0;line-height:1.5}
+  .rback{background:transparent;border:none;color:var(--text-dim);font:500 12px var(--font-ui);cursor:pointer;padding:0}
+  .rback:hover{color:var(--text)}
+  .rfilters{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:16px}
+  .rfilters .field{width:auto;min-width:140px}
+  .rfilters .fw{display:flex;flex-direction:column;gap:6px}
+  .tblwrap{overflow:auto;max-height:62vh;border:1px solid var(--border);border-radius:10px}
+  .tblwrap table{font-size:13px}
+  .tblwrap thead th{position:sticky;top:0;z-index:1}
+  audio.mini{height:30px;vertical-align:middle}
+  .stattag{font:500 11px var(--font-ui);text-transform:uppercase;letter-spacing:.04em}
+  /* ── office map ── */
+  .floorwrap{position:relative;width:100%;height:60vh;min-height:420px;background:var(--surface);
+             border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  .seat{position:absolute;transform:translate(-50%,-50%);min-width:110px;padding:8px 10px;border-radius:10px;
+        background:var(--surface-2);border:1px solid var(--border);cursor:grab;user-select:none}
+  .seat.drag{cursor:grabbing;z-index:5;box-shadow:0 4px 16px rgba(0,0,0,.4)}
+  .seat b{display:block;font:600 12.5px var(--font-ui);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+  .seat .seatstate{font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.04em;color:var(--text-dim);margin-top:3px;display:flex;align-items:center;gap:5px}
+  .seat--ok{border-left:2px solid var(--ok);background:var(--ok-tint)}
+  .seat--warn{border-left:2px solid var(--warn);background:var(--warn-tint)}
+  .seat--danger{border-left:2px solid var(--danger);background:var(--danger-tint)}
+  .seat--info{border-left:2px solid var(--info);background:var(--info-tint)}
+  .benchwrap{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  .bench{padding:6px 10px;border-radius:10px;background:var(--surface-2);border:1px dashed var(--border-strong);cursor:grab;font:600 12.5px var(--font-ui)}
 </style>
 </head>
 <body>
@@ -298,11 +337,16 @@
 <div id="viewAdmin" class="hidden">
   <div class="appbar">
     <div class="brand"><div class="mark">T</div><h1>Trinity — Admin</h1></div>
+    <div class="navtabs" style="margin-left:18px">
+      <button id="tabConsole" class="navtab active" onclick="adminTab('console')">Console</button>
+      <button id="tabReports" class="navtab" onclick="adminTab('reports')">Reports</button>
+    </div>
     <div class="sp"></div>
     <span class="who" id="adWho"></span>
     <button class="btn btn-sm" onclick="logout()">Sign out</button>
   </div>
-  <div class="wrap">
+
+  <div id="adminConsole" class="wrap">
     <div class="grid2">
       <div class="card">
         <h2>Agents</h2>
@@ -327,6 +371,30 @@
     <div class="card mt">
       <h2>Campaigns</h2>
       <div id="campList"></div>
+    </div>
+  </div>
+
+  <div id="adminReports" class="wrap wide hidden">
+    <!-- landing -->
+    <div id="repHome">
+      <div class="rgrid">
+        <button class="rtile" onclick="openReport('audit')"><h3>Audit logs</h3><p>Every user action — logins, calls, saved files, campaign changes.</p></button>
+        <button class="rtile" onclick="openReport('calls')"><h3>Call logs</h3><p>All calls placed. Listen to and download recordings.</p></button>
+        <button class="rtile" onclick="openReport('agent')"><h3>Agent report</h3><p>Logged-in, dialing, talk, wrap and break time per agent. Export CSV.</p></button>
+        <button class="rtile" onclick="openReport('research')"><h3>Research calls</h3><p>Find a specific call by its phone number.</p></button>
+        <button class="rtile" onclick="openReport('map')"><h3>Office map</h3><p>Live floor — each agent's seat and current status.</p></button>
+      </div>
+    </div>
+    <!-- panel -->
+    <div id="repPanel" class="hidden">
+      <div class="row" style="align-items:center;margin-bottom:14px">
+        <button class="rback" onclick="closeReport()">← Reports</button>
+        <h2 id="repTitle" style="margin:0 0 0 12px"></h2>
+        <div class="sp" style="flex:1"></div>
+        <button id="repExport" class="btn btn-sm hidden">Export CSV</button>
+      </div>
+      <div id="repFilters" class="rfilters"></div>
+      <div id="repBody"></div>
     </div>
   </div>
 </div>
@@ -575,7 +643,7 @@ document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{ try
 $('agBreak').onclick = async () => {
   if($('agBreak').dataset.on==='1'){ $('agBreak').textContent='Break'; $('agBreak').dataset.on=''; $('agBreak').className='btn btn-sm'; startAgent(); }
   else {
-    try{ await apiJson('/api/agent/offline','POST',{}); }catch(e){ log(e.message); }
+    try{ await apiJson('/api/agent/offline','POST',{reason:'break'}); }catch(e){ log(e.message); }
     if(client){try{client.disconnect();}catch{}} applyState('BREAK'); $('agConn').className='pill pill--faint'; $('agConn').textContent='Softphone —';
     $('agBreak').textContent='Resume'; $('agBreak').dataset.on='1'; $('agBreak').className='btn btn-sm btn-primary';
   }
@@ -666,6 +734,199 @@ async function loadCampaigns(){
     el.querySelectorAll('[data-act]').forEach(b=>b.onclick=async()=>{ try{ await apiJson(`/api/admin/campaigns/${c.id}/${b.dataset.act}`,'POST',{}); loadCampaigns(); }catch(e){ msg(e.message); } });
     wrap.appendChild(el);
     enhanceSelect(el.querySelector('[data-agentsel]'));
+  });
+}
+
+// ═══════════ ADMIN: REPORTS ═══════════
+let adminWs=null, floorAgents=[], agentRepRows=[];
+const REPTITLES={audit:'Audit logs',calls:'Call logs',agent:'Agent report',research:'Research calls',map:'Office map'};
+
+function adminTab(which){
+  const rep = which==='reports';
+  $('adminConsole').classList.toggle('hidden', rep);
+  $('adminReports').classList.toggle('hidden', !rep);
+  $('tabConsole').classList.toggle('active', !rep);
+  $('tabReports').classList.toggle('active', rep);
+  if(rep) closeReport(); else closeAdminWs();
+}
+function closeReport(){ $('repPanel').classList.add('hidden'); $('repHome').classList.remove('hidden'); closeAdminWs(); }
+function openReport(kind){
+  $('repHome').classList.add('hidden'); $('repPanel').classList.remove('hidden');
+  $('repTitle').textContent=REPTITLES[kind]||''; $('repExport').classList.toggle('hidden', kind!=='agent');
+  $('repFilters').innerHTML=''; $('repBody').innerHTML='';
+  if(kind!=='map') closeAdminWs();
+  ({audit:initAudit,calls:initCalls,agent:initAgent,research:initResearch,map:renderMap}[kind]||(()=>{}))();
+}
+
+// ── formatting helpers ──
+function fmtDur(sec){ sec=Math.round(sec||0); if(sec<60) return sec+'s';
+  const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=sec%60;
+  return h ? h+'h '+String(m).padStart(2,'0')+'m' : m+'m '+String(s).padStart(2,'0')+'s'; }
+function fmtTime(iso){ if(!iso) return '—'; const d=new Date(iso); const diff=(Date.now()-d.getTime())/1000;
+  if(diff>=0 && diff<3600){ const m=Math.floor(diff/60); return m<1?'just now':m+' min ago'; }
+  return d.toLocaleString([], {hour12:false,month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); }
+function dstr(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function csvq(s){ s=String(s==null?'':s); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }
+function stateDot(s){ return {AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',CLAIMING:'info',WRAP_UP:'warn',BREAK:'warn'}[s]||'faint'; }
+
+// ── 1) Audit logs ──
+function initAudit(){
+  const ACTIONS=['LOGIN','LOGOUT','GO_AVAILABLE','GO_BREAK','ADD_AGENT','CREATE_CAMPAIGN','UPLOAD_LEADS',
+    'CAMPAIGN_START','CAMPAIGN_PAUSE','CAMPAIGN_STOP','CAMPAIGN_RESET','DISPOSITION','CALL_LISTEN','CALL_DOWNLOAD'];
+  $('repFilters').innerHTML=`
+    <div class="fw"><span class="lbl">From</span><input id="fAuFrom" class="field" type="datetime-local"></div>
+    <div class="fw"><span class="lbl">To</span><input id="fAuTo" class="field" type="datetime-local"></div>
+    <div class="fw"><span class="lbl">Action</span><select id="fAuAction" class="field"><option value="">All actions</option>${ACTIONS.map(a=>`<option>${a}</option>`).join('')}</select></div>
+    <button id="fAuGo" class="btn btn-primary" style="height:36px">Apply</button>`;
+  enhanceSelect($('fAuAction')); $('fAuGo').onclick=loadAudit; loadAudit();
+}
+async function loadAudit(){
+  const q=new URLSearchParams(); const f=$('fAuFrom').value,t=$('fAuTo').value,a=$('fAuAction').value;
+  if(f) q.set('from',new Date(f).toISOString()); if(t) q.set('to',new Date(t).toISOString()); if(a) q.set('action',a);
+  q.set('limit','500'); $('repBody').innerHTML='<div class="dim" style="padding:16px">Loading…</div>';
+  try{ const j=await apiJson('/api/admin/reports/audit?'+q.toString());
+    if(!j.rows.length){ $('repBody').innerHTML='<div class="empty">No activity in this range.</div>'; return; }
+    const rows=j.rows.map(r=>{
+      const detail=r.meta&&Object.keys(r.meta).length?esc(JSON.stringify(r.meta)):'';
+      const tgt=r.target_type?esc(r.target_type)+(r.target_id?' '+esc(String(r.target_id).slice(0,8)):''):'';
+      return `<tr><td class="mono dim">${fmtTime(r.created_at)}</td><td>${esc(r.actor_name||'—')}</td>
+        <td class="dim">${esc(r.actor_role||'')}</td><td><span class="stattag">${esc(r.action)}</span></td>
+        <td class="dim">${tgt}</td><td class="dim mono" style="font-size:11px">${detail}</td></tr>`; }).join('');
+    $('repBody').innerHTML=`<div class="tblwrap"><table><thead><tr><th>Time</th><th>Actor</th><th>Role</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; }
+}
+
+// ── 2) Call logs + shared calls table (also used by Research) ──
+function callTalk(r){ return (r.bridged_at&&r.ended_at)?fmtDur((new Date(r.ended_at)-new Date(r.bridged_at))/1000):'—'; }
+function renderCallsTable(rows, emptyMsg){
+  if(!rows.length){ $('repBody').innerHTML='<div class="empty">'+esc(emptyMsg)+'</div>'; return; }
+  const body=rows.map(r=>{
+    const rec=r.recording_url
+      ? `<button class="btn btn-sm" onclick="listenRec(this,'${r.id}')">Listen</button> <button class="btn btn-sm" onclick="dlRec('${r.id}')">Download</button>`
+      : '<span class="dim">—</span>';
+    return `<tr><td class="mono dim">${fmtTime(r.created_at)}</td><td>${esc(r.agent_name||'—')}</td>
+      <td class="mono">${esc(r.from_number||'')}</td><td class="mono">${esc(r.to_number||'')}</td>
+      <td class="mono">${callTalk(r)}</td><td>${rec}</td></tr>`; }).join('');
+  $('repBody').innerHTML=`<div class="tblwrap"><table><thead><tr><th>Time</th><th>Agent</th><th>From</th><th>To</th><th>Talk</th><th>Recording</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+async function listenRec(btn,id){ try{ const j=await apiJson('/api/admin/reports/recording/'+id);
+  btn.closest('td').innerHTML=`<audio class="mini" controls autoplay src="${j.url}"></audio>`; }catch(e){ toast(e.message,'err'); } }
+async function dlRec(id){ try{ const j=await apiJson('/api/admin/reports/recording/'+id+'?download=1');
+  const a=document.createElement('a'); a.href=j.url; a.target='_blank'; a.download=''; document.body.appendChild(a); a.click(); a.remove(); }catch(e){ toast(e.message,'err'); } }
+function initCalls(){
+  $('repFilters').innerHTML=`
+    <div class="fw"><span class="lbl">From</span><input id="fClFrom" class="field" type="datetime-local"></div>
+    <div class="fw"><span class="lbl">To</span><input id="fClTo" class="field" type="datetime-local"></div>
+    <button id="fClGo" class="btn btn-primary" style="height:36px">Apply</button>`;
+  $('fClGo').onclick=loadCalls; loadCalls();
+}
+async function loadCalls(){
+  const q=new URLSearchParams(); const f=$('fClFrom').value,t=$('fClTo').value;
+  if(f) q.set('from',new Date(f).toISOString()); if(t) q.set('to',new Date(t).toISOString());
+  q.set('limit','500'); $('repBody').innerHTML='<div class="dim" style="padding:16px">Loading…</div>';
+  try{ const j=await apiJson('/api/admin/reports/calls?'+q.toString()); renderCallsTable(j.rows,'No calls in this range.'); }
+  catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; }
+}
+
+// ── 3) Agent report ──
+function initAgent(){
+  const now=new Date(), start=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  $('repFilters').innerHTML=`
+    <div class="fw"><span class="lbl">From</span><input id="fAgFrom" class="field" type="date" value="${dstr(start)}"></div>
+    <div class="fw"><span class="lbl">To</span><input id="fAgTo" class="field" type="date" value="${dstr(now)}"></div>
+    <button id="fAgGo" class="btn btn-primary" style="height:36px">Apply</button>`;
+  $('fAgGo').onclick=loadAgentRep; $('repExport').onclick=exportAgentCsv; loadAgentRep();
+}
+async function loadAgentRep(){
+  const f=$('fAgFrom').value, t=$('fAgTo').value; const q=new URLSearchParams();
+  if(f) q.set('from', new Date(f+'T00:00:00').toISOString());
+  if(t){ const d=new Date(t+'T00:00:00'); d.setDate(d.getDate()+1); q.set('to', d.toISOString()); }
+  $('repBody').innerHTML='<div class="dim" style="padding:16px">Loading…</div>';
+  try{ const j=await apiJson('/api/admin/reports/agent?'+q.toString()); agentRepRows=j.rows;
+    if(!j.rows.length){ $('repBody').innerHTML='<div class="empty">No agent activity in this range.</div>'; return; }
+    const rows=j.rows.map(r=>`<tr><td>${esc(r.name)}</td>
+      <td class="mono">${fmtDur(r.logged_in)}</td><td class="mono">${fmtDur(r.dialing)}</td><td class="mono">${fmtDur(r.talk)}</td>
+      <td class="mono">${fmtDur(r.wrap)}</td><td class="mono">${fmtDur(r.break)}</td><td class="mono">${fmtDur(r.available)}</td></tr>`).join('');
+    $('repBody').innerHTML=`<div class="tblwrap"><table><thead><tr><th>Agent</th><th>Logged in</th><th>Dialing</th><th>Talk</th><th>Wrap</th><th>Break</th><th>Available</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; }
+}
+function exportAgentCsv(){
+  if(!agentRepRows.length){ toast('Nothing to export','warn'); return; }
+  const head=['Agent','Logged in (s)','Dialing (s)','Talk (s)','Wrap (s)','Break (s)','Available (s)'];
+  const lines=[head.join(',')].concat(agentRepRows.map(r=>[csvq(r.name),r.logged_in,r.dialing,r.talk,r.wrap,r.break,r.available].join(',')));
+  const blob=new Blob([lines.join('\n')],{type:'text/csv'}); const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download='agent-report.csv'; a.click(); URL.revokeObjectURL(a.href);
+  toast('Agent report exported');
+}
+
+// ── 4) Research calls ──
+function initResearch(){
+  $('repFilters').innerHTML=`<div class="fw"><span class="lbl">Phone number</span><input id="fRePhone" class="field" placeholder="e.g. 4045551234" style="min-width:200px"></div>
+    <button id="fReGo" class="btn btn-primary" style="height:36px">Search</button>`;
+  $('fReGo').onclick=loadResearch; $('fRePhone').addEventListener('keydown',e=>{ if(e.key==='Enter') loadResearch(); });
+  $('repBody').innerHTML='<div class="empty">Enter a phone number to find its calls.</div>';
+}
+async function loadResearch(){
+  const p=$('fRePhone').value.replace(/[^\d]/g,''); if(!p){ toast('Enter a phone number','warn'); return; }
+  $('repBody').innerHTML='<div class="dim" style="padding:16px">Searching…</div>';
+  try{ const j=await apiJson('/api/admin/reports/research?phone='+encodeURIComponent(p)); renderCallsTable(j.rows,'No calls found for that number.'); }
+  catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; }
+}
+
+// ── 5) Office map (spatial floor plan) ──
+function openAdminWs(){
+  if(adminWs && adminWs.readyState<=1) return;
+  const proto=location.protocol==='https:'?'wss':'ws';
+  adminWs=new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
+  adminWs.onmessage=(ev)=>{ let m; try{ m=JSON.parse(ev.data); }catch{ return; }
+    if(m.type==='floor.agent'){ const a=floorAgents.find(x=>x.id===m.agentId); if(a){ a.state=m.state; updateSeatState(a.id,m.state); } } };
+  adminWs.onclose=()=>{ adminWs=null; };
+}
+function closeAdminWs(){ if(adminWs){ try{ adminWs.close(); }catch{} adminWs=null; } }
+async function renderMap(){
+  try{ const j=await apiJson('/api/admin/floor'); floorAgents=j.agents; }
+  catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
+  $('repBody').innerHTML=`<p class="dim" style="font-size:12px;margin:0 0 12px">Drag an agent onto the floor to place their desk; drag off to unseat. Positions are saved.</p>
+    <div class="floorwrap" id="floor"></div>
+    <div class="lbl mt3">Unseated agents</div><div class="benchwrap" id="bench"></div>`;
+  drawFloor(); openAdminWs();
+}
+function seatEl(a){ const dc=stateDot(a.state); const el=document.createElement('div');
+  el.className='seat seat--'+dc; el.dataset.aid=a.id;
+  el.innerHTML=`<b>${esc(a.name)}</b><div class="seatstate"><span class="dot dot--${dc}"></span><span data-st>${esc(a.state)}</span></div>`;
+  return el; }
+function drawFloor(){
+  const floor=$('floor'), bench=$('bench'); floor.innerHTML=''; bench.innerHTML='';
+  floorAgents.forEach(a=>{
+    if(a.seat_x!=null && a.seat_y!=null){ const el=seatEl(a); el.style.left=a.seat_x+'%'; el.style.top=a.seat_y+'%'; floor.appendChild(el); makeDraggable(el,a.id); }
+    else { const b=document.createElement('div'); b.className='bench'; b.dataset.aid=a.id; b.textContent=a.name; bench.appendChild(b); makeDraggable(b,a.id); }
+  });
+  if(!bench.children.length) bench.innerHTML='<span class="dim" style="font-size:12px">Everyone is seated.</span>';
+}
+function updateSeatState(aid,state){
+  const floor=$('floor'); if(!floor) return; const el=floor.querySelector('.seat[data-aid="'+aid+'"]'); if(!el) return;
+  const dc=stateDot(state); el.className='seat seat--'+dc+(el.classList.contains('drag')?' drag':'');
+  const st=el.querySelector('[data-st]'); if(st) st.textContent=state;
+  const dot=el.querySelector('.dot'); if(dot) dot.className='dot dot--'+dc;
+}
+function makeDraggable(el, agentId){
+  el.addEventListener('mousedown',(e)=>{
+    e.preventDefault(); const floor=$('floor'); const rect=floor.getBoundingClientRect();
+    let moved=false; el.classList.add('drag');
+    const move=(ev)=>{ moved=true;
+      if(el.parentElement!==floor){ floor.appendChild(el); el.style.position='absolute'; el.style.transform='translate(-50%,-50%)'; }
+      let x=(ev.clientX-rect.left)/rect.width*100, y=(ev.clientY-rect.top)/rect.height*100;
+      x=Math.max(4,Math.min(96,x)); y=Math.max(6,Math.min(94,y));
+      el.style.left=x+'%'; el.style.top=y+'%'; el.dataset.x=x; el.dataset.y=y; };
+    const up=async(ev)=>{
+      document.removeEventListener('mousemove',move); document.removeEventListener('mouseup',up); el.classList.remove('drag');
+      if(!moved) return; const r=floor.getBoundingClientRect();
+      const outside=ev.clientX<r.left||ev.clientX>r.right||ev.clientY<r.top||ev.clientY>r.bottom;
+      try{ await apiJson('/api/admin/floor/seat','POST', outside?{agent_id:agentId,x:null,y:null}:{agent_id:agentId,x:parseFloat(el.dataset.x),y:parseFloat(el.dataset.y)}); }
+      catch(err){ toast(err.message,'err'); }
+      renderMap();
+    };
+    document.addEventListener('mousemove',move); document.addEventListener('mouseup',up);
   });
 }
 

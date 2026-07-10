@@ -142,9 +142,40 @@ async function persistRt(id) {
   return sbUpdate('agents', `id=eq.${id}`, patch).catch(e => console.error('[persistRt]', e.message));
 }
 
+// Audit trail: fire-and-forget user-activity log for the Audit Logs report.
+function audit(actor, action, { target_type, target_id, meta } = {}) {
+  sbLog('audit_log', {
+    actor_id: (actor && actor.id) || null,
+    actor_name: (actor && actor.name) || null,
+    actor_role: (actor && actor.role) || null,
+    action,
+    target_type: target_type || null,
+    target_id: target_id != null ? String(target_id) : null,
+    meta: meta || {},
+  });
+}
+
+// Agent time tracking: one row per state span, so the Agent Report can sum
+// login / dialing / talk / wrap / break durations. Closing is done by an
+// agent_id + ended_at.is.null filter so it survives in-memory rt resets.
+function logStateEvent(id, state) {
+  if (!SB_HOST) return;
+  const st = rt[id] || (rt[id] = {});
+  if (st.loggedState === state) return;
+  const now = new Date().toISOString();
+  const durSec = st.stateStart ? Math.max(0, Math.round((Date.now() - st.stateStart) / 1000)) : null;
+  sbUpdate('agent_state_events', `agent_id=eq.${id}&ended_at=is.null`,
+    { ended_at: now, duration_sec: durSec }).catch(() => {});
+  st.loggedState = state; st.stateStart = Date.now();
+  // OFFLINE isn't tracked as a span (we only closed the previous open one).
+  if (state !== 'OFFLINE') sbLog('agent_state_events', { agent_id: id, state, started_at: now });
+}
+
 async function setAgentState(id, state) {
+  const changed = !rt[id] || rt[id].loggedState !== state;
   if (rt[id]) { rt[id].state = state; rt[id].rtUpdatedAt = Date.now(); }
   await persistRt(id);
+  if (changed) logStateEvent(id, state);
   wsAgentSnapshot(id);   // push to the agent's own socket + the admin floor
 }
 
@@ -242,6 +273,7 @@ app.post('/api/login', async (req, res) => {
     if (!a || !a.active || !a.password_hash) return res.status(401).json({ error: 'invalid login' });
     const ok = await bcrypt.compare(password, a.password_hash);
     if (!ok) return res.status(401).json({ error: 'invalid login' });
+    audit({ id: a.id, name: a.name, role: a.role }, 'LOGIN', { target_type: 'session' });
     res.json({ token: signToken(a), user: { id: a.id, name: a.name, email: a.email, role: a.role } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -288,6 +320,7 @@ app.post('/api/admin/users', auth, adminOnly, async (req, res) => {
       name, email: String(email).trim(), password_hash: hash, role: role === 'admin' ? 'admin' : 'agent',
       telnyx_credential_id: credId, sip_username: sip, active: true, state: 'OFFLINE',
     });
+    audit(req.user, 'ADD_AGENT', { target_type: 'agent', target_id: row.id, meta: { name: row.name, email: row.email, role: row.role } });
     res.json({ ok: true, user: { id: row.id, name: row.name, email: row.email, role: row.role, sip_username: sip } });
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
@@ -324,6 +357,7 @@ app.post('/api/admin/campaigns', auth, adminOnly, async (req, res) => {
   if (!name) return res.status(400).json({ error: 'name required' });
   try {
     const [row] = await sbInsert('campaigns', { name, status: 'DRAFT', active: false });
+    audit(req.user, 'CREATE_CAMPAIGN', { target_type: 'campaign', target_id: row.id, meta: { name } });
     res.json({ ok: true, campaign: row });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -379,6 +413,7 @@ app.post('/api/admin/campaigns/:id/leads', auth, adminOnly, async (req, res) => 
       await sbInsert('leads', leads.slice(i, i + 500));
       inserted += Math.min(500, leads.length - i);
     }
+    audit(req.user, 'UPLOAD_LEADS', { target_type: 'campaign', target_id: req.params.id, meta: { inserted, skipped: rows.length - leads.length } });
     res.json({ ok: true, inserted, skipped: rows.length - leads.length });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -387,15 +422,21 @@ async function setCampaignStatus(id, status) {
   await sbUpdate('campaigns', `id=eq.${id}`, { status, active: status === 'RUNNING' });
 }
 app.post('/api/admin/campaigns/:id/start', auth, adminOnly, async (req, res) => {
-  try { await setCampaignStatus(req.params.id, 'RUNNING'); res.json({ ok: true, status: 'RUNNING' }); }
+  try { await setCampaignStatus(req.params.id, 'RUNNING');
+    audit(req.user, 'CAMPAIGN_START', { target_type: 'campaign', target_id: req.params.id });
+    res.json({ ok: true, status: 'RUNNING' }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/api/admin/campaigns/:id/pause', auth, adminOnly, async (req, res) => {
-  try { await setCampaignStatus(req.params.id, 'PAUSED'); res.json({ ok: true, status: 'PAUSED' }); }
+  try { await setCampaignStatus(req.params.id, 'PAUSED');
+    audit(req.user, 'CAMPAIGN_PAUSE', { target_type: 'campaign', target_id: req.params.id });
+    res.json({ ok: true, status: 'PAUSED' }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/api/admin/campaigns/:id/stop', auth, adminOnly, async (req, res) => {
-  try { await setCampaignStatus(req.params.id, 'STOPPED'); res.json({ ok: true, status: 'STOPPED' }); }
+  try { await setCampaignStatus(req.params.id, 'STOPPED');
+    audit(req.user, 'CAMPAIGN_STOP', { target_type: 'campaign', target_id: req.params.id });
+    res.json({ ok: true, status: 'STOPPED' }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Reset: stop, and requeue every lead back to NEW (attempts zeroed)
@@ -404,8 +445,122 @@ app.post('/api/admin/campaigns/:id/reset', auth, adminOnly, async (req, res) => 
     await setCampaignStatus(req.params.id, 'STOPPED');
     await sbUpdate('leads', `campaign_id=eq.${req.params.id}`,
       { status: 'NEW', attempts: 0, last_attempt_at: null, next_callback_at: null, assigned_agent_id: null });
+    audit(req.user, 'CAMPAIGN_RESET', { target_type: 'campaign', target_id: req.params.id });
     res.json({ ok: true, status: 'STOPPED' });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ ADMIN: reports ══════════════════════════════════════════════════════════════
+// 1) Audit Logs — user activity trail. Filters: from, to, actor_id, action, limit.
+app.get('/api/admin/reports/audit', auth, adminOnly, async (req, res) => {
+  const { from, to, actor_id, action } = req.query;
+  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+  const f = ['select=*', `order=created_at.desc`, `limit=${limit}`];
+  if (from)     f.push(`created_at=gte.${encodeURIComponent(from)}`);
+  if (to)       f.push(`created_at=lte.${encodeURIComponent(to)}`);
+  if (actor_id) f.push(`actor_id=eq.${actor_id}`);
+  if (action)   f.push(`action=eq.${encodeURIComponent(action)}`);
+  try { res.json({ rows: await sbSelect('audit_log', f.join('&')) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 2) Call Logs — calls with recordings for listen/download. Filters: from,to,agent_id.
+async function agentNameMap() {
+  const rows = await sbSelect('agents', 'select=id,name');
+  return rows.reduce((m, a) => (m[a.id] = a.name, m), {});
+}
+app.get('/api/admin/reports/calls', auth, adminOnly, async (req, res) => {
+  const { from, to, agent_id } = req.query;
+  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+  const f = ['select=*', 'order=created_at.desc', `limit=${limit}`];
+  if (from)     f.push(`created_at=gte.${encodeURIComponent(from)}`);
+  if (to)       f.push(`created_at=lte.${encodeURIComponent(to)}`);
+  if (agent_id) f.push(`agent_id=eq.${agent_id}`);
+  try {
+    const [rows, names] = await Promise.all([sbSelect('calls', f.join('&')), agentNameMap()]);
+    res.json({ rows: rows.map(r => ({ ...r, agent_name: names[r.agent_id] || null })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 3) Research Calls — find calls by phone number (matches either leg).
+app.get('/api/admin/reports/research', auth, adminOnly, async (req, res) => {
+  const digits = String(req.query.phone || '').replace(/[^\d]/g, '');
+  if (!digits) return res.status(400).json({ error: 'phone required' });
+  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+  const pat = `*${digits}*`;
+  try {
+    const [rows, names] = await Promise.all([
+      sbSelect('calls', `or=(to_number.ilike.${pat},from_number.ilike.${pat})&order=created_at.desc&limit=${limit}&select=*`),
+      agentNameMap(),
+    ]);
+    res.json({ rows: rows.map(r => ({ ...r, agent_name: names[r.agent_id] || null })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 4) Agent Report — per-agent logged-in / dialing / talk / wrap / break seconds
+// over [from,to], computed by clamping each state span to the window.
+app.get('/api/admin/reports/agent', auth, adminOnly, async (req, res) => {
+  const now = Date.now();
+  const from = req.query.from ? new Date(req.query.from).getTime() : (now - 24 * 3600e3);
+  const to   = req.query.to   ? new Date(req.query.to).getTime()   : now;
+  // Buckets that make up "logged in" time.
+  const LOGGED = new Set(['CONNECTING', 'AVAILABLE', 'CLAIMING', 'DIALING', 'ON_CALL', 'WRAP_UP', 'BREAK']);
+  try {
+    // Any span overlapping the window: started before `to` AND (open OR ended after `from`).
+    const spans = await sbSelect('agent_state_events',
+      `started_at=lte.${encodeURIComponent(new Date(to).toISOString())}` +
+      `&or=(ended_at.is.null,ended_at.gte.${encodeURIComponent(new Date(from).toISOString())})` +
+      `&select=agent_id,state,started_at,ended_at&limit=100000`);
+    const names = await agentNameMap();
+    const acc = {};
+    for (const s of spans) {
+      const start = new Date(s.started_at).getTime();
+      const end   = s.ended_at ? new Date(s.ended_at).getTime() : now;
+      const dur   = Math.max(0, Math.min(end, to) - Math.max(start, from)) / 1000;
+      if (dur <= 0) continue;
+      const a = acc[s.agent_id] || (acc[s.agent_id] = { agent_id: s.agent_id, name: names[s.agent_id] || '—',
+        logged_in: 0, dialing: 0, talk: 0, wrap: 0, break: 0, available: 0 });
+      if (LOGGED.has(s.state)) a.logged_in += dur;
+      if (s.state === 'DIALING' || s.state === 'CLAIMING') a.dialing += dur;
+      else if (s.state === 'ON_CALL') a.talk += dur;
+      else if (s.state === 'WRAP_UP') a.wrap += dur;
+      else if (s.state === 'BREAK') a.break += dur;
+      else if (s.state === 'AVAILABLE' || s.state === 'CONNECTING') a.available += dur;
+    }
+    const rows = Object.values(acc).map(a => {
+      for (const k of ['logged_in', 'dialing', 'talk', 'wrap', 'break', 'available']) a[k] = Math.round(a[k]);
+      return a;
+    }).sort((x, y) => y.logged_in - x.logged_in);
+    res.json({ from: new Date(from).toISOString(), to: new Date(to).toISOString(), rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Recording access — returns the URL and audits the listen/download.
+app.get('/api/admin/reports/recording/:id', auth, adminOnly, async (req, res) => {
+  try {
+    const rows = await sbSelect('calls', `id=eq.${req.params.id}&select=id,recording_url,to_number,from_number`);
+    const c = rows[0];
+    if (!c || !c.recording_url) return res.status(404).json({ error: 'no recording' });
+    const download = req.query.download === '1';
+    audit(req.user, download ? 'CALL_DOWNLOAD' : 'CALL_LISTEN',
+      { target_type: 'call', target_id: c.id, meta: { to: c.to_number, from: c.from_number } });
+    res.json({ url: c.recording_url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 5) Office Map — seats + live status. GET floor, POST a seat position.
+app.get('/api/admin/floor', auth, adminOnly, async (_req, res) => {
+  try {
+    const rows = await sbSelect('agents', 'active=eq.true&select=id,name,role,seat_x,seat_y&order=name.asc');
+    res.json({ agents: rows.map(a => ({ ...a, state: (rt[a.id] && rt[a.id].state) || 'OFFLINE' })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/admin/floor/seat', auth, adminOnly, async (req, res) => {
+  const { agent_id, x, y } = req.body || {};
+  if (!agent_id) return res.status(400).json({ error: 'agent_id required' });
+  const patch = { seat_x: x == null ? null : Number(x), seat_y: y == null ? null : Number(y) };
+  try { await sbUpdate('agents', `id=eq.${agent_id}`, patch); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══ AGENT: softphone token + presence ══════════════════════════════════════════
@@ -425,12 +580,19 @@ app.get('/api/agent/token', auth, async (req, res) => {
 app.post('/api/agent/available', auth, async (req, res) => {
   const id = req.user.id;
   if (!CONNECTION_ID) return res.status(400).json({ error: 'TELNYX_CONNECTION_ID not set' });
-  if (rt[id] && rt[id].state !== 'OFFLINE') return res.json({ ok: true, state: rt[id].state });
+  // Busy states hold; only OFFLINE and BREAK may (re-)enter the floor. Break
+  // released the Telnyx leg, so resuming re-establishes the softphone like a
+  // fresh go-available.
+  if (rt[id] && ['CONNECTING', 'AVAILABLE', 'CLAIMING', 'DIALING', 'ON_CALL', 'WRAP_UP'].includes(rt[id].state))
+    return res.json({ ok: true, state: rt[id].state });
+  const wasBreak = rt[id] && rt[id].state === 'BREAK';
   try {
     const rows = await sbSelect('agents', `id=eq.${id}&select=sip_username`);
     const sip = rows[0] && rows[0].sip_username;
     if (!sip) return res.status(400).json({ error: 'no sip username' });
     rt[id] = { state: 'CONNECTING', sip };
+    logStateEvent(id, 'CONNECTING');   // opens the logged-in span at go-available
+    audit(req.user, 'GO_AVAILABLE', { target_type: 'session', meta: { from: wasBreak ? 'BREAK' : 'OFFLINE' } });
     const result = await telnyx('POST', '/calls', {
       connection_id: CONNECTION_ID,
       to: `sip:${sip}@${SIP_DOMAIN}`,
@@ -445,15 +607,19 @@ app.post('/api/agent/available', auth, async (req, res) => {
   }
 });
 
-// Go Offline / break
+// Go Offline / break. reason:'break' tracks a BREAK span (counts toward logged-in
+// time, measurable break duration); otherwise a full logout to OFFLINE.
 app.post('/api/agent/offline', auth, async (req, res) => {
   const id = req.user.id;
   const st = rt[id];
+  const isBreak = (req.body && req.body.reason) === 'break';
   try {
     if (st && st.agentLeg) await telnyx('POST', `/calls/${st.agentLeg}/actions/hangup`, {}).catch(() => {});
-    rt[id] = { state: 'OFFLINE' };
-    await setAgentState(id, 'OFFLINE');
-    res.json({ ok: true });
+    const nextState = isBreak ? 'BREAK' : 'OFFLINE';
+    rt[id] = { state: nextState };
+    await setAgentState(id, nextState);
+    audit(req.user, isBreak ? 'GO_BREAK' : 'LOGOUT', { target_type: 'session' });
+    res.json({ ok: true, state: nextState });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -557,6 +723,7 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
       patch.status = disp.outcome || 'DONE';
     }
     await sbUpdate('leads', `id=eq.${leadId}`, patch).catch(e => console.error('[disp:lead]', e.message));
+    audit(req.user, 'DISPOSITION', { target_type: 'lead', target_id: leadId, meta: { code, next_status: patch.status, phone: lead.phone } });
 
     // Hang up the lead leg if still up, then move agent to AVAILABLE.
     if (st) {
@@ -605,6 +772,7 @@ async function dialLead(agentId, lead) {
   st.state      = 'DIALING';
   st.onCallSince = null;
   await persistRt(agentId);
+  logStateEvent(agentId, 'DIALING');
   wsAgentSnapshot(agentId);
   await sbUpdate('leads', `id=eq.${lead.id}`,
     { status: 'IN_PROGRESS', attempts: (lead.attempts || 0) + 1, last_attempt_at: new Date().toISOString(), assigned_agent_id: agentId })

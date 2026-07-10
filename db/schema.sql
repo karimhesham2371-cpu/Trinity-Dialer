@@ -177,3 +177,37 @@ create index if not exists webhook_events_time_idx on webhook_events (received_a
 -- ── calls: recording + supervisor bookkeeping ─────────────────────────────────
 alter table calls add column if not exists recording_id text;   -- Telnyx recording id
 alter table calls add column if not exists talk_seconds int;     -- bridged→ended
+
+-- ═══ v4: reporting (audit trail + agent time tracking + floor plan) ═══════════
+-- One row per state span, so the Agent Report can sum login / dialing / talk /
+-- wrap / break durations. Open span = ended_at is null; closed by an
+-- agent_id + ended_at.is.null filter so it survives in-memory rt resets.
+create table if not exists agent_state_events (
+  id           bigserial primary key,
+  agent_id     uuid references agents(id),
+  state        text not null,
+  started_at   timestamptz not null default now(),
+  ended_at     timestamptz,
+  duration_sec int
+);
+create index if not exists ase_agent_idx on agent_state_events (agent_id, started_at);
+create index if not exists ase_open_idx  on agent_state_events (agent_id) where ended_at is null;
+
+-- User-activity audit trail for the Audit Logs report.
+create table if not exists audit_log (
+  id          bigserial primary key,
+  actor_id    uuid,
+  actor_name  text,
+  actor_role  text,
+  action      text not null,
+  target_type text,
+  target_id   text,
+  meta        jsonb not null default '{}'::jsonb,
+  created_at  timestamptz not null default now()
+);
+create index if not exists audit_time_idx  on audit_log (created_at);
+create index if not exists audit_actor_idx on audit_log (actor_id, created_at);
+
+-- Office map: persisted desk positions (percentage 0-100 of the canvas).
+alter table agents add column if not exists seat_x numeric;
+alter table agents add column if not exists seat_y numeric;
