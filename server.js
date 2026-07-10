@@ -18,6 +18,7 @@ const path    = require('path');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const { WebSocketServer } = require('ws');
+const { deriveFromAreaCode, inCallingWindow } = require('./lib/areacodes');
 
 const app = express();
 app.use(express.json({ limit: '8mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
@@ -61,6 +62,19 @@ const rt = {};
 
 // Discovered outbound caller-ID pool (refreshed from Telnyx).
 let CALLER_POOL = CALLER_IDS_ENV.slice();
+
+// Global lead-local calling window (compliance rule). Cached from app_settings.
+let CALLING_WINDOW = { start_hour: 10, end_hour: 21 };
+async function loadCallingWindow() {
+  if (!SB_HOST) return;
+  try {
+    const rows = await sbSelect('app_settings', `key=eq.calling_window&select=value`);
+    if (rows && rows[0] && rows[0].value) {
+      const v = rows[0].value;
+      CALLING_WINDOW = { start_hour: v.start_hour ?? 10, end_hour: v.end_hour ?? 21 };
+    }
+  } catch (e) { console.error('[callingWindow]', e.message); }
+}
 
 // ── Telnyx REST ───────────────────────────────────────────────────────────────
 async function telnyx(method, endpoint, body) {
@@ -379,42 +393,157 @@ app.delete('/api/admin/campaigns/:id/agents/:agentId', auth, adminOnly, async (r
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// CSV lead upload. Body is raw text/csv. Columns: phone,first_name,last_name,address,state
-app.post('/api/admin/campaigns/:id/leads', auth, adminOnly, async (req, res) => {
+// ── CSV lead import (Sprint 1) ────────────────────────────────────────────────
+// Canonical lead fields the mapper can target (everything else → custom).
+const CANON_FIELDS = ['phone','first_name','last_name','address','state','source'];
+// Auto-suggest which CSV header maps to each canonical field.
+const HEADER_HINTS = {
+  phone:      ['phone','number','phone_number','phone1','primary_phone','cell','mobile','tel'],
+  first_name: ['first_name','firstname','first','fname','owner_first'],
+  last_name:  ['last_name','lastname','last','lname','owner_last'],
+  address:    ['address','street','property_address','addr','site_address'],
+  state:      ['state','st','property_state'],
+  source:     ['source','lead_source','list'],
+};
+function suggestMapping(headers) {
+  const map = {};
+  for (const field of CANON_FIELDS) {
+    const hit = headers.find(h => HEADER_HINTS[field].includes(h));
+    if (hit) map[field] = hit;
+  }
+  return map;
+}
+// Turn one parsed CSV row into a lead draft using an explicit or auto mapping.
+function rowToLead(r, mapping, campaignId) {
+  const get = (f) => (mapping.fields && mapping.fields[f]) ? (r[mapping.fields[f]] || '') : '';
+  const rawPhone = get('phone') || r.phone || r.number || r.phone_number || '';
+  const phone = normPhone(rawPhone);
+  const custom = {};
+  const customCols = mapping.custom || null;
+  const mappedHeaders = new Set(Object.values(mapping.fields || {}));
+  for (const k of Object.keys(r)) {
+    if (mappedHeaders.has(k)) continue;
+    if (customCols && !customCols.includes(k)) continue; // explicit custom whitelist
+    if (r[k]) custom[k] = r[k];
+  }
+  const ac = areaCodeOf(phone);
+  const derived = deriveFromAreaCode(ac);
+  return {
+    campaign_id: campaignId,
+    phone, _rawPhone: rawPhone,
+    first_name: get('first_name') || r.first_name || r.firstname || r.first || null,
+    last_name:  get('last_name')  || r.last_name  || r.lastname  || r.last  || null,
+    address:    get('address') || r.address || null,
+    state:      (get('state') || r.state || derived.state || null),
+    source:     get('source') || null,
+    area_code:  ac,
+    timezone:   derived.tz,
+    custom, status: 'NEW',
+  };
+}
+
+// Preview: parse headers + a few sample rows, return suggested column mapping.
+app.post('/api/admin/campaigns/:id/leads/preview', auth, adminOnly, async (req, res) => {
   const csv = typeof req.body === 'string' ? req.body : (req.body && req.body.csv) || '';
   if (!csv.trim()) return res.status(400).json({ error: 'empty csv' });
   try {
     const rows = parseCsv(csv);
     if (!rows.length) return res.status(400).json({ error: 'no rows parsed' });
-    const KNOWN = new Set(['phone','number','phone_number','first_name','firstname','first','last_name','lastname','last','address','state']);
-    const leads = rows
-      .map(r => {
-        const phone = normPhone(r.phone || r.number || r.phone_number || '');
-        // preserve any extra columns as merge fields
-        const custom = {};
-        for (const k of Object.keys(r)) if (!KNOWN.has(k) && r[k]) custom[k] = r[k];
-        return {
-          campaign_id: req.params.id,
-          phone,
-          first_name: r.first_name || r.firstname || r.first || null,
-          last_name:  r.last_name  || r.lastname  || r.last  || null,
-          address:    r.address || null,
-          state:      r.state || null,
-          area_code:  areaCodeOf(phone),
-          custom,
-          status: 'NEW',
-        };
-      })
-      .filter(l => l.phone);
-    if (!leads.length) return res.status(400).json({ error: 'no valid phone numbers found' });
-    // insert in chunks
-    let inserted = 0;
-    for (let i = 0; i < leads.length; i += 500) {
-      await sbInsert('leads', leads.slice(i, i + 500));
-      inserted += Math.min(500, leads.length - i);
+    const headers = Object.keys(rows[0]);
+    res.json({
+      headers,
+      total: rows.length,
+      sample: rows.slice(0, 5),
+      suggested: suggestMapping(headers),
+      canon: CANON_FIELDS,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Import: dedupe by phone, DNC scrub, invalid rejection (+rejects file), tz
+// derivation from area code, import-batch bookkeeping. Body: raw csv OR
+// { csv, mapping:{fields,custom}, filename }.
+app.post('/api/admin/campaigns/:id/leads', auth, adminOnly, async (req, res) => {
+  const isJson = req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body);
+  const csv = typeof req.body === 'string' ? req.body : (isJson ? (req.body.csv || '') : '');
+  const mapping  = (isJson && req.body.mapping) ? req.body.mapping : {};
+  const filename = (isJson && req.body.filename) ? req.body.filename : null;
+  const campaignId = req.params.id;
+  if (!csv.trim()) return res.status(400).json({ error: 'empty csv' });
+  try {
+    const rows = parseCsv(csv);
+    if (!rows.length) return res.status(400).json({ error: 'no rows parsed' });
+
+    // 1) map + validate
+    const drafts = rows.map(r => rowToLead(r, mapping, campaignId));
+    const invalidRows = [];   // { row, reason }
+    const valid = [];
+    for (let i = 0; i < drafts.length; i++) {
+      const d = drafts[i];
+      const digits = String(d.phone || '').replace(/[^\d]/g, '');
+      const okLen = (digits.length === 11 && digits.startsWith('1')) || digits.length === 10;
+      if (!d.phone || !okLen) { invalidRows.push({ i, raw: d._rawPhone, reason: 'invalid phone' }); continue; }
+      valid.push(d);
     }
-    audit(req.user, 'UPLOAD_LEADS', { target_type: 'campaign', target_id: req.params.id, meta: { inserted, skipped: rows.length - leads.length } });
-    res.json({ ok: true, inserted, skipped: rows.length - leads.length });
+
+    // 2) dedupe by phone — within the file, then against existing campaign leads
+    let duplicates = 0;
+    const seen = new Set();
+    const deduped = [];
+    for (const d of valid) {
+      if (seen.has(d.phone)) { duplicates++; continue; }
+      seen.add(d.phone); deduped.push(d);
+    }
+    const existing = await sbSelect('leads', `campaign_id=eq.${campaignId}&select=phone`);
+    const existingSet = new Set((existing || []).map(l => l.phone));
+    const notExisting = deduped.filter(d => { if (existingSet.has(d.phone)) { duplicates++; return false; } return true; });
+
+    // 3) DNC scrub — permanent list is the source of truth (compliance rule)
+    let dncRemoved = 0;
+    const dncHits = new Set();
+    const phones = notExisting.map(d => d.phone);
+    for (let i = 0; i < phones.length; i += 200) {
+      const chunk = phones.slice(i, i + 200);
+      const inList = chunk.map(p => `"${p}"`).join(',');
+      const hits = await sbSelect('dnc_list', `phone=in.(${inList})&select=phone`);
+      for (const h of hits || []) dncHits.add(h.phone);
+    }
+    const clean = notExisting.filter(d => { if (dncHits.has(d.phone)) { dncRemoved++; return false; } return true; });
+
+    // 4) import batch row
+    let batchId = null;
+    try {
+      const [batch] = await sbInsert('import_batches', {
+        campaign_id: campaignId, filename,
+        total: rows.length, inserted: 0, duplicates,
+        dnc_removed: dncRemoved, invalid: invalidRows.length,
+        created_by: req.user.id,
+      });
+      batchId = batch && batch.id;
+    } catch (_) { /* import_batches optional; continue */ }
+
+    // 5) insert clean leads in chunks
+    let inserted = 0;
+    for (let i = 0; i < clean.length; i += 500) {
+      const chunk = clean.slice(i, i + 500).map(({ _rawPhone, ...l }) => ({ ...l, import_batch_id: batchId }));
+      await sbInsert('leads', chunk);
+      inserted += chunk.length;
+    }
+    if (batchId) await sbUpdate('import_batches', `id=eq.${batchId}`, { inserted }).catch(() => {});
+
+    // 6) rejects file (invalid numbers) for download
+    const rejects = invalidRows.map(v => `${v.raw || ''},${v.reason}`).join('\n');
+    const rejectsCsv = invalidRows.length ? 'phone,reason\n' + rejects : '';
+
+    audit(req.user, 'UPLOAD_LEADS', { target_type: 'campaign', target_id: campaignId,
+      meta: { total: rows.length, inserted, duplicates, dnc_removed: dncRemoved, invalid: invalidRows.length } });
+    res.json({
+      ok: true, batch_id: batchId,
+      total: rows.length, inserted, duplicates,
+      dnc_removed: dncRemoved, invalid: invalidRows.length,
+      rejects_csv: rejectsCsv,
+      summary: `${inserted} imported · ${duplicates} duplicate · ${dncRemoved} removed — on your DNC list · ${invalidRows.length} invalid`,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -447,6 +576,248 @@ app.post('/api/admin/campaigns/:id/reset', auth, adminOnly, async (req, res) => 
       { status: 'NEW', attempts: 0, last_attempt_at: null, next_callback_at: null, assigned_agent_id: null });
     audit(req.user, 'CAMPAIGN_RESET', { target_type: 'campaign', target_id: req.params.id });
     res.json({ ok: true, status: 'STOPPED' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ ADMIN: Sprint 1 — Lead Management ════════════════════════════════════════════
+
+// ── Global lead search: phone / name / address across all campaigns ───────────
+app.get('/api/admin/leads/search', auth, adminOnly, async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ rows: [] });
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  const digits = q.replace(/[^\d]/g, '');
+  const like = `*${q.replace(/[%,()*]/g, '')}*`;
+  const ors = [`first_name.ilike.${like}`, `last_name.ilike.${like}`, `address.ilike.${like}`];
+  if (digits) ors.push(`phone.ilike.*${digits}*`);
+  try {
+    const rows = await sbSelect('leads',
+      `or=(${ors.join(',')})&order=created_at.desc&limit=${limit}` +
+      `&select=id,campaign_id,phone,first_name,last_name,address,state,status,attempts,tags,owner_agent_id,next_callback_at`);
+    res.json({ rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Single lead (lead card) get + update ──────────────────────────────────────
+app.get('/api/admin/leads/:id', auth, adminOnly, async (req, res) => {
+  try {
+    const [lead] = await sbSelect('leads', `id=eq.${req.params.id}&select=*&limit=1`);
+    if (!lead) return res.status(404).json({ error: 'not found' });
+    const calls  = await sbSelect('calls', `lead_id=eq.${req.params.id}&order=created_at.desc&select=*`);
+    const disps  = await sbSelect('dispositions', `lead_id=eq.${req.params.id}&order=created_at.desc&select=*`);
+    const folders = await sbSelect('lead_folders', `lead_id=eq.${req.params.id}&select=folder_id`);
+    res.json({ lead, calls, dispositions: disps, folder_ids: (folders || []).map(f => f.folder_id) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/admin/leads/:id', auth, adminOnly, async (req, res) => {
+  const allow = ['first_name','last_name','address','state','status','tags','owner_agent_id','custom','next_callback_at','source'];
+  const patch = {};
+  for (const k of allow) if (k in (req.body || {})) patch[k] = req.body[k];
+  if (!Object.keys(patch).length) return res.status(400).json({ error: 'no fields' });
+  try {
+    const [row] = await sbUpdate('leads', `id=eq.${req.params.id}`, patch);
+    audit(req.user, 'EDIT_LEAD', { target_type: 'lead', target_id: req.params.id, meta: { fields: Object.keys(patch) } });
+    res.json({ ok: true, lead: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Custom CRM fields per campaign + lead-card layout ─────────────────────────
+app.get('/api/admin/campaigns/:id/fields', auth, adminOnly, async (req, res) => {
+  try { res.json({ fields: await sbSelect('campaign_fields', `campaign_id=eq.${req.params.id}&order=position.asc`) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/admin/campaigns/:id/fields', auth, adminOnly, async (req, res) => {
+  const { key, label, type, options, position, show_on_card } = req.body || {};
+  if (!key || !label) return res.status(400).json({ error: 'key + label required' });
+  try {
+    const [row] = await sbInsert('campaign_fields', {
+      campaign_id: req.params.id, key: String(key).toLowerCase().replace(/\s+/g, '_'),
+      label, type: type || 'text', options: options || [],
+      position: position ?? 0, show_on_card: show_on_card !== false,
+    });
+    audit(req.user, 'ADD_FIELD', { target_type: 'campaign', target_id: req.params.id, meta: { key, label } });
+    res.json({ ok: true, field: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/admin/fields/:fid', auth, adminOnly, async (req, res) => {
+  const allow = ['label','type','options','position','show_on_card'];
+  const patch = {}; for (const k of allow) if (k in (req.body || {})) patch[k] = req.body[k];
+  try { const [row] = await sbUpdate('campaign_fields', `id=eq.${req.params.fid}`, patch); res.json({ ok: true, field: row }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/admin/fields/:fid', auth, adminOnly, async (req, res) => {
+  try { await sbDelete('campaign_fields', `id=eq.${req.params.fid}`); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Action folders (Appointments / Hot Leads / Follow-ups) ────────────────────
+app.get('/api/admin/folders', auth, adminOnly, async (req, res) => {
+  const cid = req.query.campaign_id;
+  const q = cid ? `or=(campaign_id.eq.${cid},campaign_id.is.null)&order=position.asc` : 'order=position.asc';
+  try {
+    const folders = await sbSelect('action_folders', q);
+    // attach lead counts
+    for (const f of folders) {
+      const rows = await sbSelect('lead_folders', `folder_id=eq.${f.id}&select=lead_id`);
+      f.lead_count = (rows || []).length;
+    }
+    res.json({ folders });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/admin/folders', auth, adminOnly, async (req, res) => {
+  const { name, campaign_id, position } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const [row] = await sbInsert('action_folders', { name, campaign_id: campaign_id || null, position: position ?? 0 });
+    audit(req.user, 'ADD_FOLDER', { target_type: 'folder', target_id: row.id, meta: { name } });
+    res.json({ ok: true, folder: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/admin/folders/:fid', auth, adminOnly, async (req, res) => {
+  try { await sbDelete('action_folders', `id=eq.${req.params.fid}`); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Leads inside a folder (for the click-to-call list)
+app.get('/api/admin/folders/:fid/leads', auth, adminOnly, async (req, res) => {
+  try {
+    const mem = await sbSelect('lead_folders', `folder_id=eq.${req.params.fid}&select=lead_id&order=added_at.desc`);
+    const ids = (mem || []).map(m => m.lead_id);
+    if (!ids.length) return res.json({ leads: [] });
+    const inList = ids.map(i => `"${i}"`).join(',');
+    const leads = await sbSelect('leads', `id=in.(${inList})&select=id,campaign_id,phone,first_name,last_name,address,state,status,tags`);
+    res.json({ leads });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Add / remove a lead from a folder
+app.post('/api/admin/leads/:id/folders', auth, adminOnly, async (req, res) => {
+  const { folder_id, remove } = req.body || {};
+  if (!folder_id) return res.status(400).json({ error: 'folder_id required' });
+  try {
+    if (remove) await sbDelete('lead_folders', `lead_id=eq.${req.params.id}&folder_id=eq.${folder_id}`);
+    else        await sbInsert('lead_folders', { lead_id: req.params.id, folder_id });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Playlists: filter builder + live count ────────────────────────────────────
+// Translate a filter list into a PostgREST query fragment. Supported ops:
+// is | is_not | between. Fields: state, status, times_called, attempts, source,
+// tags (contains), or custom.<key> (jsonb).
+function playlistFragment(filters) {
+  const parts = [];
+  for (const f of (filters || [])) {
+    if (!f || !f.field) continue;
+    const op = f.op || 'is';
+    const val = f.value;
+    let col = f.field;
+    const isTag = col === 'tags';
+    const isCustom = col.startsWith('custom.');
+    if (isCustom) col = `custom->>${col.slice(7)}`;
+    const enc = (v) => encodeURIComponent(String(v));
+    if (op === 'between' && Array.isArray(val)) {
+      parts.push(`${col}=gte.${enc(val[0])}`);
+      parts.push(`${col}=lte.${enc(val[1])}`);
+    } else if (isTag) {
+      // tag contains (is) / not-contains (is_not)
+      parts.push(op === 'is_not' ? `tags=not.cs.{${enc(val)}}` : `tags=cs.{${enc(val)}}`);
+    } else if (op === 'is_not') {
+      parts.push(`${col}=neq.${enc(val)}`);
+    } else {
+      parts.push(`${col}=eq.${enc(val)}`);
+    }
+  }
+  return parts.join('&');
+}
+app.get('/api/admin/campaigns/:id/playlists', auth, adminOnly, async (req, res) => {
+  try { res.json({ playlists: await sbSelect('playlists', `campaign_id=eq.${req.params.id}&order=priority.asc,created_at.asc`) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/admin/campaigns/:id/playlists', auth, adminOnly, async (req, res) => {
+  const { name, priority, weight, group_name, filters, selection_mode } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const [row] = await sbInsert('playlists', {
+      campaign_id: req.params.id, name,
+      priority: Math.min(9, Math.max(1, priority || 5)),
+      weight: weight || 1, group_name: group_name || null,
+      filters: filters || [], selection_mode: selection_mode || 'balanced',
+    });
+    audit(req.user, 'ADD_PLAYLIST', { target_type: 'campaign', target_id: req.params.id, meta: { name } });
+    res.json({ ok: true, playlist: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/admin/playlists/:pid', auth, adminOnly, async (req, res) => {
+  const allow = ['name','priority','weight','group_name','filters','selection_mode','active'];
+  const patch = {}; for (const k of allow) if (k in (req.body || {})) patch[k] = req.body[k];
+  try { const [row] = await sbUpdate('playlists', `id=eq.${req.params.pid}`, patch); res.json({ ok: true, playlist: row }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/admin/playlists/:pid', auth, adminOnly, async (req, res) => {
+  try { await sbDelete('playlists', `id=eq.${req.params.pid}`); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Live "Available leads: N" — count leads matching a filter set (dialable only).
+app.post('/api/admin/campaigns/:id/playlists/count', auth, adminOnly, async (req, res) => {
+  const filters = (req.body && req.body.filters) || [];
+  try {
+    const frag = playlistFragment(filters);
+    const q = `campaign_id=eq.${req.params.id}&dnc=eq.false&status=in.(NEW,CALLBACK)` +
+              (frag ? `&${frag}` : '') + '&select=id';
+    // PostgREST exact count via Prefer header + Content-Range
+    const r = await fetch(`https://${SB_HOST}/rest/v1/leads?${q}`, {
+      headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, Prefer: 'count=exact', Range: '0-0' },
+    });
+    const cr = r.headers.get('content-range') || '*/0';
+    const count = parseInt(cr.split('/')[1], 10) || 0;
+    res.json({ count });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DNC list management (view / search / export / remove w/ confirm) ──────────
+app.get('/api/admin/dnc', auth, adminOnly, async (req, res) => {
+  const q = String(req.query.q || '').replace(/[^\d]/g, '');
+  const filter = q ? `phone=ilike.*${q}*&` : '';
+  try { res.json({ rows: await sbSelect('dnc_list', `${filter}order=created_at.desc&limit=500`) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/admin/dnc/export', auth, adminOnly, async (req, res) => {
+  try {
+    const rows = await sbSelect('dnc_list', 'select=phone,reason,source,created_at&order=created_at.desc');
+    const csv = 'phone,reason,source,created_at\n' +
+      (rows || []).map(r => `${r.phone},${r.reason||''},${r.source||''},${r.created_at}`).join('\n');
+    audit(req.user, 'EXPORT_DNC', { target_type: 'dnc', meta: { count: (rows||[]).length } });
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="dnc-list.csv"');
+    res.send(csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Removal requires admin role (enforced) + explicit confirm flag.
+app.delete('/api/admin/dnc/:phone', auth, adminOnly, async (req, res) => {
+  if (!req.body || req.body.confirm !== true) return res.status(400).json({ error: 'confirmation required' });
+  const phone = normPhone(req.params.phone);
+  try {
+    await sbDelete('dnc_list', `phone=eq.${encodeURIComponent(phone)}`);
+    // also clear the denormalized flag on any matching leads
+    await sbUpdate('leads', `phone=eq.${encodeURIComponent(phone)}&dnc=eq.true`, { dnc: false, status: 'NEW' }).catch(() => {});
+    audit(req.user, 'REMOVE_DNC', { target_type: 'dnc', target_id: phone });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Calling-window global setting (admin-editable) ────────────────────────────
+app.get('/api/admin/settings/calling-window', auth, adminOnly, async (_req, res) => {
+  res.json({ ...CALLING_WINDOW });
+});
+app.put('/api/admin/settings/calling-window', auth, adminOnly, async (req, res) => {
+  const sh = parseInt(req.body && req.body.start_hour, 10);
+  const eh = parseInt(req.body && req.body.end_hour, 10);
+  if (!(sh >= 0 && sh <= 23) || !(eh >= 1 && eh <= 24) || eh <= sh)
+    return res.status(400).json({ error: 'invalid window' });
+  try {
+    await sbUpdate('app_settings', `key=eq.calling_window`, { value: { start_hour: sh, end_hour: eh }, updated_at: new Date().toISOString() });
+    CALLING_WINDOW = { start_hour: sh, end_hour: eh };
+    audit(req.user, 'EDIT_CALLING_WINDOW', { target_type: 'settings', meta: CALLING_WINDOW });
+    res.json({ ok: true, ...CALLING_WINDOW });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -752,9 +1123,43 @@ app.post('/api/agent/hold', auth, async (req, res) => {
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 
+// Manual click-to-call: agent dials a specific lead (from an action folder or
+// search result) instead of waiting for the pacer. Requires the agent to be
+// AVAILABLE and in-conference. Still enforces DNC + calling-window compliance.
+app.post('/api/agent/call-lead', auth, async (req, res) => {
+  const id = req.user.id;
+  const st = rt[id];
+  const leadId = req.body && req.body.lead_id;
+  if (!leadId) return res.status(400).json({ error: 'lead_id required' });
+  if (!st || st.state !== 'AVAILABLE' || !st.conferenceId)
+    return res.status(409).json({ error: 'must be available and connected first' });
+  try {
+    const [lead] = await sbSelect('leads', `id=eq.${leadId}&select=*&limit=1`);
+    if (!lead) return res.status(404).json({ error: 'lead not found' });
+    if (!inCallingWindow(lead.timezone, CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour))
+      return res.status(409).json({ error: 'outside calling window for this lead' });
+    st.state = 'CLAIMING';
+    await dialLead(id, lead);   // does the DNC check + state transitions
+    audit(req.user, 'MANUAL_CALL', { target_type: 'lead', target_id: leadId, meta: { phone: lead.phone } });
+    res.json({ ok: true, state: st.state });
+  } catch (e) { st && (st.state = 'AVAILABLE'); res.status(502).json({ error: e.message }); }
+});
+
 // ══ PACING ENGINE ════════════════════════════════════════════════════════════════
 async function dialLead(agentId, lead) {
   const st = rt[agentId];
+  // Compliance check #1: skip DNC numbers before EVERY dial. dnc_list is the
+  // source of truth; if a number slipped through (flag not yet synced), catch
+  // it here, sync the flag, and bail without dialing.
+  try {
+    const hit = await sbSelect('dnc_list', `phone=eq.${encodeURIComponent(lead.phone)}&select=phone&limit=1`);
+    if (hit && hit.length) {
+      await sbUpdate('leads', `id=eq.${lead.id}`, { dnc: true, status: 'DNC' }).catch(() => {});
+      st.state = 'AVAILABLE';
+      console.log(`[pacing] DNC skip ${lead.phone}`);
+      return;
+    }
+  } catch (e) { console.error('[dialLead:dnc]', e.message); }
   const from = pickCallerId(areaCodeOf(lead.phone));
   const result = await telnyx('POST', '/calls', {
     connection_id: CONNECTION_ID,
@@ -796,11 +1201,16 @@ async function pacingTick() {
       for (const { agent_id } of assigns) {
         const st = rt[agent_id];
         if (!st || st.state !== 'AVAILABLE' || !st.conferenceId) continue;   // only free, in-conference agents
+        // Grab a small batch (not just 1) so we can skip out-of-window leads
+        // without stalling the agent. Out-of-window leads are simply left NEW;
+        // they auto-requeue once their local clock enters the window.
         const leads = await sbSelect('leads',
           `campaign_id=eq.${c.id}&dnc=eq.false&status=in.(NEW,CALLBACK)` +
           `&or=(next_callback_at.is.null,next_callback_at.lte.${nowIso})` +
-          `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=1&select=*`);
-        const lead = leads[0];
+          `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=10&select=*`);
+        // Compliance: hard 10AM–9PM lead-local calling window.
+        const lead = leads.find(l =>
+          inCallingWindow(l.timezone, CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour));
         if (!lead) continue;
         st.state = 'CLAIMING';                          // guard: prevents re-dial on next tick
         try { await dialLead(agent_id, lead); }
@@ -1018,8 +1428,11 @@ server.listen(PORT, async () => {
   await bootstrapAdmin();
   await rehydrateRt();
   await refreshCallerPool();
+  await loadCallingWindow();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
+  console.log(`[boot] calling window: ${CALLING_WINDOW.start_hour}:00–${CALLING_WINDOW.end_hour}:00 lead-local`);
   setInterval(pacingTick, PACING_MS);
   setInterval(reaperTick, 30 * 1000);
   setInterval(refreshCallerPool, 5 * 60 * 1000);
+  setInterval(loadCallingWindow, 5 * 60 * 1000);
 });

@@ -339,6 +339,7 @@
     <div class="brand"><div class="mark">T</div><h1>Trinity — Admin</h1></div>
     <div class="navtabs" style="margin-left:18px">
       <button id="tabConsole" class="navtab active" onclick="adminTab('console')">Console</button>
+      <button id="tabLeads" class="navtab" onclick="adminTab('leads')">Leads</button>
       <button id="tabReports" class="navtab" onclick="adminTab('reports')">Reports</button>
     </div>
     <div class="sp"></div>
@@ -396,6 +397,25 @@
       <div id="repFilters" class="rfilters"></div>
       <div id="repBody"></div>
     </div>
+  </div>
+
+  <div id="adminLeads" class="wrap wide hidden">
+    <div class="row" style="align-items:center;gap:12px;margin-bottom:14px">
+      <div class="fw"><span class="lbl">Campaign</span><select id="ldCampaign" class="field"></select></div>
+      <div class="sp" style="flex:1"></div>
+      <div class="fw" style="min-width:320px"><span class="lbl">Global lead search</span>
+        <input id="ldSearch" class="field" placeholder="Phone, name or address across all campaigns"></div>
+    </div>
+    <div id="ldSearchResults" class="hidden"></div>
+    <div class="navtabs" id="ldSub" style="margin-bottom:14px">
+      <button class="navtab active" data-lt="import" onclick="leadTab('import')">Import</button>
+      <button class="navtab" data-lt="playlists" onclick="leadTab('playlists')">Playlists</button>
+      <button class="navtab" data-lt="folders" onclick="leadTab('folders')">Action folders</button>
+      <button class="navtab" data-lt="fields" onclick="leadTab('fields')">Custom fields</button>
+      <button class="navtab" data-lt="dnc" onclick="leadTab('dnc')">DNC list</button>
+      <button class="navtab" data-lt="window" onclick="leadTab('window')">Calling window</button>
+    </div>
+    <div id="ldBody"></div>
   </div>
 </div>
 
@@ -729,8 +749,11 @@ async function loadCampaigns(){
     dz.addEventListener('drop',e=>{ e.preventDefault(); dz.classList.remove('drag'); const f=e.dataTransfer.files[0]; if(f){ const dt=new DataTransfer(); dt.items.add(f); csv.files=dt.files; readRows(f); } });
     upBtn.onclick=async()=>{ const f=csv.files[0]; if(!f){ msg('Choose a CSV first.'); return; } msg('Uploading…'); upBtn.disabled=true;
       const text=f._text!=null?f._text:await f.text();
-      try{ const r=await api(`/api/admin/campaigns/${c.id}/leads`,{ method:'POST', headers:{'Content-Type':'text/csv'}, body:text }); const jj=await r.json(); if(!r.ok)throw new Error(jj.error||'upload failed');
-        toast(`${jj.inserted} leads added`+(jj.skipped?` · ${jj.skipped} skipped`:'')); loadCampaigns(); }catch(e){ msg(e.message); upBtn.disabled=false; } };
+      try{ const r=await api(`/api/admin/campaigns/${c.id}/leads`,{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({csv:text, filename:f.name}) }); const jj=await r.json(); if(!r.ok)throw new Error(jj.error||'upload failed');
+        toast(`${jj.inserted} imported`+(jj.duplicates?` · ${jj.duplicates} dup`:'')+(jj.dnc_removed?` · ${jj.dnc_removed} DNC`:'')+(jj.invalid?` · ${jj.invalid} invalid`:''));
+        msg(jj.summary||'');
+        if(jj.rejects_csv){ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([jj.rejects_csv],{type:'text/csv'})); a.download='rejects.csv'; a.textContent='Download rejected numbers'; a.style.cssText='color:var(--danger);font-size:12px;display:inline-block;margin-top:6px'; el.querySelector('[data-msg]').appendChild(document.createElement('br')); el.querySelector('[data-msg]').appendChild(a); }
+        loadCampaigns(); }catch(e){ msg(e.message); upBtn.disabled=false; } };
     el.querySelectorAll('[data-act]').forEach(b=>b.onclick=async()=>{ try{ await apiJson(`/api/admin/campaigns/${c.id}/${b.dataset.act}`,'POST',{}); loadCampaigns(); }catch(e){ msg(e.message); } });
     wrap.appendChild(el);
     enhanceSelect(el.querySelector('[data-agentsel]'));
@@ -742,12 +765,14 @@ let adminWs=null, floorAgents=[], agentRepRows=[];
 const REPTITLES={audit:'Audit logs',calls:'Call logs',agent:'Agent report',research:'Research calls',map:'Office map'};
 
 function adminTab(which){
-  const rep = which==='reports';
-  $('adminConsole').classList.toggle('hidden', rep);
-  $('adminReports').classList.toggle('hidden', !rep);
-  $('tabConsole').classList.toggle('active', !rep);
-  $('tabReports').classList.toggle('active', rep);
-  if(rep) closeReport(); else closeAdminWs();
+  $('adminConsole').classList.toggle('hidden', which!=='console');
+  $('adminLeads').classList.toggle('hidden', which!=='leads');
+  $('adminReports').classList.toggle('hidden', which!=='reports');
+  $('tabConsole').classList.toggle('active', which==='console');
+  $('tabLeads').classList.toggle('active', which==='leads');
+  $('tabReports').classList.toggle('active', which==='reports');
+  if(which==='reports') closeReport(); else closeAdminWs();
+  if(which==='leads') initLeads();
 }
 function closeReport(){ $('repPanel').classList.add('hidden'); $('repHome').classList.remove('hidden'); closeAdminWs(); }
 function openReport(kind){
@@ -928,6 +953,263 @@ function makeDraggable(el, agentId){
     };
     document.addEventListener('mousemove',move); document.addEventListener('mouseup',up);
   });
+}
+
+// ═══════════ ADMIN: LEADS (Sprint 1 — Lead Management) ═══════════
+let leadCampaigns=[], ldCampId=null, ldCurTab='import', ldCampFields=[];
+function enhanceAll(root){ (root||document).querySelectorAll('select:not([data-enh])').forEach(enhanceSelect); }
+
+async function initLeads(){
+  try{
+    const j=await apiJson('/api/admin/campaigns');
+    leadCampaigns=j.campaigns||[];
+  }catch(e){ toast(e.message,'err'); leadCampaigns=[]; }
+  const sel=$('ldCampaign');
+  sel.innerHTML=leadCampaigns.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')||'<option value="">No campaigns</option>';
+  if(!ldCampId || !leadCampaigns.find(c=>c.id===ldCampId)) ldCampId=leadCampaigns[0]&&leadCampaigns[0].id||null;
+  sel.value=ldCampId||''; enhanceSelect(sel);
+  sel.onchange=()=>{ ldCampId=sel.value; leadTab(ldCurTab); };
+  // global search
+  let sT=null; $('ldSearch').oninput=()=>{ clearTimeout(sT); sT=setTimeout(runLeadSearch,300); };
+  leadTab(ldCurTab);
+}
+function leadTab(t){
+  ldCurTab=t;
+  $('ldSub').querySelectorAll('[data-lt]').forEach(b=>b.classList.toggle('active', b.dataset.lt===t));
+  const body=$('ldBody'); body.innerHTML='<p class="dim">Loading…</p>';
+  if(!ldCampId && ['import','playlists','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
+  ({import:renderImport,playlists:renderPlaylists,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow}[t]||(()=>{}))();
+}
+
+// ── Global lead search ──
+async function runLeadSearch(){
+  const q=$('ldSearch').value.trim(); const box=$('ldSearchResults');
+  if(!q){ box.classList.add('hidden'); box.innerHTML=''; return; }
+  try{
+    const j=await apiJson('/api/admin/leads/search?q='+encodeURIComponent(q));
+    box.classList.remove('hidden');
+    if(!j.rows.length){ box.innerHTML='<div class="card"><p class="dim">No leads match.</p></div>'; return; }
+    box.innerHTML=`<div class="card"><h2>Search — ${j.rows.length} match${j.rows.length===1?'':'es'}</h2>
+      <div class="tblwrap"><table><thead><tr><th>Phone</th><th>Name</th><th>Address</th><th>State</th><th>Status</th></tr></thead>
+      <tbody>${j.rows.map(l=>`<tr><td class="mono">${esc(l.phone)}</td><td>${esc([l.first_name,l.last_name].filter(Boolean).join(' ')||'—')}</td>
+        <td>${esc(l.address||'—')}</td><td>${esc(l.state||'—')}</td><td><span class="pill pill--faint">${esc(l.status)}</span></td></tr>`).join('')}</tbody></table></div></div>`;
+  }catch(e){ box.classList.remove('hidden'); box.innerHTML=`<div class="card"><p class="err">${esc(e.message)}</p></div>`; }
+}
+
+// ── Import (preview → column mapping → import summary) ──
+function renderImport(){
+  $('ldBody').innerHTML=`<div class="card">
+    <h2>Import leads CSV</h2>
+    <div class="dropzone" id="ldDz"><input type="file" accept=".csv" id="ldCsv" hidden><div id="ldDzText">Drop a CSV or <b>browse</b></div></div>
+    <div id="ldMap"></div>
+    <div id="ldImpMsg" class="dim mt3" style="font-size:13px"></div>
+  </div>`;
+  const dz=$('ldDz'), inp=$('ldCsv');
+  dz.onclick=()=>inp.click();
+  dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag');});
+  dz.addEventListener('dragleave',()=>dz.classList.remove('drag'));
+  dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag'); const f=e.dataTransfer.files[0]; if(f){ const dt=new DataTransfer(); dt.items.add(f); inp.files=dt.files; ldPreview(f);} });
+  inp.onchange=()=>{ if(inp.files[0]) ldPreview(inp.files[0]); };
+}
+async function ldPreview(f){
+  const text=await f.text();
+  $('ldDzText').innerHTML=`<b>${esc(f.name)}</b> · reading…`;
+  try{
+    const r=await api(`/api/admin/campaigns/${ldCampId}/leads/preview`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({csv:text})});
+    const j=await r.json(); if(!r.ok) throw new Error(j.error||'preview failed');
+    $('ldDzText').innerHTML=`<b>${esc(f.name)}</b> · ${j.total} rows`;
+    const opt=(field)=>`<option value="">— none —</option>`+j.headers.map(h=>`<option value="${esc(h)}"${j.suggested[field]===h?' selected':''}>${esc(h)}</option>`).join('');
+    const rowMap=j.canon.map(field=>`<div class="fw"><span class="lbl">${field}</span><select class="field" data-mapfield="${field}">${opt(field)}</select></div>`).join('');
+    $('ldMap').innerHTML=`
+      <div class="lbl mt3">Column mapping <span class="faint">— unmapped columns are kept as custom merge fields</span></div>
+      <div class="row" style="flex-wrap:wrap;gap:12px;margin-top:6px">${rowMap}</div>
+      <div class="tblwrap mt3" style="max-height:180px;overflow:auto"><table><thead><tr>${j.headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead>
+        <tbody>${j.sample.map(r=>`<tr>${j.headers.map(h=>`<td>${esc(r[h]||'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+      <button id="ldImport" class="btn btn-primary mt3">Import ${j.total} leads</button>`;
+    enhanceAll($('ldMap'));
+    $('ldImport').onclick=async()=>{
+      const fields={}; $('ldMap').querySelectorAll('[data-mapfield]').forEach(s=>{ if(s.value) fields[s.dataset.mapfield]=s.value; });
+      if(!fields.phone){ toast('Map the phone column first','err'); return; }
+      $('ldImport').disabled=true; $('ldImpMsg').textContent='Importing…';
+      try{
+        const j2=await apiJson(`/api/admin/campaigns/${ldCampId}/leads`,'POST',{csv:text,filename:f.name,mapping:{fields}});
+        $('ldImpMsg').innerHTML=`<b style="color:var(--ok)">${esc(j2.summary)}</b>`;
+        if(j2.rejects_csv){ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([j2.rejects_csv],{type:'text/csv'})); a.download='rejects.csv'; a.textContent=' Download rejected numbers'; a.style.cssText='color:var(--danger);font-size:12px;margin-left:8px'; $('ldImpMsg').appendChild(a); }
+        toast(`${j2.inserted} leads imported`);
+      }catch(e){ $('ldImpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; $('ldImport').disabled=false; }
+    };
+  }catch(e){ $('ldDzText').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+}
+
+// ── Playlists (filter builder + live count) ──
+const PL_FIELDS=[['state','State'],['status','Status'],['times_called','Times called'],['attempts','Attempts'],['source','Source'],['tags','Tag']];
+const PL_OPS=[['is','is'],['is_not','is not'],['between','between']];
+async function renderPlaylists(){
+  let pls=[]; try{ pls=(await apiJson(`/api/admin/campaigns/${ldCampId}/playlists`)).playlists||[]; }catch(e){}
+  try{ ldCampFields=(await apiJson(`/api/admin/campaigns/${ldCampId}/fields`)).fields||[]; }catch(e){ ldCampFields=[]; }
+  const list=pls.map(p=>`<div class="card" style="margin-bottom:12px">
+    <div class="row" style="align-items:center;gap:10px"><b>${esc(p.name)}</b>
+      <span class="pill pill--faint">priority ${p.priority}</span>
+      <span class="pill pill--faint">weight ${p.weight}</span>
+      ${p.group_name?`<span class="pill pill--info">${esc(p.group_name)}</span>`:''}
+      <span class="pill pill--faint">${esc(p.selection_mode)}</span>
+      <span class="dim mono" style="margin-left:auto">${(p.filters||[]).length} filter(s)</span>
+      <button class="btn btn-sm" data-delpl="${p.id}">Delete</button></div>
+    <div class="dim mt2" style="font-size:12px">${(p.filters||[]).map(f=>`${f.field} ${f.op} ${Array.isArray(f.value)?f.value.join('–'):f.value}`).join(' · ')||'no filters (all dialable leads)'}</div>
+  </div>`).join('')||'<p class="dim">No playlists yet.</p>';
+  $('ldBody').innerHTML=`<div class="card"><h2>New playlist</h2>
+      <div class="row" style="gap:12px;flex-wrap:wrap">
+        <div class="fw" style="flex:2"><span class="lbl">Name</span><input id="plName" class="field" placeholder="e.g. Fresh Florida"></div>
+        <div class="fw"><span class="lbl">Priority 1–9</span><input id="plPri" class="field mono" type="number" min="1" max="9" value="5"></div>
+        <div class="fw"><span class="lbl">Weight</span><input id="plWt" class="field mono" type="number" min="1" value="1"></div>
+        <div class="fw"><span class="lbl">Group</span><input id="plGrp" class="field" placeholder="optional"></div>
+        <div class="fw"><span class="lbl">DID selection</span><select id="plMode" class="field"><option value="balanced">Balanced</option><option value="strict">Strict (healthy only)</option><option value="off">Off</option></select></div>
+      </div>
+      <div class="lbl mt3">Filters</div><div id="plFilters"></div>
+      <button class="btn btn-sm mt2" id="plAddFilter">+ Add filter</button>
+      <div class="row mt3" style="align-items:center;gap:12px">
+        <button class="btn btn-primary" id="plCreate">Create playlist</button>
+        <button class="btn btn-sm" id="plCount">Count matching</button>
+        <span id="plCountOut" class="mono" style="color:var(--accent)"></span>
+      </div>
+    </div>
+    <div class="card mt"><h2>Playlists</h2>${list}</div>`;
+  enhanceAll($('ldBody'));
+  $('plAddFilter').onclick=()=>addFilterRow();
+  addFilterRow();
+  $('plCreate').onclick=async()=>{
+    const body={ name:$('plName').value.trim(), priority:+$('plPri').value, weight:+$('plWt').value,
+      group_name:$('plGrp').value.trim()||null, selection_mode:$('plMode').value, filters:collectFilters() };
+    if(!body.name){ toast('Name required','err'); return; }
+    try{ await apiJson(`/api/admin/campaigns/${ldCampId}/playlists`,'POST',body); toast('Playlist created'); renderPlaylists(); }catch(e){ toast(e.message,'err'); }
+  };
+  $('plCount').onclick=async()=>{
+    try{ const j=await apiJson(`/api/admin/campaigns/${ldCampId}/playlists/count`,'POST',{filters:collectFilters()});
+      $('plCountOut').textContent=`Available leads: ${j.count}`; }catch(e){ toast(e.message,'err'); }
+  };
+  $('ldBody').querySelectorAll('[data-delpl]').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/admin/playlists/'+b.dataset.delpl,'DELETE'); renderPlaylists(); }catch(e){ toast(e.message,'err'); } });
+}
+function fieldOptions(){
+  const base=PL_FIELDS.map(([v,l])=>`<option value="${v}">${l}</option>`).join('');
+  const custom=ldCampFields.map(f=>`<option value="custom.${esc(f.key)}">${esc(f.label)} (custom)</option>`).join('');
+  return base+custom;
+}
+function addFilterRow(){
+  const wrap=$('plFilters'); const row=document.createElement('div'); row.className='row plfilter'; row.style.cssText='gap:8px;margin-top:6px;align-items:center';
+  row.innerHTML=`<select class="field" data-f="field" style="flex:1">${fieldOptions()}</select>
+    <select class="field" data-f="op" style="flex:0 0 110px">${PL_OPS.map(([v,l])=>`<option value="${v}">${l}</option>`).join('')}</select>
+    <input class="field" data-f="v1" placeholder="value" style="flex:1">
+    <input class="field mono" data-f="v2" placeholder="…and" style="flex:0 0 100px;display:none">
+    <span data-f="rm" style="cursor:pointer;color:var(--danger);padding:0 6px">✕</span>`;
+  wrap.appendChild(row); enhanceAll(row);
+  const op=row.querySelector('[data-f="op"]'); const v2=row.querySelector('[data-f="v2"]');
+  op.onchange=()=>{ v2.style.display=op.value==='between'?'':'none'; };
+  row.querySelector('[data-f="rm"]').onclick=()=>row.remove();
+}
+function collectFilters(){
+  return Array.from($('plFilters').querySelectorAll('.plfilter')).map(r=>{
+    const field=r.querySelector('[data-f="field"]').value, op=r.querySelector('[data-f="op"]').value;
+    const v1=r.querySelector('[data-f="v1"]').value.trim(), v2=r.querySelector('[data-f="v2"]').value.trim();
+    if(!v1) return null;
+    return { field, op, value: op==='between'?[v1,v2]:v1 };
+  }).filter(Boolean);
+}
+
+// ── Action folders ──
+async function renderFolders(){
+  let folders=[]; try{ folders=(await apiJson('/api/admin/folders?campaign_id='+ldCampId)).folders||[]; }catch(e){}
+  $('ldBody').innerHTML=`<div class="card"><h2>New action folder</h2>
+      <div class="row" style="gap:12px"><input id="foName" class="field" placeholder="e.g. Appointments, Hot Leads, Follow-ups">
+      <button class="btn btn-primary" id="foAdd" style="flex:0 0 auto">Add folder</button></div>
+      <p class="dim mt3" style="font-size:12px">Leads land in folders from dispositions (Sprint 2). Agents click-to-call any lead inside a folder.</p></div>
+    <div class="card mt"><h2>Folders</h2>${folders.map(f=>`<div class="row" style="align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)">
+        <b>${esc(f.name)}</b>${f.campaign_id?'':'<span class="pill pill--info">global</span>'}
+        <span class="dim mono" style="margin-left:auto">${f.lead_count} leads</span>
+        <button class="btn btn-sm" data-viewf="${f.id}">View</button>
+        <button class="btn btn-sm" data-delf="${f.id}">Delete</button></div>`).join('')||'<p class="dim">No folders yet.</p>'}
+      <div id="foLeads" class="mt3"></div></div>`;
+  $('foAdd').onclick=async()=>{ const name=$('foName').value.trim(); if(!name)return; try{ await apiJson('/api/admin/folders','POST',{name,campaign_id:ldCampId}); renderFolders(); }catch(e){ toast(e.message,'err'); } };
+  $('ldBody').querySelectorAll('[data-delf]').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/admin/folders/'+b.dataset.delf,'DELETE'); renderFolders(); }catch(e){ toast(e.message,'err'); } });
+  $('ldBody').querySelectorAll('[data-viewf]').forEach(b=>b.onclick=async()=>{
+    try{ const j=await apiJson('/api/admin/folders/'+b.dataset.viewf+'/leads');
+      $('foLeads').innerHTML=j.leads.length?`<div class="tblwrap"><table><thead><tr><th>Phone</th><th>Name</th><th>Status</th></tr></thead>
+        <tbody>${j.leads.map(l=>`<tr><td class="mono">${esc(l.phone)}</td><td>${esc([l.first_name,l.last_name].filter(Boolean).join(' ')||'—')}</td><td>${esc(l.status)}</td></tr>`).join('')}</tbody></table></div>`
+        :'<p class="dim">Folder is empty.</p>';
+    }catch(e){ toast(e.message,'err'); }
+  });
+}
+
+// ── Custom CRM fields ──
+async function renderFields(){
+  let fields=[]; try{ fields=(await apiJson(`/api/admin/campaigns/${ldCampId}/fields`)).fields||[]; }catch(e){}
+  $('ldBody').innerHTML=`<div class="card"><h2>Add custom field</h2>
+      <div class="row" style="gap:12px;flex-wrap:wrap">
+        <div class="fw" style="flex:1"><span class="lbl">Label</span><input id="cfLabel" class="field" placeholder="e.g. Asking price"></div>
+        <div class="fw"><span class="lbl">Key</span><input id="cfKey" class="field mono" placeholder="asking_price"></div>
+        <div class="fw"><span class="lbl">Type</span><select id="cfType" class="field"><option value="text">Text</option><option value="number">Number</option><option value="date">Date</option><option value="phone">Phone</option><option value="select">Select</option></select></div>
+        <button class="btn btn-primary" id="cfAdd" style="flex:0 0 auto;align-self:flex-end">Add field</button>
+      </div></div>
+    <div class="card mt"><h2>Lead-card layout <span class="faint" style="font:400 12px var(--font-ui)">— order + visibility on the agent lead card</span></h2>
+      ${fields.map(f=>`<div class="row" style="align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)">
+        <span class="mono" style="flex:0 0 40px">${f.position}</span><b>${esc(f.label)}</b>
+        <span class="dim mono">${esc(f.key)}</span><span class="pill pill--faint">${esc(f.type)}</span>
+        <label style="margin-left:auto;font-size:12px" class="dim"><input type="checkbox" data-cardf="${f.id}" ${f.show_on_card?'checked':''}> show on card</label>
+        <button class="btn btn-sm" data-delf="${f.id}">Delete</button></div>`).join('')||'<p class="dim">No custom fields.</p>'}</div>`;
+  enhanceAll($('ldBody'));
+  $('cfAdd').onclick=async()=>{
+    const label=$('cfLabel').value.trim(), key=($('cfKey').value.trim()||label.toLowerCase().replace(/\s+/g,'_'));
+    if(!label){ toast('Label required','err'); return; }
+    try{ await apiJson(`/api/admin/campaigns/${ldCampId}/fields`,'POST',{label,key,type:$('cfType').value,position:fields.length}); renderFields(); }catch(e){ toast(e.message,'err'); }
+  };
+  $('ldBody').querySelectorAll('[data-delf]').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/admin/fields/'+b.dataset.delf,'DELETE'); renderFields(); }catch(e){ toast(e.message,'err'); } });
+  $('ldBody').querySelectorAll('[data-cardf]').forEach(cb=>cb.onchange=async()=>{ try{ await apiJson('/api/admin/fields/'+cb.dataset.cardf,'PATCH',{show_on_card:cb.checked}); }catch(e){ toast(e.message,'err'); } });
+}
+
+// ── DNC list ──
+async function renderDnc(){
+  $('ldBody').innerHTML=`<div class="card">
+    <div class="row" style="align-items:center;gap:12px">
+      <h2 style="margin:0">Do-not-call list</h2>
+      <input id="dncQ" class="field" placeholder="Search phone…" style="max-width:240px;margin-left:12px">
+      <div class="sp" style="flex:1"></div>
+      <button class="btn btn-sm" id="dncExport">Export CSV</button>
+    </div>
+    <p class="dim mt3" style="font-size:12px">Permanent. Numbers enter only when an agent logs the DNC disposition. Removal is admin-only and asks for confirmation.</p>
+    <div id="dncList" class="mt3"></div></div>`;
+  const load=async()=>{
+    try{ const j=await apiJson('/api/admin/dnc'+($('dncQ').value.trim()?'?q='+encodeURIComponent($('dncQ').value.trim()):''));
+      $('dncList').innerHTML=j.rows.length?`<div class="tblwrap"><table><thead><tr><th>Phone</th><th>Reason</th><th>Added</th><th></th></tr></thead>
+        <tbody>${j.rows.map(r=>`<tr><td class="mono">${esc(r.phone)}</td><td>${esc(r.reason||'—')}</td><td class="dim">${fmtTime(r.created_at)}</td>
+          <td><button class="btn btn-sm" data-rmdnc="${esc(r.phone)}">Remove</button></td></tr>`).join('')}</tbody></table></div>`
+        :'<p class="dim">List is empty.</p>';
+      $('dncList').querySelectorAll('[data-rmdnc]').forEach(b=>b.onclick=async()=>{
+        if(!confirm('Remove '+b.dataset.rmdnc+' from the DNC list? This lets it be dialed again.')) return;
+        try{ await apiJson('/api/admin/dnc/'+encodeURIComponent(b.dataset.rmdnc),'DELETE',{confirm:true}); toast('Removed from DNC'); load(); }catch(e){ toast(e.message,'err'); }
+      });
+    }catch(e){ $('dncList').innerHTML=`<p class="err">${esc(e.message)}</p>`; }
+  };
+  let t=null; $('dncQ').oninput=()=>{ clearTimeout(t); t=setTimeout(load,300); };
+  $('dncExport').onclick=async()=>{ try{ const r=await api('/api/admin/dnc/export'); const txt=await r.text(); const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([txt],{type:'text/csv'})); a.download='dnc-list.csv'; a.click(); URL.revokeObjectURL(a.href); }catch(e){ toast(e.message,'err'); } };
+  load();
+}
+
+// ── Calling window (global compliance setting) ──
+async function renderWindow(){
+  let w={start_hour:10,end_hour:21}; try{ w=await apiJson('/api/admin/settings/calling-window'); }catch(e){}
+  const hrs=(sel)=>Array.from({length:24},(_,h)=>`<option value="${h}"${h===sel?' selected':''}>${String(h).padStart(2,'0')}:00</option>`).join('');
+  $('ldBody').innerHTML=`<div class="card" style="max-width:520px"><h2>Calling window</h2>
+    <p class="dim" style="font-size:13px">Hard rule: no lead is dialed before or after this window in <b>their own local time</b> (derived from area code). Applies to the pacer and manual click-to-call.</p>
+    <div class="row mt3" style="gap:12px;align-items:flex-end">
+      <div class="fw"><span class="lbl">Start</span><select id="cwStart" class="field">${hrs(w.start_hour)}</select></div>
+      <div class="fw"><span class="lbl">End</span><select id="cwEnd" class="field">${hrs(w.end_hour)}</select></div>
+      <button class="btn btn-primary" id="cwSave" style="flex:0 0 auto">Save</button>
+    </div><div id="cwMsg" class="dim mt3" style="font-size:12px"></div></div>`;
+  enhanceAll($('ldBody'));
+  $('cwSave').onclick=async()=>{
+    try{ const j=await apiJson('/api/admin/settings/calling-window','PUT',{start_hour:+$('cwStart').value,end_hour:+$('cwEnd').value});
+      $('cwMsg').innerHTML=`<b style="color:var(--ok)">Saved — ${String(j.start_hour).padStart(2,'0')}:00 to ${String(j.end_hour).padStart(2,'0')}:00 lead-local</b>`; }
+    catch(e){ $('cwMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  };
 }
 
 route();
