@@ -539,8 +539,8 @@ const STATE_UI = {
   OFFLINE:   {dot:'faint', pulse:false, txt:'Offline'},
   CONNECTING:{dot:'warn',  pulse:true,  txt:'Connecting…'},
   AVAILABLE: {dot:'ok',    pulse:false, txt:'Available'},
-  CLAIMING:  {dot:'warn',  pulse:true,  txt:'Preparing…'},
-  DIALING:   {dot:'info',  pulse:true,  txt:'Dialing…'},
+  CLAIMING:  {dot:'ok',    pulse:true,  txt:'Waiting…'},
+  DIALING:   {dot:'ok',    pulse:true,  txt:'Waiting…'},
   ON_CALL:   {dot:'ok',    pulse:true,  txt:'On call'},
   WRAP_UP:   {dot:'warn',  pulse:false, txt:'Wrap-up'},
   BREAK:     {dot:'warn',  pulse:false, txt:'Break'},
@@ -557,8 +557,11 @@ function applyState(s, snap){
   $('cHang').disabled=!(s==='ON_CALL'||s==='DIALING');
   if(snap&&snap.onCallSince) onCallSince=snap.onCallSince;
 
-  if(s==='ON_CALL'){ $('bannerState').textContent='Connected — live'; $('bannerSub').textContent='Speak now.'; $('timer').style.color='var(--ok)'; startTimer(); loadContext(); }
-  else if(s==='DIALING'||s==='CLAIMING'){ $('bannerState').textContent='Dialing lead'; $('bannerSub').textContent=snap&&snap.leadNumber?('Calling '+snap.leadNumber):''; stopTimer(); loadContext(); }
+  if(s==='ON_CALL'){ $('bannerState').textContent='Connected — live'; $('bannerSub').textContent='Speak now.'; $('timer').style.color='var(--ok)'; startTimer(); loadContext(); if(prev!=='ON_CALL') beep(); }
+  // Background dialing (ReadyMode-style): the lead is dialed silently and the
+  // agent keeps a "waiting" screen — no contact details are revealed until the
+  // lead actually answers and the call goes live (ON_CALL).
+  else if(s==='DIALING'||s==='CLAIMING'){ $('bannerState').textContent='Waiting for next call…'; $('bannerSub').textContent='Dialing in the background.'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL'||curLeadId) clearLead(); }
   else if(s==='WRAP_UP'){ $('bannerState').textContent='Wrap-up — disposition required'; $('bannerSub').textContent='Pick an outcome to continue.'; stopTimer(); $('dispReq').classList.remove('hidden'); }
   else if(s==='AVAILABLE'){ $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
   else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
@@ -672,6 +675,31 @@ async function submitDisposition(code, callback_at){
     setTimeout(()=>w.classList.add('hidden'),2500);
   }catch(e){ toast(e.message,'err'); }
 }
+// ── Live-call alert tone ────────────────────────────────────────────────────
+// Two quick rising beeps the instant a lead answers, so the agent looks up.
+// Browsers gate audio behind a user gesture; we lazily create the context and
+// unlock it on the first interaction anywhere on the page.
+let _actx=null;
+function _ensureAudio(){
+  try{ _actx = _actx || new (window.AudioContext||window.webkitAudioContext)(); if(_actx.state==='suspended') _actx.resume(); }catch(e){}
+  return _actx;
+}
+document.addEventListener('click', _ensureAudio, {once:true});
+document.addEventListener('keydown', _ensureAudio, {once:true});
+function _tone(ctx, freq, at, dur){
+  const o=ctx.createOscillator(), g=ctx.createGain();
+  o.type='sine'; o.frequency.value=freq; o.connect(g); g.connect(ctx.destination);
+  const t=ctx.currentTime+at;
+  g.gain.setValueAtTime(0.0001,t);
+  g.gain.exponentialRampToValueAtTime(0.35,t+0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.start(t); o.stop(t+dur+0.02);
+}
+function beep(){
+  const ctx=_ensureAudio(); if(!ctx) return;
+  try{ _tone(ctx,880,0,0.18); _tone(ctx,1175,0.2,0.22); }catch(e){}
+}
+
 function clearLead(){
   curLeadId=null; $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
   $('scriptBody').className='empty'; $('scriptBody').textContent='No active call.';
