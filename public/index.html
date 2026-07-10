@@ -5,132 +5,192 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Trinity Dialer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#0a0f1a; --bg2:#0d131f; --panel:#111826; --panel2:#0e1522; --line:#1e2836;
-    --line2:#28344a; --txt:#e8eef7; --mut:#8792a6; --mut2:#5c6678;
-    --acc:#3b82f6; --acc-h:#2f6fe0; --grn:#22c55e; --red:#ef4444; --amber:#f59e0b;
-    --purple:#a371f7; --orange:#f0883e; --radius:12px;
-    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
+    /* Surfaces */
+    --bg:#0B0E14; --surface:#11151D; --surface-2:#171C26;
+    --border:rgba(255,255,255,0.07); --border-strong:rgba(255,255,255,0.14);
+    /* Text */
+    --text:#E6EAF2; --text-dim:#8A93A6; --text-faint:#566072;
+    /* Accent — one only */
+    --accent:#E8B33D; --accent-hover:#F2C45C; --accent-ink:#14100A;
+    /* Status */
+    --ok:#34C77B; --warn:#E8A13D; --danger:#E5544B; --info:#5B8DEF;
+    --ok-tint:rgba(52,199,123,0.12); --warn-tint:rgba(232,161,61,0.12);
+    --danger-tint:rgba(229,84,75,0.12); --info-tint:rgba(91,141,239,0.12);
+    /* Type */
+    --font-ui:"IBM Plex Sans",system-ui,sans-serif;
+    --font-mono:"IBM Plex Mono",ui-monospace,monospace;
   }
   *{box-sizing:border-box}
   html,body{height:100%}
-  body{margin:0;font:14px/1.5 Inter,system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt);
+  body{margin:0;font:400 13.5px/1.5 var(--font-ui);background:var(--bg);color:var(--text);
        -webkit-font-smoothing:antialiased}
-  ::selection{background:rgba(59,130,246,.35)}
-  a{color:var(--acc)}
+  ::selection{background:rgba(232,179,61,.28)}
+  a{color:var(--accent);text-decoration:none}
   .hidden{display:none!important}
-  .mut{color:var(--mut)} .mut2{color:var(--mut2)}
-  .err{color:var(--red);font-size:13px}
-  /* buttons */
-  .btn{appearance:none;border:1px solid var(--line2);background:#16202f;color:var(--txt);
-       padding:9px 14px;border-radius:10px;font:600 13px Inter;cursor:pointer;transition:.12s;display:inline-flex;
-       align-items:center;gap:7px;justify-content:center}
-  .btn:hover{border-color:#3a4a63;background:#1a2637}
-  .btn:disabled{opacity:.4;cursor:not-allowed}
-  .btn-primary{background:var(--acc);border-color:transparent;color:#fff}
-  .btn-primary:hover{background:var(--acc-h)}
-  .btn-grn{background:var(--grn);border-color:transparent;color:#04140a}
-  .btn-red{background:var(--red);border-color:transparent;color:#fff}
-  .btn-amber{background:var(--amber);border-color:transparent;color:#1b1200}
-  .btn-ghost{background:transparent;border-color:var(--line)}
-  .btn-sm{padding:6px 10px;font-size:12px;border-radius:8px}
-  .btn-lg{padding:12px 18px;font-size:14px}
-  .btn-block{width:100%}
-  /* inputs */
-  .field{width:100%;padding:10px 12px;background:var(--bg2);border:1px solid var(--line2);border-radius:10px;
-         color:var(--txt);font:14px Inter;outline:none;transition:.12s}
-  .field:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-  textarea.field{resize:vertical;min-height:70px;line-height:1.5}
-  label.lbl{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);margin:0 0 6px;font-weight:600}
-  select.field{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%238792a6' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center}
-  /* cards / panels */
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
-  .pill{font-size:11px;font-weight:600;padding:3px 9px;border-radius:99px;background:#0e1522;border:1px solid var(--line2);color:var(--mut)}
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--mut2);display:inline-block;flex:0 0 auto}
-  .dot.on{background:var(--grn);box-shadow:0 0 0 3px rgba(34,197,94,.18)}
-  .dot.busy{background:var(--amber);box-shadow:0 0 0 3px rgba(245,158,11,.18)}
-  .dot.call{background:var(--acc);box-shadow:0 0 0 3px rgba(59,130,246,.18)}
-  .dot.off{background:var(--mut2)}
-  .row{display:flex;gap:10px}.row>*{flex:1}
-  .mt{margin-top:12px}.mt2{margin-top:8px}
-  .spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite}
-  @keyframes sp{to{transform:rotate(360deg)}}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
-  /* toast */
-  #toasts{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px;z-index:100}
-  .toast{background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:11px 14px;font-size:13px;box-shadow:var(--shadow);animation:slideIn .2s;max-width:320px}
-  .toast.err{border-color:var(--red)}
-  @keyframes slideIn{from{transform:translateX(20px);opacity:0}}
+  .mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+  .dim{color:var(--text-dim)} .faint{color:var(--text-faint)}
+  .err{color:var(--danger);font-size:13px}
+  .lbl{display:block;font:500 11px var(--font-ui);text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);margin:0 0 6px}
 
-  /* ===== LOGIN ===== */
+  /* ── buttons ── */
+  .btn{appearance:none;height:36px;border:1px solid var(--border-strong);background:transparent;color:var(--text);
+       padding:0 14px;border-radius:8px;font:600 13px var(--font-ui);cursor:pointer;transition:background .12s ease-out,border-color .12s ease-out;
+       display:inline-flex;align-items:center;gap:7px;justify-content:center}
+  .btn:hover{background:var(--surface-2)}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .btn-primary{background:var(--accent);border-color:transparent;color:var(--accent-ink)}
+  .btn-primary:hover{background:var(--accent-hover)}
+  .btn-danger{background:var(--danger-tint);border-color:transparent;color:var(--danger)}
+  .btn-danger:hover{background:var(--danger);color:#fff}
+  .btn-sm{height:30px;padding:0 10px;font-size:12px}
+  .btn-block{width:100%}
+
+  /* ── inputs ── */
+  .field{width:100%;height:36px;padding:0 12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;
+         color:var(--text);font:400 13.5px var(--font-ui);outline:none;transition:border-color .12s,box-shadow .12s}
+  textarea.field{height:auto;min-height:74px;padding:9px 12px;resize:vertical;line-height:1.5}
+  .field::placeholder{color:var(--text-faint)}
+  .field:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(232,179,61,.18)}
+
+  /* ── custom select ── */
+  .csel{position:relative}
+  .csel-btn{width:100%;height:36px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 12px;
+            background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);
+            font:400 13.5px var(--font-ui);cursor:pointer;text-align:left}
+  .csel-btn.open{border-color:var(--accent);box-shadow:0 0 0 3px rgba(232,179,61,.18)}
+  .csel-caret{color:var(--text-dim);font-size:10px}
+  .csel-list{position:absolute;z-index:60;top:calc(100% + 4px);left:0;right:0;background:var(--surface-2);
+             border:1px solid var(--border-strong);border-radius:8px;padding:4px;max-height:240px;overflow:auto;
+             box-shadow:0 8px 24px rgba(4,6,10,.5)}
+  .csel-opt{padding:8px 10px;border-radius:6px;font-size:13.5px;cursor:pointer;color:var(--text)}
+  .csel-opt:hover{background:var(--surface)}
+  .csel-opt.sel{color:var(--accent)}
+
+  /* ── drop zone ── */
+  .dropzone{border:1px dashed var(--border-strong);border-radius:8px;padding:16px 12px;text-align:center;
+            color:var(--text-dim);font-size:13px;cursor:pointer;transition:border-color .12s,background .12s}
+  .dropzone:hover,.dropzone.drag{border-color:var(--accent);background:var(--surface-2)}
+  .dropzone b{color:var(--text);font-weight:500}
+
+  /* ── cards ── */
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px}
+  .panelTitle{font:600 14px var(--font-ui);margin:0 0 16px;display:flex;align-items:center;gap:8px}
+
+  /* ── telemetry dots ── */
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto;background:var(--text-faint)}
+  .dot--ok{background:var(--ok);--pulse:rgba(52,199,123,.4)}
+  .dot--warn{background:var(--warn);--pulse:rgba(232,161,61,.4)}
+  .dot--danger{background:var(--danger);--pulse:rgba(229,84,75,.4)}
+  .dot--info{background:var(--info);--pulse:rgba(91,141,239,.4)}
+  .dot--faint{background:var(--text-faint)}
+  @keyframes tel-pulse{0%{box-shadow:0 0 0 0 var(--pulse)}100%{box-shadow:0 0 0 6px transparent}}
+  .dot--pulse{animation:tel-pulse 1.6s ease-out infinite}
+  @media(prefers-reduced-motion:reduce){.dot--pulse{animation:none;box-shadow:0 0 0 2px var(--pulse)}}
+
+  /* ── pills ── */
+  .pill{height:22px;display:inline-flex;align-items:center;gap:7px;padding:0 10px;border-radius:999px;
+        font:600 11px var(--font-ui);text-transform:uppercase;letter-spacing:.04em;background:var(--surface-2);color:var(--text-faint)}
+  .pill--ok{background:var(--ok-tint);color:var(--ok)}
+  .pill--warn{background:var(--warn-tint);color:var(--warn)}
+  .pill--danger{background:var(--danger-tint);color:var(--danger)}
+  .pill--info{background:var(--info-tint);color:var(--info)}
+  .pill--faint{background:var(--surface-2);color:var(--text-faint)}
+
+  .row{display:flex;gap:12px}.row>*{flex:1}
+  .mt{margin-top:16px}.mt2{margin-top:8px}.mt3{margin-top:12px}
+
+  /* ── toast ── */
+  #toasts{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px;z-index:200}
+  .toast{background:var(--surface-2);border:1px solid var(--border-strong);border-left:2px solid var(--text-dim);
+         border-radius:8px;padding:11px 14px;font-size:13px;max-width:320px;animation:fadein .18s ease-out}
+  .toast--ok{border-left-color:var(--ok)}
+  .toast--warn{border-left-color:var(--warn)}
+  .toast--err{border-left-color:var(--danger)}
+  @keyframes fadein{from{opacity:0;transform:translateY(4px)}}
+
+  /* ── reconnect banner ── */
+  .reconn{background:var(--warn-tint);color:var(--warn);border-bottom:1px solid var(--border-strong);
+          font:500 12px var(--font-ui);padding:7px 18px;text-align:center}
+
+  /* ═══ LOGIN ═══ */
   #viewLogin{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
   .loginCard{width:100%;max-width:380px}
-  .brand{display:flex;align-items:center;gap:10px;margin-bottom:22px}
-  .brand .mark{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--acc),#7c3aed);display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff}
-  .brand h1{font-size:18px;margin:0;font-weight:700}
+  .brand{display:flex;align-items:center;gap:10px}
+  .brand .mark{width:32px;height:32px;border-radius:8px;background:var(--accent);display:flex;align-items:center;
+               justify-content:center;font:600 16px var(--font-ui);color:var(--accent-ink)}
+  .brand h1{font:600 18px var(--font-ui);margin:0;letter-spacing:-.01em}
 
-  /* ===== APP CHROME ===== */
-  .appbar{height:56px;display:flex;align-items:center;gap:14px;padding:0 18px;border-bottom:1px solid var(--line);background:var(--bg2);position:sticky;top:0;z-index:20}
-  .appbar .brand{margin:0}
+  /* ═══ APP CHROME ═══ */
+  .appbar{height:56px;display:flex;align-items:center;gap:14px;padding:0 32px;border-bottom:1px solid var(--border);
+          background:var(--surface);position:sticky;top:0;z-index:20}
+  .appbar .brand h1{font-size:16px}
   .appbar .sp{flex:1}
-  .who{font-size:13px;color:var(--mut)}
+  .who{font-size:13px;color:var(--text-dim)}
 
-  /* ===== AGENT 3-PANEL ===== */
+  /* ═══ AGENT 3-PANEL ═══ */
   #viewAgent{height:100vh;display:flex;flex-direction:column}
-  .agentGrid{flex:1;display:grid;grid-template-columns:320px 1fr 340px;gap:14px;padding:14px;overflow:hidden}
-  .col{display:flex;flex-direction:column;gap:14px;min-height:0;overflow:auto}
-  .panelTitle{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);font-weight:700;margin:0 0 10px;display:flex;align-items:center;gap:8px}
-  /* script */
-  #scriptBody{white-space:pre-wrap;line-height:1.7;font-size:14.5px;color:#dbe4f0}
-  #scriptBody .mf{color:var(--acc);font-weight:600}
-  /* lead card */
-  .leadName{font-size:22px;font-weight:700;margin:0}
-  .leadPhone{font-size:19px;font-weight:600;color:#fff;letter-spacing:.02em}
-  .kv{display:grid;grid-template-columns:96px 1fr;gap:6px 12px;font-size:13.5px}
-  .kv .k{color:var(--mut)}
-  .hist{display:flex;flex-direction:column;gap:0}
-  .hist .h{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
-  .hist .h:first-child{border-top:0}
-  .hbadge{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;height:fit-content;white-space:nowrap}
-  /* call state banner */
-  .callBanner{display:flex;align-items:center;gap:14px;padding:14px 16px;border-radius:var(--radius);border:1px solid var(--line2);background:linear-gradient(180deg,#121b2b,#0e1522)}
-  .callBanner .big{font-size:16px;font-weight:700}
-  .timer{font-variant-numeric:tabular-nums;font-size:22px;font-weight:700;letter-spacing:.02em}
-  /* controls */
-  .ctrlGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-  .ctrlBtn{flex-direction:column;gap:6px;padding:14px 8px;font-size:12px}
-  .ctrlBtn .ic{font-size:20px;line-height:1}
-  .ctrlBtn.active{border-color:var(--amber);background:rgba(245,158,11,.12);color:var(--amber)}
-  /* dispositions */
-  .dispGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-  .dispBtn{display:flex;align-items:center;gap:9px;padding:11px 12px;border-radius:10px;border:1px solid var(--line2);
-           background:#131c2b;cursor:pointer;font:600 13px Inter;color:var(--txt);text-align:left;transition:.1s}
-  .dispBtn:hover{border-color:var(--line2);filter:brightness(1.15)}
-  .dispBtn .hk{margin-left:auto;font-size:11px;color:var(--mut);border:1px solid var(--line2);border-radius:5px;padding:1px 6px;font-weight:600}
-  .dispBtn .sw{width:10px;height:10px;border-radius:3px;flex:0 0 auto}
-  .dialpad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-  .dialpad button{padding:12px;font-size:16px;font-weight:600;border-radius:10px;border:1px solid var(--line2);background:#131c2b;color:var(--txt);cursor:pointer}
-  .dialpad button:hover{background:#1a2637}
-  #log{font:12px/1.55 ui-monospace,Menlo,monospace;color:var(--mut);background:#080c14;border:1px solid var(--line);border-radius:10px;padding:10px;height:110px;overflow:auto;white-space:pre-wrap}
-  .empty{color:var(--mut2);font-size:13px;text-align:center;padding:26px 10px}
-  @media(max-width:1100px){ .agentGrid{grid-template-columns:1fr;overflow:auto} .col{overflow:visible} }
+  .agentGrid{flex:1;display:grid;grid-template-columns:280px 1fr 320px;gap:16px;padding:16px 32px 32px;overflow:hidden}
+  .col{display:flex;flex-direction:column;gap:16px;min-height:0;overflow:auto}
+  #scriptBody{white-space:pre-wrap;line-height:1.6;font-size:14px;color:var(--text)}
+  #scriptBody .mf{color:var(--accent);font-weight:500}
+  .leadName{font:600 20px var(--font-ui);margin:0;letter-spacing:-.01em}
+  .leadPhone{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:15px;color:var(--text)}
+  .kv{display:grid;grid-template-columns:96px 1fr;gap:8px 12px;font-size:13.5px}
+  .kv .k{color:var(--text-dim)}
+  .kv .mono{font-size:13px}
+  .hist .h{display:flex;gap:10px;padding:12px 0;border-top:1px solid var(--border)}
+  .hist .h:first-child{border-top:0;padding-top:0}
+  .hbadge{font:600 11px var(--font-ui);text-transform:uppercase;letter-spacing:.04em;padding:2px 8px;border-radius:999px;height:fit-content;white-space:nowrap}
+  .callBanner{display:flex;align-items:center;gap:14px;padding:16px 24px;border-radius:10px;border:1px solid var(--border);background:var(--surface)}
+  .callBanner .big{font:600 15px var(--font-ui)}
+  .timer{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:24px;font-weight:500;color:var(--text)}
 
-  /* ===== ADMIN ===== */
-  .wrap{max-width:960px;margin:22px auto;padding:0 16px}
+  .ctrlGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .ctrlBtn{flex-direction:column;gap:6px;height:auto;padding:14px 8px;font-size:12px;font-weight:500}
+  .ctrlBtn .ic{font-size:18px;line-height:1}
+  .ctrlBtn.active{background:var(--warn-tint);border-color:transparent;color:var(--warn)}
+  .ctrlBtn.danger{background:var(--danger-tint);border-color:transparent;color:var(--danger)}
+  .ctrlBtn.danger:hover{background:var(--danger);color:#fff}
+
+  .dispGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .dispBtn{display:flex;align-items:center;gap:9px;height:auto;padding:11px 12px;border-radius:8px;border:1px solid var(--border-strong);
+           background:transparent;cursor:pointer;font:600 13px var(--font-ui);color:var(--text);text-align:left}
+  .dispBtn:hover{background:var(--surface-2)}
+  .dispBtn .hk{margin-left:auto;font-family:var(--font-mono);font-size:11px;color:var(--text-dim);border:1px solid var(--border);border-radius:5px;padding:1px 6px}
+  .dispBtn .sw{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+  .dialpad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .dialpad button{height:44px;font-family:var(--font-mono);font-size:16px;font-weight:500;border-radius:8px;border:1px solid var(--border-strong);
+                  background:transparent;color:var(--text);cursor:pointer}
+  .dialpad button:hover{background:var(--surface-2)}
+  #log{font:400 12px/1.55 var(--font-mono);color:var(--text-dim);background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;height:104px;overflow:auto;white-space:pre-wrap}
+  .empty{color:var(--text-faint);font-size:13px;text-align:center;padding:26px 10px}
+  @media(max-width:1100px){ .agentGrid{grid-template-columns:1fr;overflow:auto;padding:16px} .col{overflow:visible} }
+
+  /* ═══ ADMIN ═══ */
+  .wrap{max-width:960px;margin:24px auto;padding:0 32px}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  @media(max-width:720px){.grid2{grid-template-columns:1fr}}
-  h2{font-size:14px;margin:0 0 12px;font-weight:700}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
-  th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  @media(max-width:768px){.grid2{grid-template-columns:1fr}.wrap{padding:0 16px}.appbar{padding:0 16px}}
+  h2{font:600 14px var(--font-ui);margin:0 0 16px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  thead tr{background:var(--surface-2)}
+  th{color:var(--text-dim);font:500 11px var(--font-ui);text-transform:uppercase;letter-spacing:.06em;text-align:left;padding:0 12px;height:36px}
+  td{text-align:left;padding:0 12px;height:44px;border-bottom:1px solid var(--border)}
+  tbody tr:hover{background:var(--surface-2)}
   .chips{display:flex;flex-wrap:wrap;gap:6px}
-  .chip{font-size:12px;padding:3px 9px;border-radius:99px;background:#0e1522;border:1px solid var(--line2);display:flex;gap:7px;align-items:center}
-  .chip b{font-weight:600}
-  .pill.RUNNING{color:var(--grn);border-color:rgba(34,197,94,.4)}
-  .pill.PAUSED{color:var(--amber);border-color:rgba(245,158,11,.4)}
-  .pill.STOPPED,.pill.DRAFT{color:var(--mut)}
+  .chip{font-size:12px;padding:3px 9px;border-radius:999px;background:var(--surface-2);border:1px solid var(--border);display:flex;gap:7px;align-items:center}
+  .chip b{font-weight:500}
+  .transport{display:flex;gap:8px}
+  .tbtn{flex:1;height:36px;display:inline-flex;align-items:center;justify-content:center;gap:6px;background:transparent;
+        border:1px solid var(--border-strong);border-radius:8px;font:600 12px var(--font-ui);cursor:pointer;color:var(--text-dim)}
+  .tbtn:hover{background:var(--surface-2)}
+  .tbtn--ok{color:var(--ok)} .tbtn--warn{color:var(--warn)} .tbtn--danger{color:var(--danger)} .tbtn--faint{color:var(--text-dim)}
+  .tbtn.on--ok{background:var(--ok-tint);border-color:transparent}
+  .tbtn.on--warn{background:var(--warn-tint);border-color:transparent}
+  .tbtn.on--danger{background:var(--danger-tint);border-color:transparent}
 </style>
 </head>
 <body>
@@ -138,8 +198,8 @@
 <!-- ═══ LOGIN ═══ -->
 <div id="viewLogin">
   <div class="loginCard card">
-    <div class="brand"><div class="mark">T</div><h1>Trinity Dialer</h1></div>
-    <label class="lbl">Email / username</label>
+    <div class="brand" style="margin-bottom:22px"><div class="mark">T</div><h1>Trinity Dialer</h1></div>
+    <label class="lbl">Email or username</label>
     <input id="liEmail" class="field" autocomplete="username" />
     <label class="lbl mt">Password</label>
     <input id="liPass" class="field" type="password" autocomplete="current-password" />
@@ -150,14 +210,15 @@
 
 <!-- ═══ AGENT ═══ -->
 <div id="viewAgent" class="hidden">
+  <div id="reconnBanner" class="reconn hidden">Reconnecting…</div>
   <div class="appbar">
     <div class="brand"><div class="mark">T</div><h1>Trinity</h1></div>
-    <span id="agState" class="pill"><span class="dot"></span> Offline</span>
-    <span id="agConn" class="pill">softphone: —</span>
+    <span id="agState" class="pill pill--faint"><span class="dot dot--faint"></span> Offline</span>
+    <span id="agConn" class="pill pill--faint">Softphone —</span>
     <div class="sp"></div>
     <span class="who" id="agWho"></span>
-    <button id="agBreak" class="btn btn-sm btn-amber">Break</button>
-    <button class="btn btn-sm btn-ghost" onclick="logout()">Sign out</button>
+    <button id="agBreak" class="btn btn-sm">Break</button>
+    <button class="btn btn-sm" onclick="logout()">Sign out</button>
   </div>
 
   <div class="agentGrid">
@@ -172,8 +233,8 @@
     <!-- CENTER: lead -->
     <div class="col">
       <div id="callBanner" class="callBanner">
-        <span id="bannerDot" class="dot"></span>
-        <div><div id="bannerState" class="big">Waiting…</div><div id="bannerSub" class="mut" style="font-size:12px">Auto-dial runs when you're Available.</div></div>
+        <span id="bannerDot" class="dot dot--faint"></span>
+        <div><div id="bannerState" class="big">Waiting</div><div id="bannerSub" class="dim" style="font-size:12px">Auto-dial runs when you go available.</div></div>
         <div class="sp" style="flex:1"></div>
         <div id="timer" class="timer hidden">00:00</div>
       </div>
@@ -199,12 +260,12 @@
       <div class="card">
         <p class="panelTitle">Call controls</p>
         <div class="ctrlGrid">
-          <button id="cMute" class="btn ctrlBtn" disabled><span class="ic">🎙️</span><span>Mute</span></button>
-          <button id="cHold" class="btn ctrlBtn" disabled><span class="ic">⏸️</span><span>Hold</span></button>
-          <button id="cPad"  class="btn ctrlBtn" disabled><span class="ic">⌨️</span><span>Dialpad</span></button>
-          <button id="cHang" class="btn ctrlBtn btn-red" disabled><span class="ic">📵</span><span>Hang up</span></button>
+          <button id="cMute" class="btn ctrlBtn" disabled><span class="ic">🎙</span><span>Mute</span></button>
+          <button id="cHold" class="btn ctrlBtn" disabled><span class="ic">⏸</span><span>Hold</span></button>
+          <button id="cPad"  class="btn ctrlBtn" disabled><span class="ic">⌨</span><span>Dialpad</span></button>
+          <button id="cHang" class="btn ctrlBtn danger" disabled><span class="ic">☎</span><span>Hang up</span></button>
         </div>
-        <div id="padWrap" class="mt hidden">
+        <div id="padWrap" class="mt3 hidden">
           <div class="dialpad">
             <button>1</button><button>2</button><button>3</button>
             <button>4</button><button>5</button><button>6</button>
@@ -215,14 +276,14 @@
       </div>
 
       <div class="card" style="flex:1">
-        <p class="panelTitle">Disposition <span id="dispReq" class="pill hidden" style="color:var(--amber);border-color:var(--amber)">required</span></p>
+        <p class="panelTitle">Disposition <span id="dispReq" class="pill pill--warn hidden">required</span></p>
         <div id="dispGrid" class="dispGrid"></div>
         <div id="cbWrap" class="mt hidden">
           <label class="lbl">Callback time</label>
           <input id="cbTime" class="field" type="datetime-local" />
           <button id="cbSave" class="btn btn-primary btn-block mt2">Save callback</button>
         </div>
-        <div id="wrapMsg" class="mut mt hidden" style="font-size:12px"></div>
+        <div id="wrapMsg" class="dim mt hidden" style="font-size:12px"></div>
       </div>
 
       <div class="card">
@@ -239,28 +300,28 @@
     <div class="brand"><div class="mark">T</div><h1>Trinity — Admin</h1></div>
     <div class="sp"></div>
     <span class="who" id="adWho"></span>
-    <button class="btn btn-sm btn-ghost" onclick="logout()">Sign out</button>
+    <button class="btn btn-sm" onclick="logout()">Sign out</button>
   </div>
   <div class="wrap">
     <div class="grid2">
       <div class="card">
-        <h2>Users</h2>
+        <h2>Agents</h2>
         <table id="usersTbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>State</th></tr></thead><tbody></tbody></table>
-        <div class="mt"><b style="font-size:13px">Add user</b></div>
-        <div class="row mt"><input id="uName" class="field" placeholder="Name" /><input id="uEmail" class="field" placeholder="Email / username" /></div>
-        <div class="row mt">
+        <div class="mt"><span class="lbl">Add agent</span></div>
+        <div class="row"><input id="uName" class="field" placeholder="Name" /><input id="uEmail" class="field" placeholder="Email or username" /></div>
+        <div class="row mt3">
           <input id="uPass" class="field" placeholder="Password" />
-          <select id="uRole" class="field"><option value="agent">agent</option><option value="admin">admin</option></select>
+          <select id="uRole" class="field"><option value="agent">Agent</option><option value="admin">Admin</option></select>
         </div>
-        <button id="btnAddUser" class="btn btn-primary btn-block mt">Create user (+ Telnyx credential)</button>
+        <button id="btnAddUser" class="btn btn-primary btn-block mt3">Add agent</button>
         <p id="uErr" class="err mt hidden"></p>
       </div>
       <div class="card">
         <h2>New campaign</h2>
         <label class="lbl">Campaign name</label>
         <input id="cName" class="field" placeholder="e.g. Florida FSBO June" />
-        <button id="btnAddCamp" class="btn btn-primary btn-block mt">Create campaign</button>
-        <p class="mut mt" style="font-size:12px">After creating: assign agents, upload a lead CSV, then Start.</p>
+        <button id="btnAddCamp" class="btn btn-primary btn-block mt3">Create campaign</button>
+        <p class="dim mt3" style="font-size:12px">After creating: assign agents, upload a lead CSV, then start.</p>
       </div>
     </div>
     <div class="card mt">
@@ -281,9 +342,28 @@ let client=null, ws=null, serverState='OFFLINE', usersCache=[];
 let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null;
 let dispositions=[], curCampaign=null, pendingCb=null;
 
-function log(m){ const el=$('log'); if(!el) return; el.textContent += (new Date().toLocaleTimeString()+'  '+m+'\n'); el.scrollTop=el.scrollHeight; }
-function toast(m,isErr){ const t=document.createElement('div'); t.className='toast'+(isErr?' err':''); t.textContent=m; $('toasts').appendChild(t); setTimeout(()=>t.remove(),4200); }
+function log(m){ const el=$('log'); if(!el) return; el.textContent += (new Date().toLocaleTimeString([], {hour12:false})+'  '+m+'\n'); el.scrollTop=el.scrollHeight; }
+function toast(m,kind){ if(kind===true)kind='err'; kind=kind||'ok';
+  const t=document.createElement('div'); t.className='toast toast--'+kind; t.textContent=m; $('toasts').appendChild(t); setTimeout(()=>t.remove(),4000); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// ── custom select: replace native ──
+function enhanceSelect(sel){
+  if(!sel || sel.dataset.enh) return; sel.dataset.enh='1';
+  const wrap=document.createElement('div'); wrap.className='csel';
+  sel.parentNode.insertBefore(wrap, sel); wrap.appendChild(sel); sel.style.display='none';
+  const btn=document.createElement('button'); btn.type='button'; btn.className='csel-btn';
+  const list=document.createElement('div'); list.className='csel-list hidden';
+  const render=()=>{ const o=sel.options[sel.selectedIndex]; btn.innerHTML=`<span>${o?esc(o.textContent):''}</span><span class="csel-caret">▾</span>`; };
+  const close=()=>{ list.classList.add('hidden'); btn.classList.remove('open'); };
+  const open=()=>{ list.innerHTML=''; Array.from(sel.options).forEach((o,i)=>{ const it=document.createElement('div');
+      it.className='csel-opt'+(i===sel.selectedIndex?' sel':''); it.textContent=o.textContent;
+      it.onclick=(e)=>{ e.stopPropagation(); sel.selectedIndex=i; render(); close(); sel.dispatchEvent(new Event('change',{bubbles:true})); };
+      list.appendChild(it); }); list.classList.remove('hidden'); btn.classList.add('open'); };
+  btn.onclick=(e)=>{ e.stopPropagation(); list.classList.contains('hidden')?open():close(); };
+  document.addEventListener('click', close);
+  wrap.appendChild(btn); wrap.appendChild(list); render();
+}
 
 async function api(path, opts={}) {
   opts.headers = Object.assign({ 'Authorization':'Bearer '+TOKEN }, opts.headers||{});
@@ -332,43 +412,52 @@ function openWs(){
   try{ if(ws) ws.close(); }catch{}
   const proto = location.protocol==='https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
+  ws.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); };
   ws.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
     if(m.type==='agent.state'){ applyState(m.state, m); } };
-  ws.onclose = ()=>{ /* reconnect while logged in as agent */ if(TOKEN&&USER&&USER.role==='agent') setTimeout(openWs, 2500); };
+  ws.onclose = ()=>{ if(TOKEN&&USER&&USER.role==='agent'){ $('reconnBanner').classList.remove('hidden'); setTimeout(openWs, 2500); } };
 }
 
 const STATE_UI = {
-  OFFLINE:['off','Offline'], CONNECTING:['busy','Connecting…'], AVAILABLE:['on','Available'],
-  CLAIMING:['busy','Preparing…'], DIALING:['busy','Dialing…'], ON_CALL:['call','On call'], WRAP_UP:['busy','Wrap-up'],
+  OFFLINE:   {dot:'faint', pulse:false, txt:'Offline'},
+  CONNECTING:{dot:'warn',  pulse:true,  txt:'Connecting…'},
+  AVAILABLE: {dot:'ok',    pulse:false, txt:'Available'},
+  CLAIMING:  {dot:'warn',  pulse:true,  txt:'Preparing…'},
+  DIALING:   {dot:'info',  pulse:true,  txt:'Dialing…'},
+  ON_CALL:   {dot:'ok',    pulse:true,  txt:'On call'},
+  WRAP_UP:   {dot:'warn',  pulse:false, txt:'Wrap-up'},
+  BREAK:     {dot:'warn',  pulse:false, txt:'Break'},
 };
 function applyState(s, snap){
   const prev=serverState; serverState=s;
-  const [cls,txt]=STATE_UI[s]||['off','—'];
-  $('agState').innerHTML=`<span class="dot ${cls}"></span> ${txt}`;
-  const dot=$('bannerDot'); dot.className='dot '+cls;
-  // controls enabled only on live call
+  const u=STATE_UI[s]||{dot:'faint',pulse:false,txt:'—'};
+  const dotHtml=`<span class="dot dot--${u.dot}${u.pulse?' dot--pulse':''}"></span>`;
+  $('agState').className='pill pill--'+u.dot;
+  $('agState').innerHTML=dotHtml+' '+u.txt;
+  $('bannerDot').className='dot dot--'+u.dot+(u.pulse?' dot--pulse':'');
   const live = (s==='ON_CALL');
   ['cMute','cHold','cPad'].forEach(id=>$(id).disabled=!live);
   $('cHang').disabled=!(s==='ON_CALL'||s==='DIALING');
   if(snap&&snap.onCallSince) onCallSince=snap.onCallSince;
 
-  if(s==='ON_CALL'){ $('bannerState').textContent='Connected — live'; $('bannerSub').textContent='Speak now.'; startTimer(); loadContext(); }
-  else if(s==='DIALING'||s==='CLAIMING'){ $('bannerState').textContent='Dialing lead…'; $('bannerSub').textContent=snap&&snap.leadNumber?('Calling '+snap.leadNumber):''; stopTimer(); loadContext(); }
+  if(s==='ON_CALL'){ $('bannerState').textContent='Connected — live'; $('bannerSub').textContent='Speak now.'; $('timer').style.color='var(--ok)'; startTimer(); loadContext(); }
+  else if(s==='DIALING'||s==='CLAIMING'){ $('bannerState').textContent='Dialing lead'; $('bannerSub').textContent=snap&&snap.leadNumber?('Calling '+snap.leadNumber):''; stopTimer(); loadContext(); }
   else if(s==='WRAP_UP'){ $('bannerState').textContent='Wrap-up — disposition required'; $('bannerSub').textContent='Pick an outcome to continue.'; stopTimer(); $('dispReq').classList.remove('hidden'); }
   else if(s==='AVAILABLE'){ $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
   else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
+  else { $('bannerState').textContent=u.txt; }
 }
 
 function startTimer(){ if(timerInt) clearInterval(timerInt); $('timer').classList.remove('hidden');
   timerInt=setInterval(()=>{ const base=onCallSince||Date.now(); const s=Math.max(0,Math.floor((Date.now()-base)/1000));
     $('timer').textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); },500); }
-function stopTimer(){ if(timerInt){clearInterval(timerInt);timerInt=null;} $('timer').classList.add('hidden'); $('timer').textContent='00:00'; }
+function stopTimer(){ if(timerInt){clearInterval(timerInt);timerInt=null;} $('timer').classList.add('hidden'); $('timer').textContent='00:00'; $('timer').style.color='var(--text)'; }
 
 async function startAgent(){
   applyState('CONNECTING');
   openWs();
   const TelnyxRTC = getTelnyxRTC();
-  if(!TelnyxRTC){ log('ERROR: Telnyx WebRTC SDK not loaded'); toast('Softphone SDK failed to load',true); return; }
+  if(!TelnyxRTC){ log('ERROR: Telnyx WebRTC SDK not loaded'); toast('Softphone SDK failed to load','err'); return; }
   try {
     log('fetching softphone token…');
     const j = await apiJson('/api/agent/token');
@@ -376,12 +465,12 @@ async function startAgent(){
     client = new TelnyxRTC({ login_token: j.login_token });
     client.remoteElement = 'remoteAudio';
     client.on('telnyx.ready', async () => {
-      $('agConn').textContent='softphone: registered';
+      $('agConn').className='pill pill--ok'; $('agConn').innerHTML='<span class="dot dot--ok"></span> Softphone';
       log('registered ✓ — going available');
       try { await apiJson('/api/agent/available','POST',{}); } catch(e){ log('available error: '+e.message); }
     });
     client.on('telnyx.error', e => log('telnyx.error: '+(e&&e.error&&e.error.message||JSON.stringify(e))));
-    client.on('telnyx.socket.close', () => { $('agConn').textContent='softphone: disconnected'; });
+    client.on('telnyx.socket.close', () => { $('agConn').className='pill pill--faint'; $('agConn').textContent='Softphone —'; });
     client.on('telnyx.notification', n => {
       if(n.type==='callUpdate' && n.call){
         const st=n.call.state;
@@ -391,7 +480,7 @@ async function startAgent(){
       }
     });
     client.connect();
-  } catch(e){ log('connect failed: '+e.message); toast(e.message,true); }
+  } catch(e){ log('connect failed: '+e.message); toast(e.message,'err'); }
 }
 
 async function loadContext(){
@@ -417,8 +506,8 @@ function renderLead(l, callerId){
     <div class="kv mt">
       ${l.address?`<div class="k">Address</div><div>${esc(l.address)}</div>`:''}
       ${l.state?`<div class="k">State</div><div>${esc(l.state)}</div>`:''}
-      <div class="k">Attempts</div><div>${l.attempts||0}</div>
-      ${callerId?`<div class="k">Caller ID</div><div>${esc(callerId)}</div>`:''}
+      <div class="k">Attempts</div><div class="mono">${l.attempts||0}</div>
+      ${callerId?`<div class="k">Caller ID</div><div class="mono">${esc(callerId)}</div>`:''}
       ${extra}
     </div>`;
   $('notes').value='';
@@ -426,16 +515,15 @@ function renderLead(l, callerId){
 function renderScript(c){
   if(!c||!c.script){ $('scriptBody').className='empty'; $('scriptBody').textContent='No script set for this campaign.'; return; }
   $('scriptBody').className='';
-  // show merged text, but highlight what were merge fields
   $('scriptBody').innerHTML=esc(c.script_merged||c.script);
 }
 function renderHistory(h){
   if(!h.length){ $('history').className='empty'; $('history').textContent='No previous contact.'; return; }
   $('history').className='hist';
   $('history').innerHTML=h.map(x=>{
-    const d=dispositions.find(d=>d.code===x.code); const color=d?d.color:'#8792a6';
+    const d=dispositions.find(d=>d.code===x.code); const color=d?d.color:'var(--text-dim)';
     return `<div class="h"><span class="hbadge" style="background:${color}22;color:${color}">${esc(x.code)}</span>
-      <div><div>${esc(x.notes||'—')}</div><div class="mut2" style="font-size:11px">${new Date(x.created_at).toLocaleString()}</div></div></div>`;
+      <div><div>${esc(x.notes||'—')}</div><div class="faint mono" style="font-size:11px">${new Date(x.created_at).toLocaleString([], {hour12:false})}</div></div></div>`;
   }).join('');
 }
 function renderDispositions(list){
@@ -443,7 +531,7 @@ function renderDispositions(list){
   const g=$('dispGrid'); g.innerHTML='';
   dispositions.forEach(d=>{
     const b=document.createElement('button'); b.className='dispBtn';
-    b.innerHTML=`<span class="sw" style="background:${d.color||'#8792a6'}"></span>${esc(d.label||d.code)}${d.hotkey?`<span class="hk">${esc(d.hotkey)}</span>`:''}`;
+    b.innerHTML=`<span class="sw" style="background:${d.color||'var(--text-dim)'}"></span>${esc(d.label||d.code)}${d.hotkey?`<span class="hk">${esc(d.hotkey)}</span>`:''}`;
     b.onclick=()=>chooseDisposition(d);
     g.appendChild(b);
   });
@@ -455,17 +543,17 @@ async function chooseDisposition(d){
     $('cbTime').value=dt.toISOString().slice(0,16); return; }
   await submitDisposition(d.code, null);
 }
-$('cbSave').onclick=async()=>{ if(!pendingCb) return; const v=$('cbTime').value; if(!v){toast('Pick a time',true);return;}
+$('cbSave').onclick=async()=>{ if(!pendingCb) return; const v=$('cbTime').value; if(!v){toast('Pick a time','warn');return;}
   await submitDisposition(pendingCb.code, new Date(v).toISOString()); $('cbWrap').classList.add('hidden'); pendingCb=null; };
 
 async function submitDisposition(code, callback_at){
   try{
     const notes=$('notes').value.trim();
     await apiJson('/api/agent/disposition','POST',{code, notes, callback_at, lead_id:curLeadId});
-    toast('Saved: '+code); $('dispReq').classList.add('hidden');
+    toast('Saved '+code); $('dispReq').classList.add('hidden');
     const w=$('wrapMsg'); w.classList.remove('hidden'); w.textContent='Advancing to next lead…';
     setTimeout(()=>w.classList.add('hidden'),2500);
-  }catch(e){ toast(e.message,true); }
+  }catch(e){ toast(e.message,'err'); }
 }
 function clearLead(){
   curLeadId=null; $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
@@ -478,18 +566,18 @@ function clearLead(){
 $('cMute').onclick=()=>toggleMute();
 function toggleMute(){ if(!agentCall) return; muted=!muted; try{ muted?agentCall.muteAudio():agentCall.unmuteAudio(); }catch{}
   $('cMute').classList.toggle('active',muted); $('cMute').querySelector('span:last-child').textContent=muted?'Unmute':'Mute'; }
-$('cHold').onclick=async()=>{ held=!held; try{ await apiJson('/api/agent/hold','POST',{on:held}); }catch(e){ held=!held; toast(e.message,true); return; }
+$('cHold').onclick=async()=>{ held=!held; try{ await apiJson('/api/agent/hold','POST',{on:held}); }catch(e){ held=!held; toast(e.message,'err'); return; }
   $('cHold').classList.toggle('active',held); $('cHold').querySelector('span:last-child').textContent=held?'Resume':'Hold'; };
 $('cPad').onclick=()=>$('padWrap').classList.toggle('hidden');
-$('cHang').onclick=async()=>{ try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ toast(e.message,true); } };
-document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/agent/dtmf','POST',{digits:b.textContent}); log('DTMF '+b.textContent); }catch(e){ toast(e.message,true); } });
+$('cHang').onclick=async()=>{ try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ toast(e.message,'err'); } };
+document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/agent/dtmf','POST',{digits:b.textContent}); log('DTMF '+b.textContent); }catch(e){ toast(e.message,'err'); } });
 
 $('agBreak').onclick = async () => {
-  if($('agBreak').dataset.on==='1'){ $('agBreak').textContent='Break'; $('agBreak').dataset.on=''; $('agBreak').className='btn btn-sm btn-amber'; startAgent(); }
+  if($('agBreak').dataset.on==='1'){ $('agBreak').textContent='Break'; $('agBreak').dataset.on=''; $('agBreak').className='btn btn-sm'; startAgent(); }
   else {
     try{ await apiJson('/api/agent/offline','POST',{}); }catch(e){ log(e.message); }
-    if(client){try{client.disconnect();}catch{}} applyState('OFFLINE'); $('agConn').textContent='softphone: —';
-    $('agBreak').textContent='Resume'; $('agBreak').dataset.on='1'; $('agBreak').className='btn btn-sm btn-grn';
+    if(client){try{client.disconnect();}catch{}} applyState('BREAK'); $('agConn').className='pill pill--faint'; $('agConn').textContent='Softphone —';
+    $('agBreak').textContent='Resume'; $('agBreak').dataset.on='1'; $('agBreak').className='btn btn-sm btn-primary';
   }
 };
 
@@ -503,64 +591,81 @@ document.addEventListener('keydown', e=>{
   }
 });
 
-// ═══════════ ADMIN (unchanged from MVP) ═══════════
-async function loadAdmin(){ await Promise.all([loadUsers(), loadCampaigns()]); }
+// ═══════════ ADMIN ═══════════
+async function loadAdmin(){ await Promise.all([loadUsers(), loadCampaigns()]); enhanceSelect($('uRole')); }
 async function loadUsers(){
   const j = await apiJson('/api/admin/users'); usersCache=j.users;
   const tb=$('usersTbl').querySelector('tbody'); tb.innerHTML='';
   j.users.forEach(u=>{ const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${esc(u.name)}</td><td class="mut">${esc(u.email||'')}</td><td>${u.role}</td><td><span class="pill">${u.state||'OFFLINE'}</span></td>`;
+    const st=u.state||'OFFLINE'; const dotc={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',WRAP_UP:'warn',BREAK:'warn'}[st]||'faint';
+    tr.innerHTML=`<td>${esc(u.name)}</td><td class="dim">${esc(u.email||'')}</td><td>${u.role}</td><td><span class="pill pill--${dotc}"><span class="dot dot--${dotc}"></span> ${st}</span></td>`;
     tb.appendChild(tr); });
 }
 $('btnAddUser').onclick = async () => {
   $('uErr').classList.add('hidden');
   const body={ name:$('uName').value.trim(), email:$('uEmail').value.trim(), password:$('uPass').value, role:$('uRole').value };
-  if(!body.name||!body.email||!body.password){ $('uErr').textContent='fill all fields'; $('uErr').classList.remove('hidden'); return; }
-  $('btnAddUser').disabled=true; $('btnAddUser').textContent='Creating…';
-  try { await apiJson('/api/admin/users','POST',body); $('uName').value=$('uEmail').value=$('uPass').value=''; await loadUsers(); toast('User created'); }
+  if(!body.name||!body.email||!body.password){ $('uErr').textContent='Fill all fields.'; $('uErr').classList.remove('hidden'); return; }
+  $('btnAddUser').disabled=true; $('btnAddUser').textContent='Adding…';
+  try { await apiJson('/api/admin/users','POST',body); $('uName').value=$('uEmail').value=$('uPass').value=''; await loadUsers(); toast('Agent added'); }
   catch(e){ $('uErr').textContent=e.message; $('uErr').classList.remove('hidden'); }
-  finally { $('btnAddUser').disabled=false; $('btnAddUser').textContent='Create user (+ Telnyx credential)'; }
+  finally { $('btnAddUser').disabled=false; $('btnAddUser').textContent='Add agent'; }
 };
 $('btnAddCamp').onclick = async () => {
   const name=$('cName').value.trim(); if(!name) return; $('btnAddCamp').disabled=true;
   try { await apiJson('/api/admin/campaigns','POST',{name}); $('cName').value=''; await loadCampaigns(); toast('Campaign created'); }
-  catch(e){ toast(e.message,true); } finally { $('btnAddCamp').disabled=false; }
+  catch(e){ toast(e.message,'err'); } finally { $('btnAddCamp').disabled=false; }
 };
 async function loadCampaigns(){
   const j = await apiJson('/api/admin/campaigns');
   const wrap=$('campList'); wrap.innerHTML='';
-  if(!j.campaigns.length){ wrap.innerHTML='<div class="mut">No campaigns yet.</div>'; return; }
+  if(!j.campaigns.length){ wrap.innerHTML='<div class="empty">No campaigns yet. Create one to upload leads.</div>'; return; }
   const agents = usersCache.filter(u=>u.role==='agent');
+  const STPILL={RUNNING:'ok',PAUSED:'warn',STOPPED:'faint',DRAFT:'faint'};
   j.campaigns.forEach(c=>{
-    const el=document.createElement('div'); el.className='card'; el.style.marginBottom='12px';
+    const el=document.createElement('div'); el.className='card'; el.style.marginBottom='16px';
     const assigned = c.agent_ids||[]; const st=c.lead_status||{};
     const statusLine = Object.keys(st).length ? Object.entries(st).map(([k,v])=>k+':'+v).join('  ') : 'no leads';
+    const stp=STPILL[c.status]||'faint';
+    const on={start:c.status==='RUNNING'?' on--ok':'',pause:c.status==='PAUSED'?' on--warn':'',stop:c.status==='STOPPED'?' on--danger':''};
     el.innerHTML = `
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-        <b style="font-size:15px">${esc(c.name)}</b><span class="pill ${c.status}">${c.status}</span>
-        <span class="mut" style="margin-left:auto;font-size:12px">${c.lead_total} leads · ${statusLine}</span></div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+        <b style="font:600 15px var(--font-ui)">${esc(c.name)}</b><span class="pill pill--${stp}">${c.status}</span>
+        <span class="dim mono" style="margin-left:auto;font-size:12px">${c.lead_total} leads · ${statusLine}</span></div>
       <div class="chips" data-assigned></div>
-      <div class="row mt"><select class="field" data-agentsel>${agents.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
+      <div class="row mt3"><select data-agentsel>${agents.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select>
         <button class="btn btn-sm" data-assign style="flex:0 0 auto">Assign agent</button></div>
-      <div class="row mt"><input class="field" type="file" accept=".csv" data-csv />
-        <button class="btn btn-sm btn-ghost" data-upload style="flex:0 0 auto">Upload leads CSV</button></div>
-      <div class="row mt">
-        <button class="btn btn-sm btn-grn" data-act="start">Start</button>
-        <button class="btn btn-sm btn-amber" data-act="pause">Pause</button>
-        <button class="btn btn-sm btn-red" data-act="stop">Stop</button>
-        <button class="btn btn-sm btn-ghost" data-act="reset">Reset</button></div>
-      <div class="mut mt" data-msg style="font-size:12px"></div>`;
+      <div class="mt3">
+        <div class="dropzone" data-dz><input type="file" accept=".csv" data-csv hidden><div data-dztext>Drop leads CSV or <b>browse</b></div></div>
+        <button class="btn btn-sm btn-block mt2" data-upload disabled>Upload leads</button></div>
+      <div class="transport mt3">
+        <button class="tbtn tbtn--ok${on.start}" data-act="start">▶ Start</button>
+        <button class="tbtn tbtn--warn${on.pause}" data-act="pause">⏸ Pause</button>
+        <button class="tbtn tbtn--danger${on.stop}" data-act="stop">⏹ Stop</button>
+        <button class="tbtn tbtn--faint" data-act="reset">↺ Reset</button></div>
+      <div class="dim mt3" data-msg style="font-size:12px"></div>`;
     const chips = el.querySelector('[data-assigned]');
     if(assigned.length){ assigned.forEach(aid=>{ const u=usersCache.find(x=>x.id===aid); const chip=document.createElement('span'); chip.className='chip';
-      chip.innerHTML=`<b>${esc(u?u.name:aid.slice(0,8))}</b> <span data-rm style="cursor:pointer;color:var(--red)">✕</span>`;
+      chip.innerHTML=`<b>${esc(u?u.name:aid.slice(0,8))}</b> <span data-rm style="cursor:pointer;color:var(--danger)">✕</span>`;
       chip.querySelector('[data-rm]').onclick=async()=>{ await apiJson(`/api/admin/campaigns/${c.id}/agents/${aid}`,'DELETE'); loadCampaigns(); }; chips.appendChild(chip); }); }
-    else chips.innerHTML='<span class="mut" style="font-size:12px">no agents assigned</span>';
+    else chips.innerHTML='<span class="faint" style="font-size:12px">No agents assigned.</span>';
     const msg=(m)=>{ el.querySelector('[data-msg]').textContent=m; };
     el.querySelector('[data-assign]').onclick=async()=>{ const aid=el.querySelector('[data-agentsel]').value; if(!aid)return; try{ await apiJson(`/api/admin/campaigns/${c.id}/agents`,'POST',{agent_id:aid}); loadCampaigns(); }catch(e){ msg(e.message); } };
-    el.querySelector('[data-upload]').onclick=async()=>{ const f=el.querySelector('[data-csv]').files[0]; if(!f){ msg('choose a CSV first'); return; } msg('uploading…');
-      const text=await f.text(); try{ const r=await api(`/api/admin/campaigns/${c.id}/leads`,{ method:'POST', headers:{'Content-Type':'text/csv'}, body:text }); const jj=await r.json(); if(!r.ok)throw new Error(jj.error||'upload failed'); msg(`inserted ${jj.inserted} leads${jj.skipped?(' · skipped '+jj.skipped):''}`); loadCampaigns(); }catch(e){ msg(e.message); } };
+    // drop zone
+    const dz=el.querySelector('[data-dz]'), csv=el.querySelector('[data-csv]'), dztext=el.querySelector('[data-dztext]'), upBtn=el.querySelector('[data-upload]');
+    const setFile=(f)=>{ if(!f)return; const rows=Math.max(0,(f._rows!=null?f._rows:0)); dztext.innerHTML=`<b>${esc(f.name)}</b> · ${rows} rows`; upBtn.disabled=false; };
+    const readRows=async(f)=>{ try{ const t=await f.text(); f._text=t; f._rows=t.split(/\r?\n/).filter(l=>l.trim()).length-1; }catch{ f._rows=0; } setFile(f); };
+    dz.onclick=()=>csv.click();
+    csv.onchange=()=>{ if(csv.files[0]) readRows(csv.files[0]); };
+    dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag');});
+    dz.addEventListener('dragleave',()=>dz.classList.remove('drag'));
+    dz.addEventListener('drop',e=>{ e.preventDefault(); dz.classList.remove('drag'); const f=e.dataTransfer.files[0]; if(f){ const dt=new DataTransfer(); dt.items.add(f); csv.files=dt.files; readRows(f); } });
+    upBtn.onclick=async()=>{ const f=csv.files[0]; if(!f){ msg('Choose a CSV first.'); return; } msg('Uploading…'); upBtn.disabled=true;
+      const text=f._text!=null?f._text:await f.text();
+      try{ const r=await api(`/api/admin/campaigns/${c.id}/leads`,{ method:'POST', headers:{'Content-Type':'text/csv'}, body:text }); const jj=await r.json(); if(!r.ok)throw new Error(jj.error||'upload failed');
+        toast(`${jj.inserted} leads added`+(jj.skipped?` · ${jj.skipped} skipped`:'')); loadCampaigns(); }catch(e){ msg(e.message); upBtn.disabled=false; } };
     el.querySelectorAll('[data-act]').forEach(b=>b.onclick=async()=>{ try{ await apiJson(`/api/admin/campaigns/${c.id}/${b.dataset.act}`,'POST',{}); loadCampaigns(); }catch(e){ msg(e.message); } });
     wrap.appendChild(el);
+    enhanceSelect(el.querySelector('[data-agentsel]'));
   });
 }
 
