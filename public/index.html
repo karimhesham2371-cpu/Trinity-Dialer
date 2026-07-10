@@ -1499,18 +1499,32 @@ async function renderDnc(){
 async function renderWindow(){
   let w={start_hour:10,end_hour:21}; try{ w=await apiJson('/api/admin/settings/calling-window'); }catch(e){}
   const hrs=(sel)=>Array.from({length:24},(_,h)=>`<option value="${h}"${h===sel?' selected':''}>${String(h).padStart(2,'0')}:00</option>`).join('');
+  let d={lines_per_agent:1,ring_secs:25}; try{ d=await apiJson('/api/admin/settings/dialer'); }catch(e){}
+  const lpaOpts=(sel)=>Array.from({length:5},(_,i)=>i+1).map(n=>`<option value="${n}"${n===sel?' selected':''}>${n} line${n>1?'s':''} / agent${n===1?' (power — no abandons)':''}</option>`).join('');
   $('ldBody').innerHTML=`<div class="card" style="max-width:520px"><h2>Calling window</h2>
     <p class="dim" style="font-size:13px">Hard rule: no lead is dialed before or after this window in <b>their own local time</b> (derived from area code). Applies to the pacer and manual click-to-call.</p>
     <div class="row mt3" style="gap:12px;align-items:flex-end">
       <div class="fw"><span class="lbl">Start</span><select id="cwStart" class="field">${hrs(w.start_hour)}</select></div>
       <div class="fw"><span class="lbl">End</span><select id="cwEnd" class="field">${hrs(w.end_hour)}</select></div>
       <button class="btn btn-primary" id="cwSave" style="flex:0 0 auto">Save</button>
-    </div><div id="cwMsg" class="dim mt3" style="font-size:12px"></div></div>`;
+    </div><div id="cwMsg" class="dim mt3" style="font-size:12px"></div></div>
+    <div class="card mt3" style="max-width:520px"><h2>Dialer pacing (CPA)</h2>
+    <p class="dim" style="font-size:13px"><b>Calls per agent</b> = how many lines are dialed simultaneously for each free agent. <b>1</b> = pure power dialing (one call at a time, zero abandoned calls). Higher values cut wait time between calls but drop unanswered extra legs when a human answers first — raise gradually. <b>Ring time</b> is how long a number rings before it's given up as no-answer.</p>
+    <div class="row mt3" style="gap:12px;align-items:flex-end">
+      <div class="fw"><span class="lbl">Calls per agent</span><select id="dlLpa" class="field">${lpaOpts(d.lines_per_agent)}</select></div>
+      <div class="fw"><span class="lbl">Ring time (sec)</span><input id="dlRing" class="field" type="number" min="10" max="60" value="${d.ring_secs}"></div>
+      <button class="btn btn-primary" id="dlSave" style="flex:0 0 auto">Save</button>
+    </div><div id="dlMsg" class="dim mt3" style="font-size:12px"></div></div>`;
   enhanceAll($('ldBody'));
   $('cwSave').onclick=async()=>{
     try{ const j=await apiJson('/api/admin/settings/calling-window','PUT',{start_hour:+$('cwStart').value,end_hour:+$('cwEnd').value});
       $('cwMsg').innerHTML=`<b style="color:var(--ok)">Saved — ${String(j.start_hour).padStart(2,'0')}:00 to ${String(j.end_hour).padStart(2,'0')}:00 lead-local</b>`; }
     catch(e){ $('cwMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  };
+  $('dlSave').onclick=async()=>{
+    try{ const j=await apiJson('/api/admin/settings/dialer','PUT',{lines_per_agent:+$('dlLpa').value,ring_secs:+$('dlRing').value});
+      $('dlMsg').innerHTML=`<b style="color:var(--ok)">Saved — ${j.lines_per_agent} line(s)/agent, ${j.ring_secs}s ring</b>`; }
+    catch(e){ $('dlMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
 }
 

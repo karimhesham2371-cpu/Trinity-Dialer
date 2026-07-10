@@ -76,6 +76,27 @@ async function loadCallingWindow() {
   } catch (e) { console.error('[callingWindow]', e.message); }
 }
 
+// Dialer pacing config (admin-editable, cached from app_settings key "dialer").
+// lines_per_agent == ReadyMode "CPA": how many leads to ring SIMULTANEOUSLY per
+// free agent. 1 = pure power dialer (zero dropped/abandoned calls). >1 shortens
+// the agent's wait between connects at the cost of occasionally dropping a call
+// when more than one person answers at once. ring_secs caps how long a no-answer
+// rings before we give up and move to the next number (kills dead air).
+let DIALER = { lines_per_agent: 1, ring_secs: 25 };
+async function loadDialerConfig() {
+  if (!SB_HOST) return;
+  try {
+    const rows = await sbSelect('app_settings', `key=eq.dialer&select=value`);
+    if (rows && rows[0] && rows[0].value) {
+      const v = rows[0].value;
+      DIALER = {
+        lines_per_agent: Math.max(1, Math.min(5, parseInt(v.lines_per_agent, 10) || 1)),
+        ring_secs: Math.max(10, Math.min(60, parseInt(v.ring_secs, 10) || 25)),
+      };
+    }
+  } catch (e) { console.error('[dialerConfig]', e.message); }
+}
+
 // ── Telnyx REST ───────────────────────────────────────────────────────────────
 async function telnyx(method, endpoint, body) {
   const res = await fetch(`${TELNYX_BASE}${endpoint}`, {
@@ -1065,6 +1086,26 @@ app.put('/api/admin/settings/calling-window', auth, adminOnly, async (req, res) 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Dialer pacing config — CPA (lines_per_agent) + ring timeout (ring_secs).
+app.get('/api/admin/settings/dialer', auth, adminOnly, async (_req, res) => {
+  res.json({ ...DIALER });
+});
+app.put('/api/admin/settings/dialer', auth, adminOnly, async (req, res) => {
+  const lpa = parseInt(req.body && req.body.lines_per_agent, 10);
+  const rs = parseInt(req.body && req.body.ring_secs, 10);
+  if (!(lpa >= 1 && lpa <= 5)) return res.status(400).json({ error: 'lines_per_agent must be 1-5' });
+  if (!(rs >= 10 && rs <= 60)) return res.status(400).json({ error: 'ring_secs must be 10-60' });
+  const value = { lines_per_agent: lpa, ring_secs: rs };
+  try {
+    await sbReq('POST', 'app_settings?on_conflict=key',
+      { key: 'dialer', value, updated_at: new Date().toISOString() },
+      'resolution=merge-duplicates,return=minimal');
+    DIALER = value;
+    audit(req.user, 'EDIT_DIALER', { target_type: 'settings', meta: DIALER });
+    res.json({ ok: true, ...DIALER });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══ ADMIN: reports ══════════════════════════════════════════════════════════════
 // 1) Audit Logs — user activity trail. Filters: from, to, actor_id, action, limit.
 app.get('/api/admin/reports/audit', auth, adminOnly, async (req, res) => {
@@ -1448,9 +1489,8 @@ async function dialLead(agentId, lead) {
     const hit = await sbSelect('dnc_list', `phone=eq.${encodeURIComponent(lead.phone)}&select=phone&limit=1`);
     if (hit && hit.length) {
       await sbUpdate('leads', `id=eq.${lead.id}`, { dnc: true, status: 'DNC' }).catch(() => {});
-      st.state = 'AVAILABLE';
       console.log(`[pacing] DNC skip ${lead.phone}`);
-      return;
+      return;   // leave state as-is; the flagged lead won't be re-selected
     }
   } catch (e) { console.error('[dialLead:dnc]', e.message); }
   const from = pickCallerId(areaCodeOf(lead.phone));
@@ -1458,16 +1498,19 @@ async function dialLead(agentId, lead) {
     connection_id: CONNECTION_ID,
     to: lead.phone,
     from,
+    timeout_secs: DIALER.ring_secs,   // hard ring cap — no dead air on no-answers
     answering_machine_detection: AMD_MODE === 'disabled' ? 'disabled' : 'premium',
     // Unconditional recording (per Karim). Recording is saved on call.recording.saved.
     record: 'record-from-answer', record_channels: 'dual', record_format: 'mp3',
     client_state: enc({ role: 'lead', agentId, conf: st.conferenceId, leadId: lead.id, campaignId: lead.campaign_id }),
   });
-  st.leadLeg    = result.data && result.data.call_control_id;
-  st.leadNumber = lead.phone;
-  st.leadId     = lead.id;
-  st.fromNumber = from;
-  st.state      = 'DIALING';
+  const ccid = result.data && result.data.call_control_id;
+  // Ratio dialing: track every in-flight (unbridged) leg. st.leadLeg is reserved
+  // for the ONE leg that actually connects to a human; the extras get dropped the
+  // moment one connects (see connectLeadLeg).
+  st.pending = st.pending || {};
+  st.pending[ccid] = { leadId: lead.id, leadNumber: lead.phone, fromNumber: from, campaignId: lead.campaign_id, at: Date.now() };
+  if (st.state !== 'ON_CALL') st.state = 'DIALING';
   st.onCallSince = null;
   await persistRt(agentId);
   logStateEvent(agentId, 'DIALING');
@@ -1477,8 +1520,52 @@ async function dialLead(agentId, lead) {
     .catch(e => console.error('[dialLead:update]', e.message));
   // Open a calls row for history/recording linkage.
   sbLog('calls', { lead_id: lead.id, agent_id: agentId, campaign_id: lead.campaign_id,
-    telnyx_call_control_id: st.leadLeg, from_number: from, to_number: lead.phone, direction: 'outbound' });
-  console.log(`[pacing] agent ${agentId.slice(0, 8)} -> ${lead.phone} from ${from}`);
+    telnyx_call_control_id: ccid, from_number: from, to_number: lead.phone, direction: 'outbound' });
+  console.log(`[pacing] agent ${agentId.slice(0, 8)} -> ${lead.phone} from ${from} (${Object.keys(st.pending).length} in flight)`);
+}
+
+// Promote one ringing leg to THE connected call for this agent, dropping every
+// other in-flight leg. Enforces the one-live-call-per-agent invariant even when
+// ratio dialing rings several numbers at once. `amd` is the AMD result (or null
+// for AMD-disabled straight answers).
+async function connectLeadLeg(agentId, ccid, cs, amd) {
+  const st = rt[agentId];
+  const conf = (cs && cs.conf) || (st && st.conferenceId);
+  if (!st || !conf) { telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {}); return; }
+  // Already talking to someone → this is a second simultaneous answer. Drop it
+  // and requeue the lead shortly so it isn't lost (this is the "abandoned call").
+  if (st.leadLeg && st.leadLeg !== ccid) {
+    if (st.pending) delete st.pending[ccid];
+    telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+    const lid = (cs && cs.leadId);
+    if (lid) sbUpdate('leads', `id=eq.${lid}`,
+      { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 10 * 60e3).toISOString() }).catch(() => {});
+    console.log(`[bridge] extra answer dropped for agent ${agentId.slice(0, 8)} (already on a call)`);
+    return;
+  }
+  const info = (st.pending && st.pending[ccid]) || {};
+  if (st.pending) delete st.pending[ccid];
+  st.leadLeg = ccid;
+  st.leadId = info.leadId || (cs && cs.leadId) || null;
+  st.leadNumber = info.leadNumber || null;
+  st.fromNumber = info.fromNumber || null;
+  st.onCallSince = Date.now();
+  st.state = 'ON_CALL';
+  await telnyx('POST', `/conferences/${conf}/actions/join`, { call_control_id: ccid, start_conference_on_enter: true, mute: false });
+  await setAgentState(agentId, 'ON_CALL');
+  sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`, { bridged_at: new Date().toISOString(), amd_result: amd || null }).catch(() => {});
+  if (st.leadId) sbUpdate('leads', `id=eq.${st.leadId}`, { status: 'CONTACTED' }).catch(() => {});
+  // Drop the sibling dials and requeue their leads so nothing is wasted.
+  if (st.pending) {
+    for (const other of Object.keys(st.pending)) {
+      const oi = st.pending[other];
+      telnyx('POST', `/calls/${other}/actions/hangup`, {}).catch(() => {});
+      if (oi && oi.leadId) sbUpdate('leads', `id=eq.${oi.leadId}`,
+        { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 5 * 60e3).toISOString() }).catch(() => {});
+    }
+    st.pending = {};
+  }
+  console.log(`[bridge] agent ${agentId.slice(0, 8)} ON_CALL (${amd || 'answered'})`);
 }
 
 let pacingBusy = false;
@@ -1501,11 +1588,14 @@ async function pacingTick() {
   if (pacingBusy || !SB_HOST || !CONNECTION_ID) return;
   pacingBusy = true;
   try {
-    // Only bother if at least one agent is free and in-conference.
+    // Agents that can take MORE dials: in-conference, not on a connected call,
+    // not inbound, and with fewer in-flight legs than the CPA ratio allows.
     const freeAgents = Object.keys(rt).filter(id => {
       const st = rt[id];
-      // AVAILABLE + in-conference + NO live lead leg + not on an inbound call.
-      return st && st.state === 'AVAILABLE' && st.conferenceId && !st.leadLeg && !st.inbound;
+      if (!st || !st.conferenceId || st.leadLeg || st.inbound) return false;
+      if (st.state !== 'AVAILABLE' && st.state !== 'DIALING') return false;
+      const inFlight = st.pending ? Object.keys(st.pending).length : 0;
+      return inFlight < DIALER.lines_per_agent;
     });
     if (!freeAgents.length) return;
     const nowIso = new Date().toISOString();
@@ -1540,27 +1630,36 @@ async function pacingTick() {
       (legacyByAgent[agent_id] ||= []).push(campaign_id);
     }
 
-    for (const agentId of freeAgents) {
-      const st = rt[agentId];
-      if (!st || st.state !== 'AVAILABLE' || !st.conferenceId || st.leadLeg || st.inbound) continue; // re-check (may have changed)
-      let lead = null;
+    // Pick the next dialable lead for one agent, honouring its playlist priority.
+    const pickLead = async (agentId) => {
       const agentPlaylists = playlistsByAgent[agentId];
       if (agentPlaylists && agentPlaylists.length) {
-        // Playlist-driven: walk playlists in priority order until one yields a lead.
         for (const p of agentPlaylists) {
           const cids = campsByPlaylist[p.id];
           if (!cids || !cids.length) continue;
-          lead = await nextDialableLead(cids, p.filters, nowIso);
-          if (lead) break;
+          const lead = await nextDialableLead(cids, p.filters, nowIso);
+          if (lead) return lead;
         }
-      } else {
-        // Legacy fallback: agent assigned straight to campaigns.
-        lead = await nextDialableLead(legacyByAgent[agentId] || [], [], nowIso);
+        return null;
       }
-      if (!lead) continue;
-      st.state = 'CLAIMING';                              // guard: prevents re-dial on next tick
-      try { await dialLead(agentId, lead); }
-      catch (e) { console.error('[pacing:dial]', e.message); st.state = 'AVAILABLE'; }
+      return nextDialableLead(legacyByAgent[agentId] || [], [], nowIso);
+    };
+
+    for (const agentId of freeAgents) {
+      const st = rt[agentId];
+      if (!st || !st.conferenceId || st.leadLeg || st.inbound) continue;
+      if (st.state !== 'AVAILABLE' && st.state !== 'DIALING') continue;
+      // Top the agent up to `lines_per_agent` simultaneous ringing legs. Each
+      // dialLead marks its lead IN_PROGRESS before the next pick, so we never
+      // ring the same number twice.
+      let need = DIALER.lines_per_agent - (st.pending ? Object.keys(st.pending).length : 0);
+      while (need-- > 0) {
+        if (st.leadLeg || st.inbound) break;             // connected mid-loop → stop dialing
+        const lead = await pickLead(agentId);
+        if (!lead) break;                                 // no more leads for this agent
+        try { await dialLead(agentId, lead); }
+        catch (e) { console.error('[pacing:dial]', e.message); break; }
+      }
     }
   } catch (e) { console.error('[pacing]', e.message); }
   finally { pacingBusy = false; }
@@ -1685,26 +1784,25 @@ app.post('/webhooks/telnyx', async (req, res) => {
       return;
     }
 
+    // AMD-disabled: a lead simply answering IS the connect signal.
+    if (event === 'call.answered' && role === 'lead' && agentId && AMD_MODE === 'disabled') {
+      await connectLeadLeg(agentId, ccid, cs, null);
+      return;
+    }
+
     // Lead premium AMD -> bridge human, drop machine
     if (event === 'call.machine.premium.detection.ended' && role === 'lead' && agentId) {
       const r = payload.result || '';
       const isHuman = r.startsWith('human') || r === 'silence' || r === 'not_sure';   // TCPA-safe: connect ambiguous
       const st = rt[agentId];
-      if (isHuman && st && (cs.conf || st.conferenceId)) {
-        await telnyx('POST', `/conferences/${cs.conf || st.conferenceId}/actions/join`, {
-          call_control_id: ccid, start_conference_on_enter: true, mute: false,
-        });
-        st.onCallSince = Date.now();
-        st.state = 'ON_CALL';
-        await setAgentState(agentId, 'ON_CALL');
-        sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`, { bridged_at: new Date().toISOString(), amd_result: r }).catch(() => {});
-        if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'CONTACTED' }).catch(() => {});
-        console.log(`[bridge] agent ${agentId.slice(0, 8)} ON_CALL (result=${r})`);
+      if (isHuman) {
+        await connectLeadLeg(agentId, ccid, cs, r);
       } else {
+        if (st && st.pending) delete st.pending[ccid];
         await telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
         if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'MACHINE' }).catch(() => {});
         console.log(`[bridge] dropped machine leg agent ${agentId.slice(0, 8)} (result=${r})`);
-        // agent freed by the ensuing call.hangup handler
+        // agent freed to redial by the ensuing call.hangup handler
       }
       return;
     }
@@ -1712,7 +1810,20 @@ app.post('/webhooks/telnyx', async (req, res) => {
     // Hangups
     if (event === 'call.hangup' && agentId && rt[agentId]) {
       const st = rt[agentId];
-      const wasLead = role === 'lead' || st.leadLeg === ccid;
+      // A ringing/unbridged ratio-dial leg dropped (no-answer, busy, ring timeout,
+      // or a dropped machine leg). Clear it; free the agent to redial only when
+      // nothing else is in flight and no call has connected.
+      if (st.pending && st.pending[ccid]) {
+        const info = st.pending[ccid]; delete st.pending[ccid];
+        if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
+          { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
+        if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
+          { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+        const idle = !st.leadLeg && Object.keys(st.pending).length === 0;
+        if (idle && st.state === 'DIALING') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
+        return;
+      }
+      const wasLead = st.leadLeg === ccid || (role === 'lead' && st.leadLeg == null);
       if (wasLead) {
         const talked = st.state === 'ON_CALL';   // agent actually spoke to a human
         if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
@@ -1791,14 +1902,26 @@ async function reaperTick() {
   try {
     // 1) Free agents wedged in transient states.
     const now = Date.now();
+    const staleLegMs = (DIALER.ring_secs + 45) * 1000;
     for (const id of Object.keys(rt)) {
       const st = rt[id];
       if (!st) continue;
-      if ((st.state === 'DIALING' || st.state === 'CLAIMING') &&
-          st.rtUpdatedAt && (now - st.rtUpdatedAt) > REAP_DIALING_MS) {
-        console.log(`[reaper] agent ${id.slice(0,8)} wedged in ${st.state} -> freeing`);
-        if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});
-        st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
+      // Sweep stale ringing legs whose hangup webhook never arrived.
+      if (st.pending) {
+        for (const cc of Object.keys(st.pending)) {
+          if (now - (st.pending[cc].at || 0) > staleLegMs) {
+            telnyx('POST', `/calls/${cc}/actions/hangup`, {}).catch(() => {});
+            delete st.pending[cc];
+          }
+        }
+      }
+      const inFlight = st.pending ? Object.keys(st.pending).length : 0;
+      // A DIALING agent with nothing actually in flight and no connected call ->
+      // free it to redial (covers a missed hangup webhook).
+      if ((st.state === 'DIALING' || st.state === 'CLAIMING') && !st.leadLeg && inFlight === 0 &&
+          st.rtUpdatedAt && (now - st.rtUpdatedAt) > 5000) {
+        console.log(`[reaper] agent ${id.slice(0,8)} idle in ${st.state} -> freeing`);
+        st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
         st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
         await setAgentState(id, st.state);
       }
@@ -1846,10 +1969,13 @@ server.listen(PORT, async () => {
   await rehydrateRt();
   await refreshCallerPool();
   await loadCallingWindow();
+  await loadDialerConfig();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
   console.log(`[boot] calling window: ${CALLING_WINDOW.start_hour}:00–${CALLING_WINDOW.end_hour}:00 lead-local`);
+  console.log(`[boot] dialer: ${DIALER.lines_per_agent} line(s)/agent, ${DIALER.ring_secs}s ring`);
   setInterval(pacingTick, PACING_MS);
   setInterval(reaperTick, 30 * 1000);
   setInterval(refreshCallerPool, 5 * 60 * 1000);
   setInterval(loadCallingWindow, 5 * 60 * 1000);
+  setInterval(loadDialerConfig, 60 * 1000);
 });
