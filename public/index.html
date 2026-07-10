@@ -541,14 +541,29 @@ function route(){
 // ═══════════ AGENT ═══════════
 function getTelnyxRTC(){ const g=window.TelnyxWebRTC||window.telnyxWebRTC||window.TelnyxRTC||window.telnyx; if(!g)return null; return g.TelnyxRTC||(g.default&&g.default.TelnyxRTC)||g; }
 
+let wsReconnTimer=null;
 function openWs(){
-  try{ if(ws) ws.close(); }catch{}
+  // Replace any existing socket, but flag the close as intentional so its
+  // onclose handler does NOT show the banner or schedule a reconnect —
+  // otherwise every call spawns a stray reconnect from the socket it just
+  // closed, and the overlapping timers keep closing the live socket forever.
+  if(ws){ try{ ws._intentional=true; ws.close(); }catch{} }
+  if(wsReconnTimer){ clearTimeout(wsReconnTimer); wsReconnTimer=null; }
   const proto = location.protocol==='https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
-  ws.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); };
-  ws.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
+  const sock = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
+  ws = sock;
+  sock.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); };
+  sock.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
     if(m.type==='agent.state'){ applyState(m.state, m); } };
-  ws.onclose = ()=>{ if(TOKEN&&USER&&USER.role==='agent'){ $('reconnBanner').classList.remove('hidden'); setTimeout(openWs, 2500); } };
+  sock.onclose = ()=>{
+    if(sock._intentional) return;      // we replaced it on purpose
+    if(sock!==ws) return;              // a newer socket already took over
+    if(TOKEN&&USER&&USER.role==='agent'){
+      $('reconnBanner').classList.remove('hidden');
+      if(wsReconnTimer) clearTimeout(wsReconnTimer);
+      wsReconnTimer=setTimeout(openWs, 2500);
+    }
+  };
 }
 
 const STATE_UI = {
