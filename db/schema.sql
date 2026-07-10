@@ -128,3 +128,52 @@ create table if not exists campaign_agents (
   created_at   timestamptz not null default now(),
   unique (campaign_id, agent_id)
 );
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- v3: durable runtime state, webhook idempotency, dialing intelligence, dispositions,
+--      scripts, recycling, recording. Safe to re-run (idempotent).
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+-- ── agents: mirror live runtime so a restart can rehydrate (no lost calls) ────
+alter table agents add column if not exists agent_leg      text;   -- Telnyx call_control_id of the agent's WebRTC leg
+alter table agents add column if not exists lead_leg       text;   -- call_control_id of the lead leg currently bridged/dialing
+alter table agents add column if not exists lead_id        uuid;   -- lead currently on this agent
+alter table agents add column if not exists lead_number    text;   -- phone being dialed (for UI)
+alter table agents add column if not exists from_number    text;   -- caller ID in use (for vacancy rotation)
+alter table agents add column if not exists rt_updated_at  timestamptz;  -- heartbeat; reaper uses this
+-- state now includes: OFFLINE | CONNECTING | AVAILABLE | CLAIMING | DIALING | ON_CALL | WRAP_UP | BREAK
+
+-- ── campaigns: full dialing configuration ─────────────────────────────────────
+alter table campaigns add column if not exists dial_ratio         numeric not null default 1.0;  -- lines per available agent (1–4)
+alter table campaigns add column if not exists wrap_seconds       int not null default 5;        -- forced wrap-up before auto-advance
+alter table campaigns add column if not exists script             text;                          -- agent script w/ {{merge_fields}}
+alter table campaigns add column if not exists dispositions       jsonb not null default '[]'::jsonb;  -- [{code,label,color,hotkey,recycle,is_dnc,is_callback}]
+alter table campaigns add column if not exists recycle_rules      jsonb not null default '{}'::jsonb;  -- {no_answer:{hours,max},busy:{minutes,max}}
+alter table campaigns add column if not exists record_calls       boolean not null default true; -- unconditional recording (per Karim)
+alter table campaigns add column if not exists vm_drop_enabled    boolean not null default false;
+alter table campaigns add column if not exists vm_drop_url        text;                          -- audio URL for ringless-style VM drop
+alter table campaigns add column if not exists local_presence     boolean not null default true; -- match caller ID area code to lead
+
+-- ── leads: recycling + custom fields + outcome tracking ───────────────────────
+alter table leads add column if not exists custom       jsonb not null default '{}'::jsonb;  -- extra CSV columns preserved as merge fields
+alter table leads add column if not exists last_outcome text;    -- last disposition code / system outcome
+alter table leads add column if not exists max_attempts int;     -- per-lead override (else campaign rule)
+alter table leads add column if not exists area_code    text;    -- derived for local presence + tz
+-- status now includes: NEW | IN_PROGRESS | CONTACTED | CALLBACK | MACHINE | NO_ANSWER
+--                      | BUSY | DONE | BAD_NUMBER | DNC | EXHAUSTED
+
+-- ── dispositions: link to campaign, add disposition source ────────────────────
+alter table dispositions add column if not exists campaign_id uuid references campaigns(id);
+
+-- ── webhook idempotency: dedupe Telnyx redeliveries ───────────────────────────
+create table if not exists webhook_events (
+  event_id     text primary key,        -- Telnyx event id (data.id)
+  event_type   text,
+  received_at  timestamptz not null default now()
+);
+-- housekeeping: old rows can be pruned by the reaper (keeps last ~24h)
+create index if not exists webhook_events_time_idx on webhook_events (received_at);
+
+-- ── calls: recording + supervisor bookkeeping ─────────────────────────────────
+alter table calls add column if not exists recording_id text;   -- Telnyx recording id
+alter table calls add column if not exists talk_seconds int;     -- bridged→ended

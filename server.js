@@ -13,9 +13,11 @@
 //     when premium AMD confirms a human, the lead PSTN leg joins the conference
 
 const express = require('express');
+const http    = require('http');
 const path    = require('path');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
+const { WebSocketServer } = require('ws');
 
 const app = express();
 app.use(express.json({ limit: '8mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
@@ -107,9 +109,50 @@ function findAgentByLeg(legId) {
   }
   return null;
 }
+
+// Persist the full in-memory runtime for an agent to the agents row, so a server
+// restart can rehydrate mid-shift instead of dropping every live call.
+async function persistRt(id) {
+  const st = rt[id];
+  const now = new Date().toISOString();
+  const patch = st ? {
+    state: st.state || 'OFFLINE',
+    agent_leg: st.agentLeg || null,
+    lead_leg: st.leadLeg || null,
+    lead_id: st.leadId || null,
+    lead_number: st.leadNumber || null,
+    from_number: st.fromNumber || null,
+    conference_id: st.conferenceId || null,
+    rt_updated_at: now, updated_at: now,
+  } : { state: 'OFFLINE', agent_leg: null, lead_leg: null, lead_id: null,
+        lead_number: null, from_number: null, conference_id: null, rt_updated_at: now, updated_at: now };
+  return sbUpdate('agents', `id=eq.${id}`, patch).catch(e => console.error('[persistRt]', e.message));
+}
+
 async function setAgentState(id, state) {
-  if (rt[id]) rt[id].state = state;
-  sbUpdate('agents', `id=eq.${id}`, { state, updated_at: new Date().toISOString() }).catch(() => {});
+  if (rt[id]) { rt[id].state = state; rt[id].rtUpdatedAt = Date.now(); }
+  await persistRt(id);
+  wsAgentSnapshot(id);   // push to the agent's own socket + the admin floor
+}
+
+// Rebuild `rt` from the agents table on boot (durable-state recovery).
+async function rehydrateRt() {
+  if (!SB_HOST) return;
+  try {
+    const rows = await sbSelect('agents',
+      `state=neq.OFFLINE&select=id,state,sip_username,agent_leg,lead_leg,lead_id,lead_number,from_number,conference_id`);
+    let n = 0;
+    for (const a of rows || []) {
+      rt[a.id] = {
+        state: a.state, sip: a.sip_username,
+        agentLeg: a.agent_leg, leadLeg: a.lead_leg, leadId: a.lead_id,
+        leadNumber: a.lead_number, fromNumber: a.from_number, conferenceId: a.conference_id,
+        rtUpdatedAt: Date.now(),
+      };
+      n++;
+    }
+    if (n) console.log(`[rehydrate] restored ${n} live agent(s) from DB`);
+  } catch (e) { console.error('[rehydrate]', e.message); }
 }
 
 // ── Caller-ID pool ────────────────────────────────────────────────────────────
@@ -122,11 +165,42 @@ async function refreshCallerPool() {
     if (nums.length) CALLER_POOL = nums;
   } catch (e) { console.error('[callerPool]', e.message); }
 }
-function pickCallerId() {
+function pickCallerId(preferredAreaCode) {
   const inUse = new Set(Object.values(rt).map(s => s.fromNumber).filter(Boolean));
-  const free = CALLER_POOL.filter(n => !inUse.has(n));
-  const pool = free.length ? free : CALLER_POOL;
-  return pool.length ? pool[Math.floor(Math.random() * pool.length)] : DEFAULT_FROM;
+  let candidates = CALLER_POOL.filter(n => !inUse.has(n));
+  if (!candidates.length) candidates = CALLER_POOL.slice();
+  // Local presence: prefer a DID whose area code matches the lead's.
+  if (preferredAreaCode) {
+    const local = candidates.filter(n => areaCodeOf(n) === preferredAreaCode);
+    if (local.length) candidates = local;
+  }
+  return candidates.length ? candidates[Math.floor(Math.random() * candidates.length)] : DEFAULT_FROM;
+}
+function areaCodeOf(e164) {
+  const d = String(e164 || '').replace(/[^\d]/g, '');
+  // +1XXXYYYYYYY -> XXX
+  if (d.length === 11 && d.startsWith('1')) return d.slice(1, 4);
+  if (d.length === 10) return d.slice(0, 3);
+  return null;
+}
+
+// ── WebSocket gateway ───────────────────────────────────────────────────────────
+// Agents subscribe to their own live state; admins subscribe to the whole floor.
+// clients: Set of { ws, userId, role }
+const wsClients = new Set();
+function wsSend(ws, obj) { try { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); } catch {} }
+function wsToAdmins(obj) { for (const c of wsClients) if (c.role === 'admin') wsSend(c.ws, obj); }
+function wsToAgent(id, obj) { for (const c of wsClients) if (c.userId === id) wsSend(c.ws, obj); }
+function agentSnapshot(id) {
+  const st = rt[id] || { state: 'OFFLINE' };
+  return { agentId: id, state: st.state, leadId: st.leadId || null, leadNumber: st.leadNumber || null,
+           fromNumber: st.fromNumber || null, onCallSince: st.onCallSince || null };
+}
+// Push one agent's state to that agent and to every admin (floor view).
+function wsAgentSnapshot(id) {
+  const snap = agentSnapshot(id);
+  wsToAgent(id, { type: 'agent.state', ...snap });
+  wsToAdmins({ type: 'floor.agent', ...snap });
 }
 
 // ── Auth: login + admin bootstrap ───────────────────────────────────────────────
@@ -164,9 +238,10 @@ app.get('/api/me', auth, (req, res) => res.json({ user: req.user }));
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({
-    ok: true, service: 'trinity-dialer', phase: 'mvp',
+    ok: true, service: 'trinity-dialer', phase: 'phase0',
     telnyx_key: !!TELNYX_KEY, connection_id: !!CONNECTION_ID, supabase: !!(SB_HOST && SB_KEY),
     caller_pool: CALLER_POOL.length, agents_online: Object.keys(rt).length,
+    ws_clients: wsClients.size, recording: true,
     time: new Date().toISOString(),
   });
 });
@@ -374,12 +449,14 @@ app.get('/api/agent/status', auth, (req, res) => {
 // ══ PACING ENGINE ════════════════════════════════════════════════════════════════
 async function dialLead(agentId, lead) {
   const st = rt[agentId];
-  const from = pickCallerId();
+  const from = pickCallerId(areaCodeOf(lead.phone));
   const result = await telnyx('POST', '/calls', {
     connection_id: CONNECTION_ID,
     to: lead.phone,
     from,
     answering_machine_detection: AMD_MODE === 'disabled' ? 'disabled' : 'premium',
+    // Unconditional recording (per Karim). Recording is saved on call.recording.saved.
+    record: 'record-from-answer', record_channels: 'dual', record_format: 'mp3',
     client_state: enc({ role: 'lead', agentId, conf: st.conferenceId, leadId: lead.id, campaignId: lead.campaign_id }),
   });
   st.leadLeg    = result.data && result.data.call_control_id;
@@ -387,9 +464,15 @@ async function dialLead(agentId, lead) {
   st.leadId     = lead.id;
   st.fromNumber = from;
   st.state      = 'DIALING';
+  st.onCallSince = null;
+  await persistRt(agentId);
+  wsAgentSnapshot(agentId);
   await sbUpdate('leads', `id=eq.${lead.id}`,
     { status: 'IN_PROGRESS', attempts: (lead.attempts || 0) + 1, last_attempt_at: new Date().toISOString(), assigned_agent_id: agentId })
     .catch(e => console.error('[dialLead:update]', e.message));
+  // Open a calls row for history/recording linkage.
+  sbLog('calls', { lead_id: lead.id, agent_id: agentId, campaign_id: lead.campaign_id,
+    telnyx_call_control_id: st.leadLeg, from_number: from, to_number: lead.phone, direction: 'outbound' });
   console.log(`[pacing] agent ${agentId.slice(0, 8)} -> ${lead.phone} from ${from}`);
 }
 
@@ -428,17 +511,40 @@ app.post('/webhooks/telnyx', async (req, res) => {
 
   const data    = (req.body && req.body.data) || {};
   const event   = data.event_type || 'unknown';
+  const eventId  = data.id || null;
   const payload = data.payload || {};
   const ccid    = payload.call_control_id || null;
   const cs      = dec(payload.client_state);
   const role    = cs && cs.role;
   const agentId = (cs && cs.agentId) || findAgentByLeg(ccid);
 
+  // Idempotency: Telnyx redelivers webhooks. Record the event id; if we've already
+  // seen it, skip processing so we never bridge/hangup twice.
+  if (eventId) {
+    try {
+      const ins = await sbReq('POST', 'webhook_events', { event_id: eventId, event_type: event },
+        'resolution=ignore-duplicates,return=representation');
+      if (Array.isArray(ins) && ins.length === 0) {
+        console.log(`[wh] dup ${event} ${eventId.slice(-8)} — skipped`);
+        return;
+      }
+    } catch (e) { /* if the table is missing, fail open and still process */ }
+  }
+
   console.log(`[wh] ${event} role=${role || '-'} agent=${agentId ? agentId.slice(0, 8) : '-'} ccid=${ccid ? ccid.slice(-8) : '-'}` +
               (payload.result ? ` result=${payload.result}` : ''));
   sbLog('call_events', { event_type: event, telnyx_call_control_id: ccid, client_state: cs, payload });
 
   try {
+    // Recording saved -> attach URL to the calls row for in-browser playback.
+    if (event === 'call.recording.saved') {
+      const url = (payload.recording_urls && (payload.recording_urls.mp3 || payload.recording_urls.wav)) ||
+                  (payload.public_recording_urls && (payload.public_recording_urls.mp3 || payload.public_recording_urls.wav)) || null;
+      if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
+        { recording_url: url, recording_id: payload.recording_id || null }).catch(() => {});
+      return;
+    }
+
     // Agent leg answered -> create per-agent conference, mark AVAILABLE
     if (event === 'call.answered' && role === 'agent' && agentId) {
       const conf = await telnyx('POST', '/conferences', {
@@ -463,8 +569,10 @@ app.post('/webhooks/telnyx', async (req, res) => {
         await telnyx('POST', `/conferences/${cs.conf || st.conferenceId}/actions/join`, {
           call_control_id: ccid, start_conference_on_enter: true, mute: false,
         });
+        st.onCallSince = Date.now();
         st.state = 'ON_CALL';
         await setAgentState(agentId, 'ON_CALL');
+        sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`, { bridged_at: new Date().toISOString(), amd_result: r }).catch(() => {});
         if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'CONTACTED' }).catch(() => {});
         console.log(`[bridge] agent ${agentId.slice(0, 8)} ON_CALL (result=${r})`);
       } else {
@@ -487,7 +595,9 @@ app.post('/webhooks/telnyx', async (req, res) => {
           if (status) sbUpdate('leads', `id=eq.${cs.leadId}`, { status }).catch(() => {});
           else sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.IN_PROGRESS`, { status: 'NO_ANSWER' }).catch(() => {});
         }
-        st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null;
+        if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
+          { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
+        st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
         if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
         console.log(`[bridge] lead ended, agent ${agentId.slice(0, 8)} AVAILABLE`);
       } else if (role === 'agent' || st.agentLeg === ccid) {
@@ -531,12 +641,72 @@ function normPhone(p) {
   return d.startsWith('+') ? d : '+' + d;
 }
 
+// ══ STUCK-CALL REAPER ══════════════════════════════════════════════════════════
+// In-memory state can wedge (agent stuck DIALING because a webhook was missed, a
+// lead stuck IN_PROGRESS after a crash). This self-heals the floor every 30s.
+const REAP_DIALING_MS = 90 * 1000;      // agent dialing/claiming this long w/ no bridge -> free them
+const REAP_LEAD_MS    = 8  * 60 * 1000; // lead IN_PROGRESS this long -> requeue as NO_ANSWER
+async function reaperTick() {
+  if (!SB_HOST) return;
+  try {
+    // 1) Free agents wedged in transient states.
+    const now = Date.now();
+    for (const id of Object.keys(rt)) {
+      const st = rt[id];
+      if (!st) continue;
+      if ((st.state === 'DIALING' || st.state === 'CLAIMING') &&
+          st.rtUpdatedAt && (now - st.rtUpdatedAt) > REAP_DIALING_MS) {
+        console.log(`[reaper] agent ${id.slice(0,8)} wedged in ${st.state} -> freeing`);
+        if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});
+        st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
+        st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
+        await setAgentState(id, st.state);
+      }
+    }
+    // 2) Requeue leads stuck IN_PROGRESS (dialer died mid-call).
+    const cutoff = new Date(now - REAP_LEAD_MS).toISOString();
+    await sbUpdate('leads', `status=eq.IN_PROGRESS&last_attempt_at=lt.${cutoff}`,
+      { status: 'NO_ANSWER', last_outcome: 'reaper_timeout' }).catch(() => {});
+    // 3) Prune webhook idempotency rows older than 24h.
+    const dayAgo = new Date(now - 24 * 3600 * 1000).toISOString();
+    sbDelete('webhook_events', `received_at=lt.${dayAgo}`).catch(() => {});
+  } catch (e) { console.error('[reaper]', e.message); }
+}
+
 // ── Boot ───────────────────────────────────────────────────────────────────────
-app.listen(PORT, async () => {
-  console.log(`Trinity Dialer (mvp) listening on :${PORT}`);
+const server = http.createServer(app);
+
+// WebSocket gateway: /ws?token=<jwt>. Auth via the same JWT as the REST API.
+const wss = new WebSocketServer({ server, path: '/ws' });
+wss.on('connection', (ws, req) => {
+  let user = null;
+  try {
+    const url = new URL(req.url, 'http://x');
+    const tok = url.searchParams.get('token');
+    user = jwt.verify(tok, JWT_SECRET);
+  } catch { ws.close(4001, 'unauthorized'); return; }
+  const client = { ws, userId: user.id, role: user.role };
+  wsClients.add(client);
+  ws.on('close', () => wsClients.delete(client));
+  ws.on('error', () => wsClients.delete(client));
+  // Prime the new client with the current picture.
+  if (user.role === 'admin') {
+    for (const id of Object.keys(rt)) wsSend(ws, { type: 'floor.agent', ...agentSnapshot(id) });
+  } else {
+    wsSend(ws, { type: 'agent.state', ...agentSnapshot(user.id) });
+  }
+  wsSend(ws, { type: 'hello', role: user.role, ts: Date.now() });
+});
+// Heartbeat: drop dead sockets.
+setInterval(() => { for (const c of wsClients) { try { c.ws.ping(); } catch {} } }, 30 * 1000);
+
+server.listen(PORT, async () => {
+  console.log(`Trinity Dialer (phase0) listening on :${PORT}`);
   await bootstrapAdmin();
+  await rehydrateRt();
   await refreshCallerPool();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
   setInterval(pacingTick, PACING_MS);
+  setInterval(reaperTick, 30 * 1000);
   setInterval(refreshCallerPool, 5 * 60 * 1000);
 });
