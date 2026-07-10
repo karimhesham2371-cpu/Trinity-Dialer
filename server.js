@@ -1414,7 +1414,7 @@ app.post('/api/agent/call-lead', auth, async (req, res) => {
   const st = rt[id];
   const leadId = req.body && req.body.lead_id;
   if (!leadId) return res.status(400).json({ error: 'lead_id required' });
-  if (!st || st.state !== 'AVAILABLE' || !st.conferenceId)
+  if (!st || st.state !== 'AVAILABLE' || !st.conferenceId || st.leadLeg)
     return res.status(409).json({ error: 'must be available and connected first' });
   try {
     const [lead] = await sbSelect('leads', `id=eq.${leadId}&select=*&limit=1`);
@@ -1431,6 +1431,16 @@ app.post('/api/agent/call-lead', auth, async (req, res) => {
 // ══ PACING ENGINE ════════════════════════════════════════════════════════════════
 async function dialLead(agentId, lead) {
   const st = rt[agentId];
+  if (!st) return;
+  // ReadyMode power-dialer invariant: ONE live line per agent. Never launch a
+  // new dial while a lead leg is still connected/ringing — this is the last-
+  // resort guard against overlapping calls if a hangup webhook was missed or
+  // state raced back to AVAILABLE. Bail and stay dialable for the next tick.
+  if (st.leadLeg) {
+    console.log(`[pacing] skip dial ${agentId.slice(0, 8)} — lead leg still live`);
+    if (st.state === 'CLAIMING') st.state = 'AVAILABLE';
+    return;
+  }
   // Compliance check #1: skip DNC numbers before EVERY dial. dnc_list is the
   // source of truth; if a number slipped through (flag not yet synced), catch
   // it here, sync the flag, and bail without dialing.
@@ -1493,7 +1503,9 @@ async function pacingTick() {
   try {
     // Only bother if at least one agent is free and in-conference.
     const freeAgents = Object.keys(rt).filter(id => {
-      const st = rt[id]; return st && st.state === 'AVAILABLE' && st.conferenceId;
+      const st = rt[id];
+      // AVAILABLE + in-conference + NO live lead leg + not on an inbound call.
+      return st && st.state === 'AVAILABLE' && st.conferenceId && !st.leadLeg && !st.inbound;
     });
     if (!freeAgents.length) return;
     const nowIso = new Date().toISOString();
@@ -1530,7 +1542,7 @@ async function pacingTick() {
 
     for (const agentId of freeAgents) {
       const st = rt[agentId];
-      if (!st || st.state !== 'AVAILABLE' || !st.conferenceId) continue; // re-check (may have changed)
+      if (!st || st.state !== 'AVAILABLE' || !st.conferenceId || st.leadLeg || st.inbound) continue; // re-check (may have changed)
       let lead = null;
       const agentPlaylists = playlistsByAgent[agentId];
       if (agentPlaylists && agentPlaylists.length) {
