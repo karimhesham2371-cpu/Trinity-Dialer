@@ -1576,6 +1576,7 @@ async function renderWindow(){
   const hrs=(sel)=>Array.from({length:24},(_,h)=>`<option value="${h}"${h===sel?' selected':''}>${String(h).padStart(2,'0')}:00</option>`).join('');
   let d={lines_per_agent:1,ring_secs:25}; try{ d=await apiJson('/api/admin/settings/dialer'); }catch(e){}
   const lpaOpts=(sel)=>Array.from({length:5},(_,i)=>i+1).map(n=>`<option value="${n}"${n===sel?' selected':''}>${n} line${n>1?'s':''} / agent${n===1?' (power — no abandons)':''}</option>`).join('');
+  let p={neg_strike_limit:4,recycle_window_days:10,positive_dnc_days:90,neg_redial_hours:24}; try{ p=await apiJson('/api/admin/settings/call-policy'); }catch(e){}
   $('ldBody').innerHTML=`<div class="card" style="max-width:520px"><h2>Calling window</h2>
     <p class="dim" style="font-size:13px">Hard rule: no lead is dialed before or after this window in <b>their own local time</b> (derived from area code). Applies to the pacer and manual click-to-call.</p>
     <div class="row mt3" style="gap:12px;align-items:flex-end">
@@ -1589,7 +1590,18 @@ async function renderWindow(){
       <div class="fw"><span class="lbl">Calls per agent</span><select id="dlLpa" class="field">${lpaOpts(d.lines_per_agent)}</select></div>
       <div class="fw"><span class="lbl">Ring time (sec)</span><input id="dlRing" class="field" type="number" min="10" max="60" value="${d.ring_secs}"></div>
       <button class="btn btn-primary" id="dlSave" style="flex:0 0 auto">Save</button>
-    </div><div id="dlMsg" class="dim mt3" style="font-size:12px"></div></div>`;
+    </div><div id="dlMsg" class="dim mt3" style="font-size:12px"></div></div>
+    <div class="card mt3" style="max-width:520px"><h2>Call Result Management</h2>
+    <p class="dim" style="font-size:13px">Controls what happens to a phone number based on the call's disposition. <b>Sale / appointment</b> → DNC that auto-clears after the days below. <b>DNC</b> disposition → permanent (admin-clear only). <b>Any other outcome</b> (not available / voicemail / not interested / …) stays re-dialable within the recycle window from the first dial; once it hits the strike limit across any campaign it's permanently blocked.</p>
+    <div class="row mt3" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
+      <div class="fw"><span class="lbl">Sale/appt DNC days</span><input id="cpPos" class="field" type="number" min="1" max="3650" value="${p.positive_dnc_days}"></div>
+      <div class="fw"><span class="lbl">Recycle window (days)</span><input id="cpWin" class="field" type="number" min="1" max="365" value="${p.recycle_window_days}"></div>
+    </div>
+    <div class="row mt3" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
+      <div class="fw"><span class="lbl">Strikes → permanent DNC</span><input id="cpStr" class="field" type="number" min="1" max="20" value="${p.neg_strike_limit}"></div>
+      <div class="fw"><span class="lbl">Redial spacing (hours)</span><input id="cpRedial" class="field" type="number" min="1" max="720" value="${p.neg_redial_hours}"></div>
+      <button class="btn btn-primary" id="cpSave" style="flex:0 0 auto">Save</button>
+    </div><div id="cpMsg" class="dim mt3" style="font-size:12px"></div></div>`;
   enhanceAll($('ldBody'));
   $('cwSave').onclick=async()=>{
     try{ const j=await apiJson('/api/admin/settings/calling-window','PUT',{start_hour:+$('cwStart').value,end_hour:+$('cwEnd').value});
@@ -1600,6 +1612,13 @@ async function renderWindow(){
     try{ const j=await apiJson('/api/admin/settings/dialer','PUT',{lines_per_agent:+$('dlLpa').value,ring_secs:+$('dlRing').value});
       $('dlMsg').innerHTML=`<b style="color:var(--ok)">Saved — ${j.lines_per_agent} line(s)/agent, ${j.ring_secs}s ring</b>`; }
     catch(e){ $('dlMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  };
+  $('cpSave').onclick=async()=>{
+    try{ const j=await apiJson('/api/admin/settings/call-policy','PUT',{
+        positive_dnc_days:+$('cpPos').value, recycle_window_days:+$('cpWin').value,
+        neg_strike_limit:+$('cpStr').value, neg_redial_hours:+$('cpRedial').value});
+      $('cpMsg').innerHTML=`<b style="color:var(--ok)">Saved — sale/appt DNC ${j.positive_dnc_days}d · recycle ${j.recycle_window_days}d · ${j.neg_strike_limit} strikes → DNC · redial every ${j.neg_redial_hours}h</b>`; }
+    catch(e){ $('cpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
 }
 

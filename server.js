@@ -63,10 +63,28 @@ const DEFAULT_RECYCLE = { no_answer: { hours: 4, max: 5 }, busy: { minutes: 20, 
 //    number stays re-dialable for 10 days from the FIRST dial. Each such
 //    disposition is a "strike"; 4 strikes on a phone (across ALL campaigns)
 //    → permanent DNC. After the 10-day window with < 4 strikes → EXHAUSTED.
-const NEG_STRIKE_LIMIT      = 4;
-const RECYCLE_WINDOW_DAYS   = 10;
-const POSITIVE_DNC_DAYS     = 90;
-const DEFAULT_NEG_REDIAL_MS = 24 * 3600e3;   // spacing between redials when a disposition has no explicit recycle rule
+// Admin-editable via the "Call Result Management" panel (app_settings key
+// "call_policy"). These are just the DEFAULTS; loadCallPolicy() overrides them.
+const POLICY_DEFAULTS = {
+  neg_strike_limit:    4,    // negative dispositions on a phone before permanent DNC
+  recycle_window_days: 10,   // re-dialable for this many days from the FIRST dial
+  positive_dnc_days:   90,   // sale/appointment DNC auto-removal window
+  neg_redial_hours:    24,   // spacing between redials when a disposition has no explicit recycle rule
+};
+let POLICY = { ...POLICY_DEFAULTS };
+async function loadCallPolicy() {
+  if (!SB_HOST) return;
+  try {
+    const rows = await sbSelect('app_settings', `key=eq.call_policy&select=value`);
+    const v = rows && rows[0] && rows[0].value;
+    if (v) POLICY = {
+      neg_strike_limit:    Math.max(1, Math.min(20,   parseInt(v.neg_strike_limit, 10)    || POLICY_DEFAULTS.neg_strike_limit)),
+      recycle_window_days: Math.max(1, Math.min(365,  parseInt(v.recycle_window_days, 10)  || POLICY_DEFAULTS.recycle_window_days)),
+      positive_dnc_days:   Math.max(1, Math.min(3650, parseInt(v.positive_dnc_days, 10)    || POLICY_DEFAULTS.positive_dnc_days)),
+      neg_redial_hours:    Math.max(1, Math.min(720,  parseInt(v.neg_redial_hours, 10)     || POLICY_DEFAULTS.neg_redial_hours)),
+    };
+  } catch (e) { console.error('[callPolicy]', e.message); }
+}
 
 // In-memory runtime keyed by agent id (single instance — required for pacing).
 // { state, sip, agentLeg, conferenceId, leadLeg, leadId, leadNumber, fromNumber }
@@ -1285,6 +1303,31 @@ app.put('/api/admin/settings/dialer', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Call Result Management — disposition → DNC / recycle policy knobs.
+app.get('/api/admin/settings/call-policy', auth, adminOnly, async (_req, res) => {
+  res.json({ ...POLICY });
+});
+app.put('/api/admin/settings/call-policy', auth, adminOnly, async (req, res) => {
+  const b = req.body || {};
+  const nsl = parseInt(b.neg_strike_limit, 10);
+  const rwd = parseInt(b.recycle_window_days, 10);
+  const pdd = parseInt(b.positive_dnc_days, 10);
+  const nrh = parseInt(b.neg_redial_hours, 10);
+  if (!(nsl >= 1 && nsl <= 20))    return res.status(400).json({ error: 'neg_strike_limit must be 1-20' });
+  if (!(rwd >= 1 && rwd <= 365))   return res.status(400).json({ error: 'recycle_window_days must be 1-365' });
+  if (!(pdd >= 1 && pdd <= 3650))  return res.status(400).json({ error: 'positive_dnc_days must be 1-3650' });
+  if (!(nrh >= 1 && nrh <= 720))   return res.status(400).json({ error: 'neg_redial_hours must be 1-720' });
+  const value = { neg_strike_limit: nsl, recycle_window_days: rwd, positive_dnc_days: pdd, neg_redial_hours: nrh };
+  try {
+    await sbReq('POST', 'app_settings?on_conflict=key',
+      { key: 'call_policy', value, updated_at: new Date().toISOString() },
+      'resolution=merge-duplicates,return=minimal');
+    POLICY = value;
+    audit(req.user, 'EDIT_CALL_POLICY', { target_type: 'settings', meta: POLICY });
+    res.json({ ok: true, ...POLICY });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══ ADMIN: reports ══════════════════════════════════════════════════════════════
 // 1) Audit Logs — user activity trail. Filters: from, to, actor_id, action, limit.
 app.get('/api/admin/reports/audit', auth, adminOnly, async (req, res) => {
@@ -1604,7 +1647,7 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
     } else if (isPositiveDisp(disp)) {
       // Sale / appointment / lead → converted, DNC for 90 days then auto-removed.
       patch.status = disp.outcome || 'DONE'; patch.dnc = true;
-      dncTemporary(lead.phone, POSITIVE_DNC_DAYS, 'converted');
+      dncTemporary(lead.phone, POLICY.positive_dnc_days, 'converted');
     } else if (disp.is_callback) {
       patch.status = 'CALLBACK';
       patch.next_callback_at = callback_at || new Date(Date.now() + 3600e3).toISOString();
@@ -1615,7 +1658,7 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
       // Otherwise keep it re-dialable, but only within 10 days of the first dial.
       const act = await bumpPhoneStrike(lead.phone);
       const strikes = (act && act.neg_strikes) || 1;
-      if (strikes >= NEG_STRIKE_LIMIT) {
+      if (strikes >= POLICY.neg_strike_limit) {
         patch.status = 'DNC'; patch.dnc = true;
         dncPermanent(lead.phone, 'strike-limit');
         // Propagate DNC to every other lead row sharing this number.
@@ -1623,9 +1666,9 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
           { dnc: true, status: 'DNC' }).catch(() => {});
       } else {
         const firstDial = (act && act.first_dial_at) ? new Date(act.first_dial_at).getTime() : Date.now();
-        const windowEnd = firstDial + RECYCLE_WINDOW_DAYS * 86400e3;
+        const windowEnd = firstDial + POLICY.recycle_window_days * 86400e3;
         const rule = disp.recycle ? ((cfg.recycle_rules || DEFAULT_RECYCLE)[disp.recycle] || {}) : {};
-        const ms = rule.hours ? rule.hours * 3600e3 : (rule.minutes ? rule.minutes * 60e3 : DEFAULT_NEG_REDIAL_MS);
+        const ms = rule.hours ? rule.hours * 3600e3 : (rule.minutes ? rule.minutes * 60e3 : POLICY.neg_redial_hours * 3600e3);
         const next = Date.now() + ms;
         if (next >= windowEnd) {
           patch.status = 'EXHAUSTED';   // next redial would fall outside the 10-day window
@@ -2222,6 +2265,7 @@ server.listen(PORT, async () => {
   await refreshCallerPool();
   await loadCallingWindow();
   await loadDialerConfig();
+  await loadCallPolicy();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
   console.log(`[boot] calling window: ${CALLING_WINDOW.start_hour}:00–${CALLING_WINDOW.end_hour}:00 lead-local`);
   console.log(`[boot] dialer: ${DIALER.lines_per_agent} line(s)/agent, ${DIALER.ring_secs}s ring`);
@@ -2230,6 +2274,7 @@ server.listen(PORT, async () => {
   setInterval(refreshCallerPool, 5 * 60 * 1000);
   setInterval(loadCallingWindow, 5 * 60 * 1000);
   setInterval(loadDialerConfig, 60 * 1000);
+  setInterval(loadCallPolicy, 60 * 1000);
   sweepExpiredDnc();
   setInterval(sweepExpiredDnc, 10 * 60 * 1000);   // auto-remove expired (e.g. 90-day) DNC entries
 });
