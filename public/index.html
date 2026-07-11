@@ -1576,7 +1576,8 @@ async function renderWindow(){
   const hrs=(sel)=>Array.from({length:24},(_,h)=>`<option value="${h}"${h===sel?' selected':''}>${String(h).padStart(2,'0')}:00</option>`).join('');
   let d={lines_per_agent:1,ring_secs:25}; try{ d=await apiJson('/api/admin/settings/dialer'); }catch(e){}
   const lpaOpts=(sel)=>Array.from({length:5},(_,i)=>i+1).map(n=>`<option value="${n}"${n===sel?' selected':''}>${n} line${n>1?'s':''} / agent${n===1?' (power — no abandons)':''}</option>`).join('');
-  let p={neg_strike_limit:4,recycle_window_days:10,positive_dnc_days:90,neg_redial_hours:24}; try{ p=await apiJson('/api/admin/settings/call-policy'); }catch(e){}
+  let cp={dispositions:[],defaults:{recycle_window_days:10,neg_strike_limit:4,neg_redial_hours:24}}; try{ cp=await apiJson('/api/admin/settings/call-policy'); }catch(e){}
+  const cpOpts=(cp.dispositions||[]).map((dsp,i)=>`<option value="${i}">${esc(dsp.label)} (${esc(dsp.code)})</option>`).join('');
   $('ldBody').innerHTML=`<div class="card" style="max-width:520px"><h2>Calling window</h2>
     <p class="dim" style="font-size:13px">Hard rule: no lead is dialed before or after this window in <b>their own local time</b> (derived from area code). Applies to the pacer and manual click-to-call.</p>
     <div class="row mt3" style="gap:12px;align-items:flex-end">
@@ -1592,14 +1593,14 @@ async function renderWindow(){
       <button class="btn btn-primary" id="dlSave" style="flex:0 0 auto">Save</button>
     </div><div id="dlMsg" class="dim mt3" style="font-size:12px"></div></div>
     <div class="card mt3" style="max-width:520px"><h2>Call Result Management</h2>
-    <p class="dim" style="font-size:13px">Controls what happens to a phone number based on the call's disposition. <b>Sale / appointment</b> → DNC that auto-clears after the days below. <b>DNC</b> disposition → permanent (admin-clear only). <b>Any other outcome</b> (not available / voicemail / not interested / …) stays re-dialable within the recycle window from the first dial; once it hits the strike limit across any campaign it's permanently blocked.</p>
+    <p class="dim" style="font-size:13px">Pick a disposition, then set how its calls recycle. <b>Recycle window</b> = how many days the number stays re-dialable, counted from the first dial. <b>Strikes</b> = how many times this outcome can hit a number (across any campaign) before it's permanently added to DNC. <b>Redial spacing</b> = the wait between re-dials while inside the window.</p>
+    <div class="row mt3"><div class="fw" style="flex:1"><span class="lbl">Disposition</span><select id="cpDisp" class="field">${cpOpts}</select></div></div>
     <div class="row mt3" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
-      <div class="fw"><span class="lbl">Sale/appt DNC days</span><input id="cpPos" class="field" type="number" min="1" max="3650" value="${p.positive_dnc_days}"></div>
-      <div class="fw"><span class="lbl">Recycle window (days)</span><input id="cpWin" class="field" type="number" min="1" max="365" value="${p.recycle_window_days}"></div>
+      <div class="fw"><span class="lbl">Recycle window (days)</span><input id="cpWin" class="field" type="number" min="1" max="365"></div>
+      <div class="fw"><span class="lbl">Strikes</span><input id="cpStr" class="field" type="number" min="1" max="20"></div>
     </div>
     <div class="row mt3" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
-      <div class="fw"><span class="lbl">Strikes → permanent DNC</span><input id="cpStr" class="field" type="number" min="1" max="20" value="${p.neg_strike_limit}"></div>
-      <div class="fw"><span class="lbl">Redial spacing (hours)</span><input id="cpRedial" class="field" type="number" min="1" max="720" value="${p.neg_redial_hours}"></div>
+      <div class="fw"><span class="lbl">Redial spacing (hours)</span><input id="cpRedial" class="field" type="number" min="1" max="720"></div>
       <button class="btn btn-primary" id="cpSave" style="flex:0 0 auto">Save</button>
     </div><div id="cpMsg" class="dim mt3" style="font-size:12px"></div></div>`;
   enhanceAll($('ldBody'));
@@ -1613,11 +1614,17 @@ async function renderWindow(){
       $('dlMsg').innerHTML=`<b style="color:var(--ok)">Saved — ${j.lines_per_agent} line(s)/agent, ${j.ring_secs}s ring</b>`; }
     catch(e){ $('dlMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
-  $('cpSave').onclick=async()=>{
-    try{ const j=await apiJson('/api/admin/settings/call-policy','PUT',{
-        positive_dnc_days:+$('cpPos').value, recycle_window_days:+$('cpWin').value,
-        neg_strike_limit:+$('cpStr').value, neg_redial_hours:+$('cpRedial').value});
-      $('cpMsg').innerHTML=`<b style="color:var(--ok)">Saved — sale/appt DNC ${j.positive_dnc_days}d · recycle ${j.recycle_window_days}d · ${j.neg_strike_limit} strikes → DNC · redial every ${j.neg_redial_hours}h</b>`; }
+  const cpFill=()=>{ const d=(cp.dispositions||[])[+$('cpDisp').value]; if(!d)return; const pol=d.policy||cp.defaults;
+    $('cpWin').value=pol.recycle_window_days; $('cpStr').value=pol.neg_strike_limit; $('cpRedial').value=pol.neg_redial_hours;
+    $('cpMsg').innerHTML=d.is_dnc?`<span class="dim">“${esc(d.label)}” always goes to <b>permanent</b> DNC — these knobs don't apply.</span>`
+      :d.positive?`<span class="dim">“${esc(d.label)}” is a positive outcome — DNC auto-clears after ${cp.positive_dnc_days} days; these knobs don't apply.</span>`
+      :d.is_callback?`<span class="dim">“${esc(d.label)}” schedules a callback — these knobs don't apply.</span>`:''; };
+  if($('cpDisp')){ $('cpDisp').onchange=cpFill; cpFill(); }
+  $('cpSave').onclick=async()=>{ const d=(cp.dispositions||[])[+$('cpDisp').value]; if(!d)return;
+    try{ const j=await apiJson('/api/admin/settings/call-policy','PUT',{ code:d.code,
+        recycle_window_days:+$('cpWin').value, neg_strike_limit:+$('cpStr').value, neg_redial_hours:+$('cpRedial').value});
+      d.policy=j.policy;
+      $('cpMsg').innerHTML=`<b style="color:var(--ok)">Saved “${esc(d.label)}” — recycle ${j.policy.recycle_window_days}d · ${j.policy.neg_strike_limit} strikes → DNC · redial every ${j.policy.neg_redial_hours}h</b>`; }
     catch(e){ $('cpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
 }

@@ -64,27 +64,37 @@ const DEFAULT_RECYCLE = { no_answer: { hours: 4, max: 5 }, busy: { minutes: 20, 
 //    disposition is a "strike"; 4 strikes on a phone (across ALL campaigns)
 //    → permanent DNC. After the 10-day window with < 4 strikes → EXHAUSTED.
 // Admin-editable via the "Call Result Management" panel (app_settings key
-// "call_policy"). These are just the DEFAULTS; loadCallPolicy() overrides them.
-const POLICY_DEFAULTS = {
-  neg_strike_limit:    4,    // negative dispositions on a phone before permanent DNC
-  recycle_window_days: 10,   // re-dialable for this many days from the FIRST dial
-  positive_dnc_days:   90,   // sale/appointment DNC auto-removal window
-  neg_redial_hours:    24,   // spacing between redials when a disposition has no explicit recycle rule
-};
-let POLICY = { ...POLICY_DEFAULTS };
+// "call_policy"). Recycle/strike/redial are now configured PER DISPOSITION —
+// each disposition code carries its own re-dial window, strike limit, and
+// redial spacing. positive_dnc_days still governs the sale/appt DNC expiry.
+const DISP_POLICY_DEFAULT = { recycle_window_days: 10, neg_strike_limit: 4, neg_redial_hours: 24 };
+const POSITIVE_DNC_DAYS_DEFAULT = 90;
+let POLICY = { positive_dnc_days: POSITIVE_DNC_DAYS_DEFAULT, dispositions: {} };
+function clampDispPolicy(v) {
+  return {
+    recycle_window_days: Math.max(1, Math.min(365, parseInt(v && v.recycle_window_days, 10) || DISP_POLICY_DEFAULT.recycle_window_days)),
+    neg_strike_limit:    Math.max(1, Math.min(20,  parseInt(v && v.neg_strike_limit, 10)    || DISP_POLICY_DEFAULT.neg_strike_limit)),
+    neg_redial_hours:    Math.max(1, Math.min(720, parseInt(v && v.neg_redial_hours, 10)    || DISP_POLICY_DEFAULT.neg_redial_hours)),
+  };
+}
 async function loadCallPolicy() {
   if (!SB_HOST) return;
   try {
     const rows = await sbSelect('app_settings', `key=eq.call_policy&select=value`);
     const v = rows && rows[0] && rows[0].value;
-    if (v) POLICY = {
-      neg_strike_limit:    Math.max(1, Math.min(20,   parseInt(v.neg_strike_limit, 10)    || POLICY_DEFAULTS.neg_strike_limit)),
-      recycle_window_days: Math.max(1, Math.min(365,  parseInt(v.recycle_window_days, 10)  || POLICY_DEFAULTS.recycle_window_days)),
-      positive_dnc_days:   Math.max(1, Math.min(3650, parseInt(v.positive_dnc_days, 10)    || POLICY_DEFAULTS.positive_dnc_days)),
-      neg_redial_hours:    Math.max(1, Math.min(720,  parseInt(v.neg_redial_hours, 10)     || POLICY_DEFAULTS.neg_redial_hours)),
-    };
+    if (v) {
+      const disp = {};
+      if (v.dispositions && typeof v.dispositions === 'object')
+        for (const [code, cfg] of Object.entries(v.dispositions)) disp[code] = clampDispPolicy(cfg);
+      POLICY = {
+        positive_dnc_days: Math.max(1, Math.min(3650, parseInt(v.positive_dnc_days, 10) || POSITIVE_DNC_DAYS_DEFAULT)),
+        dispositions: disp,
+      };
+    }
   } catch (e) { console.error('[callPolicy]', e.message); }
 }
+// Effective recycle/strike/redial policy for a given disposition code.
+const dispPolicy = (code) => (POLICY.dispositions && POLICY.dispositions[code]) || DISP_POLICY_DEFAULT;
 
 // In-memory runtime keyed by agent id (single instance — required for pacing).
 // { state, sip, agentLeg, conferenceId, leadLeg, leadId, leadNumber, fromNumber }
@@ -1303,28 +1313,39 @@ app.put('/api/admin/settings/dialer', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Call Result Management — disposition → DNC / recycle policy knobs.
+// Call Result Management — per-disposition recycle / strike / redial policy.
+// Returns the disposition list (for the dropdown) plus each one's effective
+// settings so the UI can pre-fill the fields when a disposition is picked.
 app.get('/api/admin/settings/call-policy', auth, adminOnly, async (_req, res) => {
-  res.json({ ...POLICY });
+  const dispositions = DEFAULT_DISPOSITIONS.map(d => ({
+    code: d.code, label: d.label,
+    is_dnc: !!d.is_dnc, is_callback: !!d.is_callback, positive: isPositiveDisp(d),
+    policy: dispPolicy(d.code),
+  }));
+  res.json({ dispositions, defaults: DISP_POLICY_DEFAULT, positive_dnc_days: POLICY.positive_dnc_days });
 });
+// Save the policy for ONE disposition. Body: { code, recycle_window_days,
+// neg_strike_limit, neg_redial_hours }. Merges into the per-disposition map.
 app.put('/api/admin/settings/call-policy', auth, adminOnly, async (req, res) => {
   const b = req.body || {};
-  const nsl = parseInt(b.neg_strike_limit, 10);
+  const code = String(b.code || '').trim();
+  if (!code || !DEFAULT_DISPOSITIONS.some(d => d.code === code))
+    return res.status(400).json({ error: 'unknown disposition code' });
   const rwd = parseInt(b.recycle_window_days, 10);
-  const pdd = parseInt(b.positive_dnc_days, 10);
+  const nsl = parseInt(b.neg_strike_limit, 10);
   const nrh = parseInt(b.neg_redial_hours, 10);
-  if (!(nsl >= 1 && nsl <= 20))    return res.status(400).json({ error: 'neg_strike_limit must be 1-20' });
-  if (!(rwd >= 1 && rwd <= 365))   return res.status(400).json({ error: 'recycle_window_days must be 1-365' });
-  if (!(pdd >= 1 && pdd <= 3650))  return res.status(400).json({ error: 'positive_dnc_days must be 1-3650' });
-  if (!(nrh >= 1 && nrh <= 720))   return res.status(400).json({ error: 'neg_redial_hours must be 1-720' });
-  const value = { neg_strike_limit: nsl, recycle_window_days: rwd, positive_dnc_days: pdd, neg_redial_hours: nrh };
+  if (!(rwd >= 1 && rwd <= 365))  return res.status(400).json({ error: 'recycle_window_days must be 1-365' });
+  if (!(nsl >= 1 && nsl <= 20))   return res.status(400).json({ error: 'neg_strike_limit must be 1-20' });
+  if (!(nrh >= 1 && nrh <= 720))  return res.status(400).json({ error: 'neg_redial_hours must be 1-720' });
+  const dispositions = { ...(POLICY.dispositions || {}), [code]: { recycle_window_days: rwd, neg_strike_limit: nsl, neg_redial_hours: nrh } };
+  const value = { positive_dnc_days: POLICY.positive_dnc_days, dispositions };
   try {
     await sbReq('POST', 'app_settings?on_conflict=key',
       { key: 'call_policy', value, updated_at: new Date().toISOString() },
       'resolution=merge-duplicates,return=minimal');
     POLICY = value;
-    audit(req.user, 'EDIT_CALL_POLICY', { target_type: 'settings', meta: POLICY });
-    res.json({ ok: true, ...POLICY });
+    audit(req.user, 'EDIT_CALL_POLICY', { target_type: 'settings', meta: { code, ...dispositions[code] } });
+    res.json({ ok: true, code, policy: dispositions[code] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1656,9 +1677,10 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
       // Every other outcome (not available / voicemail / not interested / …):
       // one strike. 4 strikes on the phone (any campaign) → permanent DNC.
       // Otherwise keep it re-dialable, but only within 10 days of the first dial.
+      const dp = dispPolicy(disp.code);
       const act = await bumpPhoneStrike(lead.phone);
       const strikes = (act && act.neg_strikes) || 1;
-      if (strikes >= POLICY.neg_strike_limit) {
+      if (strikes >= dp.neg_strike_limit) {
         patch.status = 'DNC'; patch.dnc = true;
         dncPermanent(lead.phone, 'strike-limit');
         // Propagate DNC to every other lead row sharing this number.
@@ -1666,9 +1688,9 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
           { dnc: true, status: 'DNC' }).catch(() => {});
       } else {
         const firstDial = (act && act.first_dial_at) ? new Date(act.first_dial_at).getTime() : Date.now();
-        const windowEnd = firstDial + POLICY.recycle_window_days * 86400e3;
+        const windowEnd = firstDial + dp.recycle_window_days * 86400e3;
         const rule = disp.recycle ? ((cfg.recycle_rules || DEFAULT_RECYCLE)[disp.recycle] || {}) : {};
-        const ms = rule.hours ? rule.hours * 3600e3 : (rule.minutes ? rule.minutes * 60e3 : POLICY.neg_redial_hours * 3600e3);
+        const ms = rule.hours ? rule.hours * 3600e3 : (rule.minutes ? rule.minutes * 60e3 : dp.neg_redial_hours * 3600e3);
         const next = Date.now() + ms;
         if (next >= windowEnd) {
           patch.status = 'EXHAUSTED';   // next redial would fall outside the 10-day window
