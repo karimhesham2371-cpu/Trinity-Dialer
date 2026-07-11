@@ -208,6 +208,9 @@
   .rtile:hover{border-color:var(--accent);background:var(--surface-2)}
   .rtile h3{color:var(--text);font:600 15px var(--font-ui);margin:0 0 6px}
   .rtile p{font-size:12.5px;color:var(--text-dim);margin:0;line-height:1.5}
+  .aibox{display:flex;flex-direction:column;gap:8px;max-height:220px;overflow:auto;border:1px solid var(--border-strong);border-radius:8px;padding:12px;background:var(--surface)}
+  .airow{display:flex;align-items:center;gap:8px;color:var(--text);font:500 13px var(--font-ui);cursor:pointer}
+  .airow input{cursor:pointer}
   .rback{background:transparent;border:none;color:var(--text-dim);font:500 12px var(--font-ui);cursor:pointer;padding:0}
   .rback:hover{color:var(--text)}
   .rfilters{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:16px}
@@ -431,6 +434,7 @@
       <button class="navtab" data-lt="fields" onclick="leadTab('fields')">Custom fields</button>
       <button class="navtab" data-lt="dnc" onclick="leadTab('dnc')">DNC list</button>
       <button class="navtab" data-lt="window" onclick="leadTab('window')">Calling window</button>
+      <button class="navtab" data-lt="ai" onclick="leadTab('ai')">AI Caller</button>
     </div>
     <div id="ldBody"></div>
   </div>
@@ -1210,7 +1214,7 @@ function leadTab(t){
   $('ldSub').querySelectorAll('[data-lt]').forEach(b=>b.classList.toggle('active', b.dataset.lt===t));
   const body=$('ldBody'); body.innerHTML='<p class="dim">Loading…</p>';
   if(!ldCampId && ['import','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
-  ({import:renderImport,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow}[t]||(()=>{}))();
+  ({import:renderImport,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow,ai:renderAiCaller}[t]||(()=>{}))();
 }
 
 // ── Global lead search ──
@@ -1568,6 +1572,40 @@ async function renderDnc(){
     finally{ btn.disabled=false; btn.textContent='Add to DNC list'; }
   };
   load();
+}
+
+// ── AI Cold Caller (Sprint 1: config foundation) ──
+async function renderAiCaller(){
+  let a={enabled:false,concurrency:5,assistant_id:'',voice:'',transfer_agent_ids:[],campaign_ids:[],campaigns:[],agents:[]};
+  try{ a=await apiJson('/api/admin/settings/ai'); }catch(e){}
+  const campSet=new Set(a.campaign_ids||[]), agSet=new Set(a.transfer_agent_ids||[]);
+  const campRows=(a.campaigns||[]).map(c=>`<label class="airow"><input type="checkbox" class="aiCamp" value="${c.id}"${campSet.has(c.id)?' checked':''}> ${esc(c.name)}${c.active?'':' <span class="dim">(inactive)</span>'}</label>`).join('')||'<span class="dim">No campaigns yet.</span>';
+  const agRows=(a.agents||[]).map(g=>`<label class="airow"><input type="checkbox" class="aiAgent" value="${g.id}"${agSet.has(g.id)?' checked':''}> ${esc(g.name)} <span class="dim">(${esc(g.role)})</span></label>`).join('')||'<span class="dim">No users yet.</span>';
+  $('ldBody').innerHTML=`<div class="card" style="max-width:640px"><h2>AI Cold Caller</h2>
+    <p class="dim" style="font-size:13px">The AI dials selected campaigns as its own lane, separate from human agents. It attaches a Telnyx AI Assistant <b>only after a human answers and speaks back</b> — voicemails and silent pickups never start the meter. Interested leads are warm-transferred to the closers below.
+    <br><b style="color:var(--warn)">Sprint 1:</b> this saves the configuration only. AI dialing is wired up in the next step, so toggling it on here does not place any calls yet.</p>
+    <div class="row mt3" style="align-items:center;gap:10px">
+      <label class="airow" style="font-weight:600"><input type="checkbox" id="aiEnabled"${a.enabled?' checked':''}> Enable AI dialing</label>
+    </div>
+    <div class="row mt3" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
+      <div class="fw"><span class="lbl">Max simultaneous AI calls (spend cap)</span><input id="aiConc" class="field" type="number" min="1" max="50" value="${a.concurrency}"></div>
+      <div class="fw"><span class="lbl">Telnyx Assistant ID</span><input id="aiAsst" class="field" placeholder="assistant-xxxxxxxx" value="${esc(a.assistant_id||'')}"></div>
+    </div>
+    <div class="row mt3"><div class="fw" style="flex:1"><span class="lbl">Voice (informational)</span><input id="aiVoice" class="field" placeholder="e.g. Telnyx Ultra / ElevenLabs voice name" value="${esc(a.voice||'')}"></div></div>
+    <div class="mt3"><span class="lbl">Campaigns the AI dials</span><div class="aibox">${campRows}</div></div>
+    <div class="mt3"><span class="lbl">Warm-transfer closers (Lead / Callback)</span><div class="aibox">${agRows}</div></div>
+    <div class="row mt3"><button class="btn btn-primary" id="aiSave">Save</button></div>
+    <div id="aiMsg" class="dim mt3" style="font-size:12px"></div></div>`;
+  enhanceAll($('ldBody'));
+  $('aiSave').onclick=async()=>{
+    const body={ enabled:$('aiEnabled').checked, concurrency:+$('aiConc').value,
+      assistant_id:$('aiAsst').value.trim(), voice:$('aiVoice').value.trim(),
+      campaign_ids:[...document.querySelectorAll('.aiCamp:checked')].map(c=>c.value),
+      transfer_agent_ids:[...document.querySelectorAll('.aiAgent:checked')].map(c=>c.value) };
+    try{ const j=await apiJson('/api/admin/settings/ai','PUT',body);
+      $('aiMsg').innerHTML=`<b style="color:var(--ok)">Saved — AI ${j.enabled?'enabled':'off'}, cap ${j.concurrency}, ${j.campaign_ids.length} campaign(s), ${j.transfer_agent_ids.length} closer(s)</b>`; }
+    catch(e){ $('aiMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  };
 }
 
 // ── Calling window (global compliance setting) ──

@@ -137,6 +137,33 @@ async function loadDialerConfig() {
   } catch (e) { console.error('[dialerConfig]', e.message); }
 }
 
+// ── AI Cold Caller config (admin-editable, cached from app_settings key "ai") ──
+// The AI runs as its own "seat lane" on the floor, independent of human agents.
+//   enabled            master on/off switch for AI dialing
+//   concurrency        MAX simultaneous AI calls — the hard spend ceiling (1-50)
+//   assistant_id       the Telnyx AI Assistant to attach on a confirmed human
+//   voice              informational: which TTS voice the assistant uses
+//   transfer_agent_ids human closers who receive warm transfers (Lead/Callback)
+//   campaign_ids       which campaigns the AI caller dials (opt-in, never all)
+// Sprint 1 only loads/serves this config; the pacer wiring lands in Sprint 2, so
+// toggling `enabled` here does NOT yet affect live human dialing.
+let AI = { enabled: false, concurrency: 5, assistant_id: '', voice: '', transfer_agent_ids: [], campaign_ids: [] };
+async function loadAiConfig() {
+  if (!SB_HOST) return;
+  try {
+    const rows = await sbSelect('app_settings', `key=eq.ai&select=value`);
+    const v = rows && rows[0] && rows[0].value;
+    if (v) AI = {
+      enabled: !!v.enabled,
+      concurrency: Math.max(1, Math.min(50, parseInt(v.concurrency, 10) || 5)),
+      assistant_id: String(v.assistant_id || '').trim(),
+      voice: String(v.voice || '').trim(),
+      transfer_agent_ids: Array.isArray(v.transfer_agent_ids) ? v.transfer_agent_ids.map(String) : [],
+      campaign_ids: Array.isArray(v.campaign_ids) ? v.campaign_ids.map(String) : [],
+    };
+  } catch (e) { console.error('[aiConfig]', e.message); }
+}
+
 // ── Telnyx REST ───────────────────────────────────────────────────────────────
 async function telnyx(method, endpoint, body) {
   const res = await fetch(`${TELNYX_BASE}${endpoint}`, {
@@ -1349,6 +1376,42 @@ app.put('/api/admin/settings/call-policy', auth, adminOnly, async (req, res) => 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// AI Cold Caller — master config. GET returns the config plus the campaign and
+// agent lists so the UI can offer opt-in checkboxes. PUT validates + persists.
+app.get('/api/admin/settings/ai', auth, adminOnly, async (_req, res) => {
+  try {
+    const [campaigns, agents] = await Promise.all([
+      sbSelect('campaigns', 'select=id,name,active&order=created_at.desc').catch(() => []),
+      sbSelect('agents', 'select=id,name,role&order=name.asc').catch(() => []),
+    ]);
+    res.json({ ...AI, campaigns: campaigns || [], agents: (agents || []).filter(a => a.role === 'agent' || a.role === 'admin') });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/admin/settings/ai', auth, adminOnly, async (req, res) => {
+  const b = req.body || {};
+  const conc = parseInt(b.concurrency, 10);
+  if (!(conc >= 1 && conc <= 50)) return res.status(400).json({ error: 'concurrency must be 1-50' });
+  const value = {
+    enabled: !!b.enabled,
+    concurrency: conc,
+    assistant_id: String(b.assistant_id || '').trim(),
+    voice: String(b.voice || '').trim(),
+    transfer_agent_ids: Array.isArray(b.transfer_agent_ids) ? b.transfer_agent_ids.map(String) : [],
+    campaign_ids: Array.isArray(b.campaign_ids) ? b.campaign_ids.map(String) : [],
+  };
+  // Guard: can't enable AI dialing without an assistant to attach.
+  if (value.enabled && !value.assistant_id)
+    return res.status(400).json({ error: 'set a Telnyx assistant_id before enabling' });
+  try {
+    await sbReq('POST', 'app_settings?on_conflict=key',
+      { key: 'ai', value, updated_at: new Date().toISOString() },
+      'resolution=merge-duplicates,return=minimal');
+    AI = value;
+    audit(req.user, 'EDIT_AI', { target_type: 'settings', meta: { enabled: value.enabled, concurrency: value.concurrency, campaigns: value.campaign_ids.length } });
+    res.json({ ok: true, ...AI });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══ ADMIN: reports ══════════════════════════════════════════════════════════════
 // 1) Audit Logs — user activity trail. Filters: from, to, actor_id, action, limit.
 app.get('/api/admin/reports/audit', auth, adminOnly, async (req, res) => {
@@ -2288,15 +2351,18 @@ server.listen(PORT, async () => {
   await loadCallingWindow();
   await loadDialerConfig();
   await loadCallPolicy();
+  await loadAiConfig();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
   console.log(`[boot] calling window: ${CALLING_WINDOW.start_hour}:00–${CALLING_WINDOW.end_hour}:00 lead-local`);
   console.log(`[boot] dialer: ${DIALER.lines_per_agent} line(s)/agent, ${DIALER.ring_secs}s ring`);
+  console.log(`[boot] ai caller: ${AI.enabled ? 'ENABLED' : 'off'}, concurrency ${AI.concurrency}, ${AI.campaign_ids.length} campaign(s), assistant ${AI.assistant_id || '(none)'}`);
   setInterval(pacingTick, PACING_MS);
   setInterval(reaperTick, 30 * 1000);
   setInterval(refreshCallerPool, 5 * 60 * 1000);
   setInterval(loadCallingWindow, 5 * 60 * 1000);
   setInterval(loadDialerConfig, 60 * 1000);
   setInterval(loadCallPolicy, 60 * 1000);
+  setInterval(loadAiConfig, 60 * 1000);
   sweepExpiredDnc();
   setInterval(sweepExpiredDnc, 10 * 60 * 1000);   // auto-remove expired (e.g. 90-day) DNC entries
 });
