@@ -537,6 +537,12 @@ function enhanceSelect(sel){
   document.addEventListener('click', close);
   wrap.appendChild(btn); wrap.appendChild(list); render();
 }
+// Refresh an already-enhanced select's visible label after its options/value change.
+function syncCsel(sel){
+  const w=sel&&sel.closest&&sel.closest('.csel'); if(!w) return;
+  const b=w.querySelector('.csel-btn'); const o=sel.options[sel.selectedIndex];
+  if(b) b.innerHTML=`<span>${esc(o?o.textContent:'')}</span><span class="csel-caret">▾</span>`;
+}
 
 async function api(path, opts={}) {
   opts.headers = Object.assign({ 'Authorization':'Bearer '+TOKEN }, opts.headers||{});
@@ -1242,10 +1248,15 @@ async function initLeads(){
     leadCampaigns=j.campaigns||[];
   }catch(e){ toast(e.message,'err'); leadCampaigns=[]; }
   const sel=$('ldCampaign');
-  sel.innerHTML=leadCampaigns.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')||'<option value="">No campaigns</option>';
+  const campOpts=leadCampaigns.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('');
+  sel.innerHTML=(campOpts||'')+'<option value="__new__">＋ Create new campaign…</option>';
   if(!ldCampId || !leadCampaigns.find(c=>c.id===ldCampId)) ldCampId=leadCampaigns[0]&&leadCampaigns[0].id||null;
-  sel.value=ldCampId||''; enhanceSelect(sel);
-  sel.onchange=()=>{ ldCampId=sel.value; leadTab(ldCurTab); };
+  sel.value=ldCampId||'__new__'; enhanceSelect(sel); syncCsel(sel);
+  sel.onchange=()=>{
+    if(sel.value==='__new__'){ renderCreateCampaign(); return; }
+    ldCampId=sel.value; leadTab(ldCurTab);
+  };
+  if(!ldCampId){ renderCreateCampaign(); return; }
   // global search
   let sT=null; $('ldSearch').oninput=()=>{ clearTimeout(sT); sT=setTimeout(runLeadSearch,300); };
   leadTab(ldCurTab);
@@ -1322,6 +1333,77 @@ async function ldPreview(f){
       }catch(e){ $('ldImpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; $('ldImport').disabled=false; }
     };
   }catch(e){ $('ldDzText').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+}
+// Shared import-result popup (contacts uploaded / duplicates / DNC / invalid).
+function showImportResult(fileName,j2){
+  const stat=(cls,lbl,val)=>`<div class="mstat mstat--${cls}"><span class="mlbl">${lbl}</span><span class="mval">${val}</span></div>`;
+  let body=stat('ok','Contacts uploaded',j2.inserted)
+         + stat('warn','Duplicates skipped',j2.duplicates)
+         + stat('dnc','On DNC list — removed',j2.dnc_removed);
+  if(j2.invalid) body+=stat('info','Invalid numbers',j2.invalid);
+  showModal('Upload complete',`${esc(fileName)} · ${j2.total} rows processed`,body,'Done');
+}
+
+// ── Create campaign (from the campaign dropdown) ──
+function renderCreateCampaign(){
+  let ccText=null, ccFile=null, ccMapping=null;
+  $('ldBody').innerHTML=`<div class="card" style="max-width:720px">
+    <h2>Create new campaign</h2>
+    <p class="dim" style="font-size:13px">Name the campaign, then optionally upload the lead file that should be assigned to it. Leads are deduped and DNC-scrubbed automatically on import.</p>
+    <div class="fw mt3" style="max-width:360px"><span class="lbl">Campaign name</span>
+      <input id="ccName" class="field" placeholder="e.g. Charlotte FSBO — July" autocomplete="off"></div>
+    <div class="lbl mt3">Lead file <span class="faint">— optional; you can also import later</span></div>
+    <div class="dropzone" id="ccDz"><input type="file" accept=".csv" id="ccCsv" hidden><div id="ccDzText">Drop a CSV or <b>browse</b></div></div>
+    <div id="ccMap"></div>
+    <div class="row mt3"><button id="ccCreate" class="btn btn-primary">Create campaign</button></div>
+    <div id="ccMsg" class="dim mt3" style="font-size:13px"></div></div>`;
+  const dz=$('ccDz'), inp=$('ccCsv');
+  dz.onclick=()=>inp.click();
+  dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag');});
+  dz.addEventListener('dragleave',()=>dz.classList.remove('drag'));
+  dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag'); const f=e.dataTransfer.files[0]; if(f){ const dt=new DataTransfer(); dt.items.add(f); inp.files=dt.files; ccPreview(f);} });
+  inp.onchange=()=>{ if(inp.files[0]) ccPreview(inp.files[0]); };
+  async function ccPreview(f){
+    ccFile=f; ccText=await f.text();
+    $('ccDzText').innerHTML=`<b>${esc(f.name)}</b> · reading…`;
+    try{
+      // Campaign id in the preview URL is ignored server-side; 'new' is a placeholder.
+      const r=await api(`/api/admin/campaigns/new/leads/preview`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({csv:ccText})});
+      const j=await r.json(); if(!r.ok) throw new Error(j.error||'preview failed');
+      $('ccDzText').innerHTML=`<b>${esc(f.name)}</b> · ${j.total} rows`;
+      const opt=(field)=>`<option value="">— none —</option>`+j.headers.map(h=>`<option value="${esc(h)}"${j.suggested[field]===h?' selected':''}>${esc(h)}</option>`).join('');
+      const rowMap=j.canon.map(field=>`<div class="fw"><span class="lbl">${field}</span><select class="field" data-mapfield="${field}">${opt(field)}</select></div>`).join('');
+      $('ccMap').innerHTML=`
+        <div class="lbl mt3">Column mapping <span class="faint">— unmapped columns are kept as custom merge fields</span></div>
+        <div class="row" style="flex-wrap:wrap;gap:12px;margin-top:6px">${rowMap}</div>
+        <div class="tblwrap mt3" style="max-height:180px;overflow:auto"><table><thead><tr>${j.headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead>
+          <tbody>${j.sample.map(r=>`<tr>${j.headers.map(h=>`<td>${esc(r[h]||'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+      enhanceAll($('ccMap')); ccMapping=j;
+      $('ccCreate').textContent=`Create campaign & import ${j.total} leads`;
+    }catch(e){ $('ccDzText').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  }
+  $('ccCreate').onclick=async()=>{
+    const name=$('ccName').value.trim();
+    if(!name){ toast('Enter a campaign name','err'); $('ccName').focus(); return; }
+    const fields={}; $('ccMap').querySelectorAll('[data-mapfield]').forEach(s=>{ if(s.value) fields[s.dataset.mapfield]=s.value; });
+    if(ccText && !fields.phone){ toast('Map the phone column first','err'); return; }
+    const btn=$('ccCreate'); btn.disabled=true; $('ccMsg').textContent='Creating campaign…';
+    try{
+      const cj=await apiJson('/api/admin/campaigns','POST',{name});
+      const newId=cj.campaign&&cj.campaign.id;
+      if(ccText && newId){
+        $('ccMsg').textContent='Importing leads…';
+        const j2=await apiJson(`/api/admin/campaigns/${newId}/leads`,'POST',{csv:ccText,filename:ccFile.name,mapping:{fields}});
+        showImportResult(ccFile.name,j2);
+        toast(`Campaign created · ${j2.inserted} leads imported`);
+      } else {
+        toast('Campaign created');
+      }
+      ldCampId=newId;
+      await initLeads();                 // rebuild dropdown, select the new campaign
+      leadTab('import');
+    }catch(e){ $('ccMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; btn.disabled=false; }
+  };
 }
 
 // ── Playlists (top-level containers of campaigns + callers) ──
