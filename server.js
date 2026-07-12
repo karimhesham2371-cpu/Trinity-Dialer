@@ -1773,6 +1773,47 @@ app.get('/api/agent/status', auth, (req, res) => {
              fromNumber: st.fromNumber || null, onCallSince: st.onCallSince || null });
 });
 
+// Agent-facing productivity: logged-in / break / wrap durations + calls handled,
+// for two windows — today (local midnight) and this month (resets on the 1st).
+const PROD_LOGGED = new Set(['CONNECTING', 'AVAILABLE', 'CLAIMING', 'DIALING', 'ON_CALL', 'WRAP_UP', 'BREAK']);
+async function productivityWindow(agentId, fromMs, toMs) {
+  const fromIso = new Date(fromMs).toISOString(), toIso = new Date(toMs).toISOString();
+  const [spans, calls] = await Promise.all([
+    sbSelect('agent_state_events',
+      `agent_id=eq.${agentId}&started_at=lte.${encodeURIComponent(toIso)}` +
+      `&or=(ended_at.is.null,ended_at.gte.${encodeURIComponent(fromIso)})` +
+      `&select=state,started_at,ended_at&limit=100000`),
+    sbSelect('calls',
+      `agent_id=eq.${agentId}&created_at=gte.${encodeURIComponent(fromIso)}` +
+      `&created_at=lte.${encodeURIComponent(toIso)}&select=id&limit=100000`),
+  ]);
+  const out = { logged_in: 0, break: 0, wrap: 0, calls: (calls || []).length };
+  for (const s of spans || []) {
+    const start = new Date(s.started_at).getTime();
+    const end = s.ended_at ? new Date(s.ended_at).getTime() : Date.now();
+    const dur = Math.max(0, Math.min(end, toMs) - Math.max(start, fromMs)) / 1000;
+    if (dur <= 0) continue;
+    if (PROD_LOGGED.has(s.state)) out.logged_in += dur;
+    if (s.state === 'BREAK') out.break += dur;
+    else if (s.state === 'WRAP_UP') out.wrap += dur;
+  }
+  for (const k of ['logged_in', 'break', 'wrap']) out[k] = Math.round(out[k]);
+  return out;
+}
+app.get('/api/agent/productivity', auth, async (req, res) => {
+  try {
+    const now = Date.now();
+    const d = new Date();
+    const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const monthStart = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+    const [today, month] = await Promise.all([
+      productivityWindow(req.user.id, dayStart, now),
+      productivityWindow(req.user.id, monthStart, now),
+    ]);
+    res.json({ today, month });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Load a campaign's config, filling in defaults for unset dialer fields.
 async function campaignConfig(id) {
   if (!id) return null;
