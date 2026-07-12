@@ -163,6 +163,12 @@ async function loadAiConfig() {
     };
   } catch (e) { console.error('[aiConfig]', e.message); }
 }
+// In-flight AI calls, keyed by Telnyx call_control_id. This is the AI lane's
+// entire runtime — it has NO conference and NO human agent seat. Each entry:
+//   { leadId, leadNumber, fromNumber, campaignId, name, address, phase, at }
+//   phase: 'dialing' (ringing / pre-answer) | 'assistant' (assistant attached).
+// The size of this map is the live spend; AI.concurrency is the hard ceiling.
+const aiRt = {};
 
 // ── Telnyx REST ───────────────────────────────────────────────────────────────
 async function telnyx(method, endpoint, body) {
@@ -2042,6 +2048,116 @@ async function pacingTick() {
   finally { pacingBusy = false; }
 }
 
+// ══ AI COLD CALLER LANE ══════════════════════════════════════════════════════════
+// A self-contained pacer that dials leads from AI.campaign_ids and, on a CONFIRMED
+// human (premium AMD gate — voicemail is never billed), attaches the Telnyx AI
+// Assistant instead of bridging a human agent. No conference, no seat; the only
+// resource is a concurrency slot in aiRt. Reuses the same DID pool as the human
+// dialer (pickCallerId) per the "same phone numbers" decision.
+const AI_MAX_CALL_MS = 15 * 60 * 1000;   // safety: reclaim a slot if a webhook was missed
+
+// Next dialable, in-window AI lead across AI.campaign_ids. Mirrors nextDialableLead
+// but scoped to the AI opt-in campaigns with no playlist filters.
+async function nextAiLead(nowIso) {
+  const cids = AI.campaign_ids;
+  if (!cids.length) return null;
+  const inList = cids.map(c => `"${c}"`).join(',');
+  const leads = await sbSelect('leads',
+    `campaign_id=in.(${inList})&dnc=eq.false&status=in.(NEW,CALLBACK)` +
+    `&or=(next_callback_at.is.null,next_callback_at.lte.${nowIso})` +
+    `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=15&select=*`);
+  return (leads || []).find(l =>
+    inCallingWindow(l.timezone, CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour)) || null;
+}
+
+// Place one outbound AI call. Marks the lead IN_PROGRESS immediately (same as the
+// human dialLead) so neither lane re-picks it. client_state carries role:'ai'.
+async function dialAiLead(lead) {
+  // Compliance: skip DNC before every dial (honour non-expired entries).
+  try {
+    const nowIso = new Date().toISOString();
+    const hit = await sbSelect('dnc_list',
+      `phone=eq.${encodeURIComponent(lead.phone)}&or=(expires_at.is.null,expires_at.gt.${nowIso})&select=phone&limit=1`);
+    if (hit && hit.length) {
+      await sbUpdate('leads', `id=eq.${lead.id}`, { dnc: true, status: 'DNC' }).catch(() => {});
+      console.log(`[ai] DNC skip ${lead.phone}`);
+      return;
+    }
+  } catch (e) { console.error('[dialAiLead:dnc]', e.message); }
+  const from = pickCallerId(areaCodeOf(lead.phone));
+  const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ').trim() || 'there';
+  const result = await telnyx('POST', '/calls', {
+    connection_id: CONNECTION_ID,
+    to: lead.phone,
+    from,
+    timeout_secs: DIALER.ring_secs,
+    answering_machine_detection: AMD_MODE === 'disabled' ? 'disabled' : 'premium',
+    record: 'record-from-answer', record_channels: 'dual', record_format: 'mp3',
+    client_state: enc({ role: 'ai', leadId: lead.id, campaignId: lead.campaign_id }),
+  });
+  const ccid = result.data && result.data.call_control_id;
+  if (!ccid) return;
+  aiRt[ccid] = { leadId: lead.id, leadNumber: lead.phone, fromNumber: from,
+    campaignId: lead.campaign_id, name, address: lead.address || '', phase: 'dialing', at: Date.now() };
+  await sbUpdate('leads', `id=eq.${lead.id}`,
+    { status: 'IN_PROGRESS', attempts: (lead.attempts || 0) + 1, last_attempt_at: new Date().toISOString() })
+    .catch(e => console.error('[dialAiLead:update]', e.message));
+  markFirstDial(lead.phone);
+  sbLog('calls', { lead_id: lead.id, campaign_id: lead.campaign_id,
+    telnyx_call_control_id: ccid, from_number: from, to_number: lead.phone, direction: 'outbound' });
+  console.log(`[ai] -> ${lead.phone} from ${from} (${Object.keys(aiRt).length}/${AI.concurrency} live)`);
+}
+
+// Attach the assistant to a live, confirmed-human leg. Dynamic variables are nested
+// under assistant.dynamic_variables per the Telnyx ai_assistant_start contract.
+async function startAiAssistant(ccid) {
+  const info = aiRt[ccid];
+  if (!info) return;
+  const dyn = { contact_name: info.name || 'there' };
+  if (info.address) dyn.property_address = info.address;
+  try {
+    await telnyx('POST', `/calls/${ccid}/actions/ai_assistant_start`, {
+      assistant: { id: AI.assistant_id, dynamic_variables: dyn },
+    });
+    info.phase = 'assistant';
+    sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
+      { bridged_at: new Date().toISOString(), amd_result: 'human' }).catch(() => {});
+    if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`, { status: 'CONTACTED' }).catch(() => {});
+    console.log(`[ai] assistant attached ${ccid.slice(-8)} (${info.leadNumber})`);
+  } catch (e) {
+    console.error('[ai:start]', e.message);
+    telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+  }
+}
+
+let aiPacingBusy = false;
+async function aiPacingTick() {
+  if (aiPacingBusy) return;
+  if (!AI.enabled || !AI.assistant_id || !AI.campaign_ids.length) return;
+  if (!SB_HOST || !CONNECTION_ID) return;
+  aiPacingBusy = true;
+  try {
+    // Reclaim leaked slots (missed hangup webhook) before counting capacity.
+    for (const [id, info] of Object.entries(aiRt)) {
+      if (Date.now() - info.at > AI_MAX_CALL_MS) {
+        delete aiRt[id];
+        telnyx('POST', `/calls/${id}/actions/hangup`, {}).catch(() => {});
+        console.log(`[ai] reclaimed stale slot ${id.slice(-8)}`);
+      }
+    }
+    let slots = AI.concurrency - Object.keys(aiRt).length;
+    if (slots <= 0) return;
+    const nowIso = new Date().toISOString();
+    while (slots-- > 0) {
+      const lead = await nextAiLead(nowIso);   // dialAiLead marks IN_PROGRESS, so no re-pick
+      if (!lead) break;
+      try { await dialAiLead(lead); }
+      catch (e) { console.error('[ai:dial]', e.message); break; }
+    }
+  } catch (e) { console.error('[aiPacing]', e.message); }
+  finally { aiPacingBusy = false; }
+}
+
 // Pick a random AVAILABLE, in-conference agent who works `campaignId` (via any
 // playlist that contains it). Returns an agentId or null.
 async function pickInboundAgent(campaignId) {
@@ -2102,6 +2218,51 @@ app.post('/webhooks/telnyx', async (req, res) => {
       if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
         { recording_url: url, recording_id: payload.recording_id || null }).catch(() => {});
       return;
+    }
+
+    // ── AI Cold Caller lane ────────────────────────────────────────────────────
+    // Self-contained: no conference, no human agent. The assistant is attached
+    // only on a confirmed human so voicemails never incur assistant cost.
+    if (role === 'ai') {
+      const info = aiRt[ccid];
+      // AMD disabled: a straight answer is the connect signal.
+      if (event === 'call.answered' && AMD_MODE === 'disabled' && info && info.phase === 'dialing') {
+        await startAiAssistant(ccid);
+        return;
+      }
+      // Premium AMD gate: attach on human/ambiguous, hang up + mark machine otherwise.
+      if (event === 'call.machine.premium.detection.ended') {
+        const r = payload.result || '';
+        const isHuman = r.startsWith('human') || r === 'silence' || r === 'not_sure';   // TCPA-safe
+        if (isHuman) {
+          if (info && info.phase === 'dialing') await startAiAssistant(ccid);
+        } else {
+          delete aiRt[ccid];
+          await telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+          if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
+          sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`, { amd_result: r }).catch(() => {});
+          console.log(`[ai] dropped machine ${ccid ? ccid.slice(-8) : '-'} (result=${r})`);
+        }
+        return;
+      }
+      // Call ended: free the slot and disposition the lead.
+      if (event === 'call.hangup') {
+        const talked = info && info.phase === 'assistant';
+        delete aiRt[ccid];
+        sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
+          { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
+        if (talked) {
+          if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.CONTACTED`, { last_outcome: 'ai_contacted' }).catch(() => {});
+        } else {
+          // Never reached a human (no-answer/busy/ring-timeout). Machine was already
+          // marked above and removed from aiRt, so it won't reach this branch.
+          if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.IN_PROGRESS`,
+            { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+        }
+        console.log(`[ai] hangup ${ccid ? ccid.slice(-8) : '-'} (${talked ? 'talked' : 'no-answer'})`);
+        return;
+      }
+      return;   // ignore other AI-lane events (call.initiated, ai_assistant.*, etc.)
     }
 
     // ── Inbound call on one of our DIDs ────────────────────────────────────────
@@ -2357,6 +2518,7 @@ server.listen(PORT, async () => {
   console.log(`[boot] dialer: ${DIALER.lines_per_agent} line(s)/agent, ${DIALER.ring_secs}s ring`);
   console.log(`[boot] ai caller: ${AI.enabled ? 'ENABLED' : 'off'}, concurrency ${AI.concurrency}, ${AI.campaign_ids.length} campaign(s), assistant ${AI.assistant_id || '(none)'}`);
   setInterval(pacingTick, PACING_MS);
+  setInterval(aiPacingTick, PACING_MS);   // AI Cold Caller lane (independent of human agents)
   setInterval(reaperTick, 30 * 1000);
   setInterval(refreshCallerPool, 5 * 60 * 1000);
   setInterval(loadCallingWindow, 5 * 60 * 1000);
