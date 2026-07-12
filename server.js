@@ -147,7 +147,7 @@ async function loadDialerConfig() {
 //   campaign_ids       which campaigns the AI caller dials (opt-in, never all)
 // Sprint 1 only loads/serves this config; the pacer wiring lands in Sprint 2, so
 // toggling `enabled` here does NOT yet affect live human dialing.
-let AI = { enabled: false, concurrency: 5, assistant_id: '', voice: '', transfer_agent_ids: [], campaign_ids: [] };
+let AI = { enabled: false, concurrency: 5, assistant_id: '', voice: '', transfer_agent_ids: [], campaign_ids: [], did_numbers: [] };
 async function loadAiConfig() {
   if (!SB_HOST) return;
   try {
@@ -160,6 +160,7 @@ async function loadAiConfig() {
       voice: String(v.voice || '').trim(),
       transfer_agent_ids: Array.isArray(v.transfer_agent_ids) ? v.transfer_agent_ids.map(String) : [],
       campaign_ids: Array.isArray(v.campaign_ids) ? v.campaign_ids.map(String) : [],
+      did_numbers: Array.isArray(v.did_numbers) ? v.did_numbers.map(String) : [],
     };
   } catch (e) { console.error('[aiConfig]', e.message); }
 }
@@ -436,10 +437,14 @@ async function refreshCallerPool() {
     if (nums.length) CALLER_POOL = nums;
   } catch (e) { console.error('[callerPool]', e.message); }
 }
-function pickCallerId(preferredAreaCode) {
+function pickCallerId(preferredAreaCode, allow) {
+  // Optional allowlist (AI lane can be restricted to a chosen subset of DIDs).
+  // Fall back to the full pool if the allowlist matches nothing usable.
+  let base = (Array.isArray(allow) && allow.length) ? CALLER_POOL.filter(n => allow.includes(n)) : CALLER_POOL;
+  if (!base.length) base = CALLER_POOL;
   const inUse = new Set(Object.values(rt).map(s => s.fromNumber).filter(Boolean));
-  let candidates = CALLER_POOL.filter(n => !inUse.has(n));
-  if (!candidates.length) candidates = CALLER_POOL.slice();
+  let candidates = base.filter(n => !inUse.has(n));
+  if (!candidates.length) candidates = base.slice();
   // Local presence: prefer a DID whose area code matches the lead's.
   if (preferredAreaCode) {
     const local = candidates.filter(n => areaCodeOf(n) === preferredAreaCode);
@@ -1386,11 +1391,12 @@ app.put('/api/admin/settings/call-policy', auth, adminOnly, async (req, res) => 
 // agent lists so the UI can offer opt-in checkboxes. PUT validates + persists.
 app.get('/api/admin/settings/ai', auth, adminOnly, async (_req, res) => {
   try {
-    const [campaigns, agents] = await Promise.all([
+    const [campaigns, agents, dids] = await Promise.all([
       sbSelect('campaigns', 'select=id,name,active&order=created_at.desc').catch(() => []),
       sbSelect('agents', 'select=id,name,role&order=name.asc').catch(() => []),
+      sbSelect('dids', 'select=phone_number,state,area_code,active&active=eq.true&order=phone_number.asc').catch(() => []),
     ]);
-    res.json({ ...AI, campaigns: campaigns || [], agents: (agents || []).filter(a => a.role === 'agent' || a.role === 'admin') });
+    res.json({ ...AI, campaigns: campaigns || [], agents: (agents || []).filter(a => a.role === 'agent' || a.role === 'admin'), dids: dids || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.put('/api/admin/settings/ai', auth, adminOnly, async (req, res) => {
@@ -1404,6 +1410,7 @@ app.put('/api/admin/settings/ai', auth, adminOnly, async (req, res) => {
     voice: String(b.voice || '').trim(),
     transfer_agent_ids: Array.isArray(b.transfer_agent_ids) ? b.transfer_agent_ids.map(String) : [],
     campaign_ids: Array.isArray(b.campaign_ids) ? b.campaign_ids.map(String) : [],
+    did_numbers: Array.isArray(b.did_numbers) ? b.did_numbers.map(String) : [],
   };
   // Guard: can't enable AI dialing without an assistant to attach.
   if (value.enabled && !value.assistant_id)
@@ -1415,6 +1422,32 @@ app.put('/api/admin/settings/ai', auth, adminOnly, async (req, res) => {
     AI = value;
     audit(req.user, 'EDIT_AI', { target_type: 'settings', meta: { enabled: value.enabled, concurrency: value.concurrency, campaigns: value.campaign_ids.length } });
     res.json({ ok: true, ...AI });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// AI Call Results — live in-flight calls (from aiRt) + stored AI-lane calls with
+// the contact's name/address embedded from the leads table. 50 rows per page.
+// AI calls are the outbound calls with no human agent (agent_id is null).
+app.get('/api/admin/ai/calls', auth, adminOnly, async (req, res) => {
+  const page = Math.max(0, parseInt(req.query.page, 10) || 0);
+  const PER = 50;
+  const { from, to } = req.query;
+  // Live lane snapshot (server memory) — drives the "bot is calling now" panel.
+  const live = Object.entries(aiRt).map(([ccid, i]) => ({
+    ccid, phone: i.leadNumber, name: i.name, address: i.address,
+    phase: i.phase, campaign_id: i.campaignId, since: i.at,
+  })).sort((a, b) => a.since - b.since);
+  const f = [
+    'select=*,leads(first_name,last_name,address,state,phone,status)',
+    'agent_id=is.null', 'direction=eq.outbound',
+    'order=created_at.desc', `limit=${PER + 1}`, `offset=${page * PER}`,
+  ];
+  if (from) f.push(`created_at=gte.${encodeURIComponent(from)}`);
+  if (to)   f.push(`created_at=lte.${encodeURIComponent(to)}`);
+  try {
+    const rows = await sbSelect('calls', f.join('&'));
+    const hasMore = rows.length > PER;
+    res.json({ live, rows: rows.slice(0, PER), page, per: PER, hasMore });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2084,7 +2117,7 @@ async function dialAiLead(lead) {
       return;
     }
   } catch (e) { console.error('[dialAiLead:dnc]', e.message); }
-  const from = pickCallerId(areaCodeOf(lead.phone));
+  const from = pickCallerId(areaCodeOf(lead.phone), AI.did_numbers);
   const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ').trim() || 'there';
   const result = await telnyx('POST', '/calls', {
     connection_id: CONNECTION_ID,
