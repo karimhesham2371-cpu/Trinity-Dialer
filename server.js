@@ -1391,13 +1391,28 @@ app.put('/api/admin/settings/call-policy', auth, adminOnly, async (req, res) => 
 // agent lists so the UI can offer opt-in checkboxes. PUT validates + persists.
 app.get('/api/admin/settings/ai', auth, adminOnly, async (_req, res) => {
   try {
-    const [campaigns, agents, dids] = await Promise.all([
+    const [campaigns, agents] = await Promise.all([
       sbSelect('campaigns', 'select=id,name,active&order=created_at.desc').catch(() => []),
       sbSelect('agents', 'select=id,name,role&order=name.asc').catch(() => []),
-      sbSelect('dids', 'select=phone_number,state,area_code,active&active=eq.true&order=phone_number.asc').catch(() => []),
     ]);
-    res.json({ ...AI, campaigns: campaigns || [], agents: (agents || []).filter(a => a.role === 'agent' || a.role === 'admin'), dids: dids || [] });
+    res.json({ ...AI, campaigns: campaigns || [], agents: (agents || []).filter(a => a.role === 'agent' || a.role === 'admin'),
+      telnyx_numbers: telnyxNumberList() });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// The live outbound number pool, straight from the Telnyx Call-Control connection
+// (CALLER_POOL, refreshed on boot + every 5 min). This is the exact set the AI can
+// dial from, so the picker always mirrors Telnyx — no manual re-entry.
+function telnyxNumberList() {
+  return CALLER_POOL.map(n => {
+    const ac = areaCodeOf(n);
+    const d = (ac && deriveFromAreaCode(ac)) || {};
+    return { phone_number: n, area_code: ac, state: d.state || null };
+  });
+}
+// On-demand pull from Telnyx (the "Sync from Telnyx" button).
+app.post('/api/admin/settings/ai/refresh-numbers', auth, adminOnly, async (_req, res) => {
+  try { await refreshCallerPool(); res.json({ numbers: telnyxNumberList() }); }
+  catch (e) { res.status(502).json({ error: e.message }); }
 });
 app.put('/api/admin/settings/ai', auth, adminOnly, async (req, res) => {
   const b = req.body || {};

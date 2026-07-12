@@ -1598,40 +1598,76 @@ function aiTab(t){
 }
 
 // ── Controller: numbers, concurrency, campaigns, assistant ──
+function aiNumRows(list,sel){
+  if(!list||!list.length) return '<span class="dim">No numbers on your Telnyx connection. Attach numbers to the connection in Telnyx, then click Sync.</span>';
+  return list.map(d=>`<label class="airow"><input type="checkbox" class="aiDid" value="${esc(d.phone_number)}"${sel.has(d.phone_number)?' checked':''}> <span class="mono">${esc(d.phone_number)}</span>${d.state?` <span class="dim">(${esc(d.state)})</span>`:''}</label>`).join('');
+}
 async function renderAiController(){
-  let a={enabled:false,concurrency:5,assistant_id:'',voice:'',transfer_agent_ids:[],campaign_ids:[],did_numbers:[],campaigns:[],agents:[],dids:[]};
+  let a={enabled:false,concurrency:5,assistant_id:'',voice:'',transfer_agent_ids:[],campaign_ids:[],did_numbers:[],campaigns:[],agents:[],telnyx_numbers:[]};
   try{ a=await apiJson('/api/admin/settings/ai'); }catch(e){}
   const campSet=new Set(a.campaign_ids||[]), agSet=new Set(a.transfer_agent_ids||[]), didSet=new Set(a.did_numbers||[]);
   const campRows=(a.campaigns||[]).map(c=>`<label class="airow"><input type="checkbox" class="aiCamp" value="${c.id}"${campSet.has(c.id)?' checked':''}> ${esc(c.name)}${c.active?'':' <span class="dim">(inactive)</span>'}</label>`).join('')||'<span class="dim">No campaigns yet.</span>';
   const agRows=(a.agents||[]).map(g=>`<label class="airow"><input type="checkbox" class="aiAgent" value="${g.id}"${agSet.has(g.id)?' checked':''}> ${esc(g.name)} <span class="dim">(${esc(g.role)})</span></label>`).join('')||'<span class="dim">No users yet.</span>';
-  const didRows=(a.dids||[]).map(d=>`<label class="airow"><input type="checkbox" class="aiDid" value="${esc(d.phone_number)}"${didSet.has(d.phone_number)?' checked':''}> <span class="mono">${esc(d.phone_number)}</span>${d.state?` <span class="dim">(${esc(d.state)})</span>`:''}</label>`).join('')||'<span class="dim">No numbers yet — add them under Leads → Numbers.</span>';
   $('aiBody').innerHTML=`<div class="card" style="max-width:640px"><h2>AI Cold Caller — Controller</h2>
     <p class="dim" style="font-size:13px">The AI dials the selected campaigns as its own lane, independent of human agents. It attaches a Telnyx AI Assistant <b>only after a human answers and speaks back</b> — voicemails and silent pickups never start the meter.</p>
-    <div class="row mt3" style="align-items:center;gap:10px">
-      <label class="airow" style="font-weight:600"><input type="checkbox" id="aiEnabled"${a.enabled?' checked':''}> Enable AI dialing</label>
-      <span class="dim" style="font-size:12px">Live within ~60s of saving.</span>
+    <div class="row mt3" style="align-items:center;gap:12px">
+      <button class="btn ${a.enabled?'btn-danger':'btn-primary'}" id="aiToggle" style="min-width:150px;font-weight:600">${a.enabled?'■ Stop AI caller':'▶ Start AI caller'}</button>
+      <span id="aiState" class="stattag" style="color:${a.enabled?'var(--ok)':'var(--text-faint)'}">${a.enabled?'RUNNING':'stopped'}</span>
+      <span class="dim" style="font-size:12px">Start dials the checked campaigns; Stop halts the AI lane (~60s).</span>
     </div>
     <div class="row mt3" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
       <div class="fw"><span class="lbl">Max simultaneous AI calls (spend cap)</span><input id="aiConc" class="field" type="number" min="1" max="50" value="${a.concurrency}"></div>
       <div class="fw"><span class="lbl">Telnyx Assistant ID</span><input id="aiAsst" class="field" placeholder="assistant-xxxxxxxx" value="${esc(a.assistant_id||'')}"></div>
     </div>
     <div class="row mt3"><div class="fw" style="flex:1"><span class="lbl">Voice (informational)</span><input id="aiVoice" class="field" placeholder="e.g. Telnyx Ultra / ElevenLabs voice name" value="${esc(a.voice||'')}"></div></div>
-    <div class="mt3"><span class="lbl">Numbers the AI dials from</span><div class="aibox">${didRows}</div>
-      <p class="dim" style="font-size:11px;margin-top:4px">Pick which caller-ID numbers the AI rotates through. Leave all unchecked to use the full dialer pool.</p></div>
+    <div class="mt3"><div class="row" style="align-items:center;gap:8px"><span class="lbl" style="margin:0">Numbers the AI dials from</span>
+        <button class="btn btn-sm" id="aiSyncNums" style="height:26px;padding:0 10px;font-size:12px">↻ Sync from Telnyx</button></div>
+      <div class="aibox" id="aiNumBox" style="margin-top:6px">${aiNumRows(a.telnyx_numbers,didSet)}</div>
+      <p class="dim" style="font-size:11px;margin-top:4px">This list mirrors the numbers on your Telnyx connection — attach a number there and it appears here (Sync to pull immediately). Leave all unchecked to use every number in the pool.</p></div>
     <div class="mt3"><span class="lbl">Campaigns the AI dials</span><div class="aibox">${campRows}</div></div>
     <div class="mt3"><span class="lbl">Warm-transfer closers <span class="dim">(reserved — live transfer ships later)</span></span><div class="aibox">${agRows}</div></div>
     <div class="row mt3"><button class="btn btn-primary" id="aiSave">Save</button></div>
     <div id="aiMsg" class="dim mt3" style="font-size:12px"></div></div>`;
   enhanceAll($('aiBody'));
+  $('aiSyncNums').onclick=async()=>{
+    const keep=new Set([...document.querySelectorAll('.aiDid:checked')].map(c=>c.value));
+    const btn=$('aiSyncNums'); btn.disabled=true; btn.textContent='Syncing…';
+    try{ const j=await apiJson('/api/admin/settings/ai/refresh-numbers','POST',{});
+      $('aiNumBox').innerHTML=aiNumRows(j.numbers||[],keep);
+      toast(`Synced — ${(j.numbers||[]).length} number(s) on the connection`); }
+    catch(e){ toast(e.message,'err'); }
+    btn.disabled=false; btn.textContent='↻ Sync from Telnyx';
+  };
+  // current running state (drives the toggle button independent of Save)
+  let aiOn=!!a.enabled;
+  const gather=(enabled)=>({ enabled, concurrency:+$('aiConc').value,
+    assistant_id:$('aiAsst').value.trim(), voice:$('aiVoice').value.trim(),
+    campaign_ids:[...document.querySelectorAll('.aiCamp:checked')].map(c=>c.value),
+    did_numbers:[...document.querySelectorAll('.aiDid:checked')].map(c=>c.value),
+    transfer_agent_ids:[...document.querySelectorAll('.aiAgent:checked')].map(c=>c.value) });
+  const paintToggle=()=>{ const b=$('aiToggle'), s=$('aiState');
+    b.className='btn '+(aiOn?'btn-danger':'btn-primary');
+    b.textContent=aiOn?'■ Stop AI caller':'▶ Start AI caller';
+    s.textContent=aiOn?'RUNNING':'stopped'; s.style.color=aiOn?'var(--ok)':'var(--text-faint)'; };
   $('aiSave').onclick=async()=>{
-    const body={ enabled:$('aiEnabled').checked, concurrency:+$('aiConc').value,
-      assistant_id:$('aiAsst').value.trim(), voice:$('aiVoice').value.trim(),
-      campaign_ids:[...document.querySelectorAll('.aiCamp:checked')].map(c=>c.value),
-      did_numbers:[...document.querySelectorAll('.aiDid:checked')].map(c=>c.value),
-      transfer_agent_ids:[...document.querySelectorAll('.aiAgent:checked')].map(c=>c.value) };
-    try{ const j=await apiJson('/api/admin/settings/ai','PUT',body);
-      $('aiMsg').innerHTML=`<b style="color:var(--ok)">Saved — AI ${j.enabled?'enabled':'off'}, cap ${j.concurrency}, ${j.campaign_ids.length} campaign(s), ${(j.did_numbers||[]).length||'all'} number(s)</b>`; }
+    try{ const j=await apiJson('/api/admin/settings/ai','PUT',gather(aiOn));
+      aiOn=!!j.enabled; paintToggle();
+      $('aiMsg').innerHTML=`<b style="color:var(--ok)">Saved — AI ${j.enabled?'running':'stopped'}, cap ${j.concurrency}, ${j.campaign_ids.length} campaign(s), ${(j.did_numbers||[]).length||'all'} number(s)</b>`; }
     catch(e){ $('aiMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  };
+  $('aiToggle').onclick=async()=>{
+    const want=!aiOn;
+    if(want){
+      if(![...document.querySelectorAll('.aiCamp:checked')].length){ toast('Pick at least one campaign for the AI to dial','err'); return; }
+      if(!$('aiAsst').value.trim()){ toast('Enter the Telnyx Assistant ID first','err'); return; }
+    }
+    const b=$('aiToggle'); b.disabled=true; b.textContent=want?'Starting…':'Stopping…';
+    try{ const j=await apiJson('/api/admin/settings/ai','PUT',gather(want));
+      aiOn=!!j.enabled;
+      $('aiMsg').innerHTML=`<b style="color:var(--ok)">AI caller ${aiOn?`started on ${j.campaign_ids.length} campaign(s)`:'stopped'}</b>`;
+      toast(aiOn?'AI caller started':'AI caller stopped'); }
+    catch(e){ $('aiMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; toast(e.message,'err'); }
+    b.disabled=false; paintToggle();
   };
 }
 
