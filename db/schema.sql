@@ -159,6 +159,8 @@ alter table leads add column if not exists custom       jsonb not null default '
 alter table leads add column if not exists last_outcome text;    -- last disposition code / system outcome
 alter table leads add column if not exists max_attempts int;     -- per-lead override (else campaign rule)
 alter table leads add column if not exists area_code    text;    -- derived for local presence + tz
+alter table leads add column if not exists city         text;    -- property city (CSV column mapping)
+alter table leads add column if not exists zip          text;    -- property ZIP / postal (CSV column mapping)
 -- status now includes: NEW | IN_PROGRESS | CONTACTED | CALLBACK | MACHINE | NO_ANSWER
 --                      | BUSY | DONE | BAD_NUMBER | DNC | EXHAUSTED
 

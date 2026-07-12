@@ -652,14 +652,16 @@ app.delete('/api/admin/campaigns/:id/agents/:agentId', auth, adminOnly, async (r
 
 // ── CSV lead import (Sprint 1) ────────────────────────────────────────────────
 // Canonical lead fields the mapper can target (everything else → custom).
-const CANON_FIELDS = ['phone','first_name','last_name','address','state','source'];
+const CANON_FIELDS = ['first_name','last_name','phone','address','city','state','zip','source'];
 // Auto-suggest which CSV header maps to each canonical field.
 const HEADER_HINTS = {
   phone:      ['phone','number','phone_number','phone1','primary_phone','cell','mobile','tel'],
   first_name: ['first_name','firstname','first','fname','owner_first'],
   last_name:  ['last_name','lastname','last','lname','owner_last'],
   address:    ['address','street','property_address','addr','site_address'],
+  city:       ['city','property_city','town','municipality'],
   state:      ['state','st','property_state'],
+  zip:        ['zip','zipcode','zip_code','postal','postal_code','postcode','property_zip'],
   source:     ['source','lead_source','list'],
 };
 function suggestMapping(headers) {
@@ -691,7 +693,9 @@ function rowToLead(r, mapping, campaignId) {
     first_name: get('first_name') || r.first_name || r.firstname || r.first || null,
     last_name:  get('last_name')  || r.last_name  || r.lastname  || r.last  || null,
     address:    get('address') || r.address || null,
+    city:       get('city') || r.city || null,
     state:      (get('state') || r.state || derived.state || null),
+    zip:        get('zip') || r.zip || r.zipcode || r.postal || null,
     source:     get('source') || null,
     area_code:  ac,
     timezone:   derived.tz,
@@ -1729,7 +1733,7 @@ async function campaignConfig(id) {
 function mergeScript(script, lead) {
   if (!script) return '';
   const map = { first_name: lead.first_name, last_name: lead.last_name, phone: lead.phone,
-    address: lead.address, state: lead.state, ...(lead.custom || {}) };
+    address: lead.address, city: lead.city, state: lead.state, zip: lead.zip, ...(lead.custom || {}) };
   return script.replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, k) => (map[k] != null && map[k] !== '' ? map[k] : `—`));
 }
 
@@ -2133,7 +2137,12 @@ async function dialAiLead(lead) {
     }
   } catch (e) { console.error('[dialAiLead:dnc]', e.message); }
   const from = pickCallerId(areaCodeOf(lead.phone), AI.did_numbers);
+  // Cold-call greeting addresses the contact by FIRST name only.
+  const firstName = String(lead.first_name || '').trim() || 'there';
   const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ').trim() || 'there';
+  // Full property address from the mapped lead columns (street, city, state, zip).
+  const propertyAddress = [lead.address, lead.city, lead.state, lead.zip]
+    .map(x => String(x || '').trim()).filter(Boolean).join(', ');
   const result = await telnyx('POST', '/calls', {
     connection_id: CONNECTION_ID,
     to: lead.phone,
@@ -2146,7 +2155,8 @@ async function dialAiLead(lead) {
   const ccid = result.data && result.data.call_control_id;
   if (!ccid) return;
   aiRt[ccid] = { leadId: lead.id, leadNumber: lead.phone, fromNumber: from,
-    campaignId: lead.campaign_id, name, address: lead.address || '', phase: 'dialing', at: Date.now() };
+    campaignId: lead.campaign_id, name, firstName, address: propertyAddress || lead.address || '',
+    phase: 'dialing', at: Date.now() };
   await sbUpdate('leads', `id=eq.${lead.id}`,
     { status: 'IN_PROGRESS', attempts: (lead.attempts || 0) + 1, last_attempt_at: new Date().toISOString() })
     .catch(e => console.error('[dialAiLead:update]', e.message));
@@ -2161,7 +2171,11 @@ async function dialAiLead(lead) {
 async function startAiAssistant(ccid) {
   const info = aiRt[ccid];
   if (!info) return;
-  const dyn = { contact_name: info.name || 'there' };
+  // The bot addresses the contact by first name and asks about the property at
+  // the mapped address. contact_name is the FIRST name; property_address is the
+  // full street/city/state/zip from the campaign's uploaded lead list.
+  const dyn = { contact_name: info.firstName || info.name || 'there',
+    contact_first_name: info.firstName || 'there' };
   if (info.address) dyn.property_address = info.address;
   try {
     await telnyx('POST', `/calls/${ccid}/actions/ai_assistant_start`, {

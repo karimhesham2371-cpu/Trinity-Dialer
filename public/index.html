@@ -114,6 +114,20 @@
   .toast--err{border-left-color:var(--danger)}
   @keyframes fadein{from{opacity:0;transform:translateY(4px)}}
 
+  /* ── modal (import result popup) ── */
+  #modalBack{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:300;display:flex;
+             align-items:center;justify-content:center;animation:fadein .15s ease-out}
+  #modalBack.hidden{display:none}
+  .modal{background:var(--surface);border:1px solid var(--border-strong);border-radius:16px;
+         padding:22px 24px;max-width:420px;width:calc(100% - 40px);box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .modal h3{margin:0 0 4px;font-size:17px}
+  .modal .msub{color:var(--text-dim);font-size:13px;margin-bottom:16px}
+  .mstat{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;
+         border:1px solid var(--border-strong);border-radius:10px;margin-bottom:8px}
+  .mstat .mlbl{font-size:13px} .mstat .mval{font-weight:700;font-size:18px}
+  .mstat--ok{border-left:3px solid var(--ok)} .mstat--warn{border-left:3px solid var(--warn)}
+  .mstat--dnc{border-left:3px solid var(--danger)} .mstat--info{border-left:3px solid var(--info)}
+
   /* ── reconnect banner ── */
   .reconn{background:var(--warn-tint);color:var(--warn);border-bottom:1px solid var(--border-strong);
           font:500 12px var(--font-ui);padding:7px 18px;text-align:center}
@@ -477,6 +491,7 @@
 
 <audio id="remoteAudio" autoplay></audio>
 <div id="toasts"></div>
+<div id="modalBack" class="hidden"></div>
 <script src="https://unpkg.com/@telnyx/webrtc/lib/bundle.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -490,6 +505,20 @@ function log(m){ const el=$('log'); if(!el) return; el.textContent += (new Date(
 function toast(m,kind){ if(kind===true)kind='err'; kind=kind||'ok';
   const t=document.createElement('div'); t.className='toast toast--'+kind; t.textContent=m; $('toasts').appendChild(t); setTimeout(()=>t.remove(),4000); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// Centered modal popup. bodyHtml is trusted markup; caller escapes user data.
+function showModal(title,subtitle,bodyHtml,okLabel){
+  const back=$('modalBack');
+  back.innerHTML=`<div class="modal">
+    <h3>${esc(title)}</h3>${subtitle?`<div class="msub">${esc(subtitle)}</div>`:''}
+    ${bodyHtml||''}
+    <div class="row mt3" style="justify-content:flex-end"><button class="btn btn-primary" id="modalOk">${esc(okLabel||'Done')}</button></div>
+  </div>`;
+  back.classList.remove('hidden');
+  const close=()=>{ back.classList.add('hidden'); back.innerHTML=''; };
+  $('modalOk').onclick=close;
+  back.onclick=e=>{ if(e.target===back) close(); };
+  return close;
+}
 
 // ── custom select: replace native ──
 function enhanceSelect(sel){
@@ -1282,8 +1311,14 @@ async function ldPreview(f){
       try{
         const j2=await apiJson(`/api/admin/campaigns/${ldCampId}/leads`,'POST',{csv:text,filename:f.name,mapping:{fields}});
         $('ldImpMsg').innerHTML=`<b style="color:var(--ok)">${esc(j2.summary)}</b>`;
+        // Result popup: successful contacts, duplicates, DNC (+ invalid if any).
+        const stat=(cls,lbl,val)=>`<div class="mstat mstat--${cls}"><span class="mlbl">${lbl}</span><span class="mval">${val}</span></div>`;
+        let body=stat('ok','Contacts uploaded',j2.inserted)
+               + stat('warn','Duplicates skipped',j2.duplicates)
+               + stat('dnc','On DNC list — removed',j2.dnc_removed);
+        if(j2.invalid) body+=stat('info','Invalid numbers',j2.invalid);
+        showModal('Upload complete',`${esc(f.name)} · ${j2.total} rows processed`,body,'Done');
         if(j2.rejects_csv){ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([j2.rejects_csv],{type:'text/csv'})); a.download='rejects.csv'; a.textContent=' Download rejected numbers'; a.style.cssText='color:var(--danger);font-size:12px;margin-left:8px'; $('ldImpMsg').appendChild(a); }
-        toast(`${j2.inserted} leads imported`);
       }catch(e){ $('ldImpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; $('ldImport').disabled=false; }
     };
   }catch(e){ $('ldDzText').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
