@@ -1451,6 +1451,8 @@ app.get('/api/admin/ai/calls', auth, adminOnly, async (req, res) => {
   const page = Math.max(0, parseInt(req.query.page, 10) || 0);
   const PER = 50;
   const { from, to } = req.query;
+  const dmin = req.query.dmin != null && req.query.dmin !== '' ? Math.max(0, parseInt(req.query.dmin, 10) || 0) : null;
+  const dmax = req.query.dmax != null && req.query.dmax !== '' ? Math.max(0, parseInt(req.query.dmax, 10) || 0) : null;
   // Live lane snapshot (server memory) — drives the "bot is calling now" panel.
   const live = Object.entries(aiRt).map(([ccid, i]) => ({
     ccid, phone: i.leadNumber, name: i.name, address: i.address,
@@ -1463,6 +1465,9 @@ app.get('/api/admin/ai/calls', auth, adminOnly, async (req, res) => {
   ];
   if (from) f.push(`created_at=gte.${encodeURIComponent(from)}`);
   if (to)   f.push(`created_at=lte.${encodeURIComponent(to)}`);
+  // Duration filter — matches on call duration_sec (seconds). Keeps DB-side pagination correct.
+  if (dmin != null) f.push(`duration_sec=gte.${dmin}`);
+  if (dmax != null) f.push(`duration_sec=lte.${dmax}`);
   try {
     const rows = await sbSelect('calls', f.join('&'));
     const hasMore = rows.length > PER;
@@ -1552,6 +1557,58 @@ app.get('/api/admin/reports/agent', auth, adminOnly, async (req, res) => {
       return a;
     }).sort((x, y) => y.logged_in - x.logged_in);
     res.json({ from: new Date(from).toISOString(), to: new Date(to).toISOString(), rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Campaign analytics: disposition summary + call time, per campaign ──────────
+// Aggregates the dispositions table (grouped by code) and the calls table (time)
+// over [from,to], optionally scoped to one campaign. Powers the Analytics grid.
+const DISP_META = (() => {
+  const m = {};
+  for (const d of DEFAULT_DISPOSITIONS) m[d.code] = { label: d.label, color: d.color };
+  // Codes that arise from the system/AI lane (no agent disposition row) or extras.
+  m.MACHINE   = m.MACHINE   || { label: 'Answering Machine', color: '#a371f7' };
+  m.BUSY      = m.BUSY      || { label: 'Busy',              color: '#d29922' };
+  m.AI_CONTACTED = { label: 'AI — Contacted', color: '#2ea043' };
+  return m;
+})();
+const dispMeta = (code) => DISP_META[code] || { label: String(code || 'Unknown'), color: '#8b95a5' };
+
+app.get('/api/admin/analytics', auth, adminOnly, async (req, res) => {
+  const now = Date.now();
+  const from = req.query.from ? new Date(req.query.from).getTime() : new Date(new Date().toDateString()).getTime();
+  const to   = req.query.to   ? new Date(req.query.to).getTime()   : now;
+  const fromIso = new Date(from).toISOString(), toIso = new Date(to).toISOString();
+  const wantId = req.query.campaign_id && req.query.campaign_id !== 'all' ? String(req.query.campaign_id) : null;
+  try {
+    const campaigns = await sbSelect('campaigns', 'select=id,name,status,active&order=created_at.asc') || [];
+    const targets = wantId ? campaigns.filter(c => c.id === wantId) : campaigns;
+    const ids = targets.map(c => c.id);
+    const acc = {};
+    for (const c of targets) acc[c.id] = { campaign_id: c.id, name: c.name, status: c.status, active: c.active,
+      dials: 0, total_calls: 0, total_talk_sec: 0, avg_sec: 0, _codes: {} };
+
+    if (ids.length) {
+      const inList = ids.map(i => `"${i}"`).join(',');
+      const range = `&created_at=gte.${encodeURIComponent(fromIso)}&created_at=lte.${encodeURIComponent(toIso)}`;
+      const [disps, calls] = await Promise.all([
+        sbSelect('dispositions', `campaign_id=in.(${inList})${range}&select=campaign_id,code&limit=200000`),
+        sbSelect('calls', `campaign_id=in.(${inList})${range}&select=campaign_id,duration_sec,talk_seconds&limit=200000`),
+      ]);
+      for (const d of disps || []) { const a = acc[d.campaign_id]; if (!a) continue;
+        a.total_calls++; a._codes[d.code] = (a._codes[d.code] || 0) + 1; }
+      for (const c of calls || []) { const a = acc[c.campaign_id]; if (!a) continue;
+        a.dials++; a.total_talk_sec += (c.talk_seconds || c.duration_sec || 0); }
+    }
+    const summaries = Object.values(acc).map(a => {
+      a.avg_sec = a.total_calls ? Math.round(a.total_talk_sec / a.total_calls) : 0;
+      a.dispositions = Object.entries(a._codes)
+        .map(([code, count]) => ({ code, ...dispMeta(code), count,
+          pct: a.total_calls ? Math.round((count / a.total_calls) * 1000) / 10 : 0 }))
+        .sort((x, y) => y.count - x.count);
+      delete a._codes; return a;
+    });
+    res.json({ from: fromIso, to: toIso, campaigns, summaries });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

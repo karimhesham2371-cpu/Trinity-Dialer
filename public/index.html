@@ -128,6 +128,22 @@
   .mstat--ok{border-left:3px solid var(--ok)} .mstat--warn{border-left:3px solid var(--warn)}
   .mstat--dnc{border-left:3px solid var(--danger)} .mstat--info{border-left:3px solid var(--info)}
 
+  /* ── analytics (Console) ── */
+  .angrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:16px;align-items:start}
+  .ancard{background:var(--surface);border:1px solid var(--border-strong);border-radius:14px;padding:18px}
+  .ancard .anhead{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+  .ancard .anname{font:600 15px var(--font-ui)}
+  .anstats{display:flex;gap:10px;margin-bottom:14px}
+  .anstat{flex:1;border:1px solid var(--border-strong);border-radius:10px;padding:10px 12px}
+  .anstat .anv{font-weight:700;font-size:18px} .anstat .ank{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em}
+  table.antbl{width:100%;border-collapse:collapse;font-size:13px}
+  table.antbl th{text-align:left;color:var(--text-dim);font:500 11px var(--font-ui);text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;border-bottom:1px solid var(--border-strong)}
+  table.antbl td{padding:7px 8px;border-bottom:1px solid var(--border)}
+  table.antbl td:nth-child(2),table.antbl td:nth-child(3){text-align:right;font-variant-numeric:tabular-nums}
+  .andisp{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:8px;vertical-align:middle}
+  .antransport{display:flex;gap:6px;margin-top:14px}
+  .antransport .tbtn{flex:1;font-size:12px;padding:7px 0}
+
   /* ── reconnect banner ── */
   .reconn{background:var(--warn-tint);color:var(--warn);border-bottom:1px solid var(--border-strong);
           font:500 12px var(--font-ui);padding:7px 18px;text-align:center}
@@ -370,7 +386,7 @@
   <div class="appbar">
     <div class="brand"><div class="mark">T</div><h1>Trinity — Admin</h1></div>
     <div class="navtabs" style="margin-left:18px">
-      <button id="tabConsole" class="navtab active" onclick="adminTab('console')">Console</button>
+      <button id="tabConsole" class="navtab active" onclick="adminTab('console')">Analytics</button>
       <button id="tabLeads" class="navtab" onclick="adminTab('leads')">Leads</button>
       <button id="tabUsers" class="navtab" onclick="adminTab('users')">User management</button>
       <button id="tabReports" class="navtab" onclick="adminTab('reports')">Reports</button>
@@ -381,32 +397,17 @@
     <button class="btn btn-sm" onclick="logout()">Sign out</button>
   </div>
 
-  <div id="adminConsole" class="wrap">
-    <div class="grid2">
-      <div class="card">
-        <h2>Agents</h2>
-        <table id="usersTbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>State</th></tr></thead><tbody></tbody></table>
-        <div class="mt"><span class="lbl">Add agent</span></div>
-        <div class="row"><input id="uName" class="field" placeholder="Name" /><input id="uEmail" class="field" placeholder="Email or username" /></div>
-        <div class="row mt3">
-          <input id="uPass" class="field" placeholder="Password" />
-          <select id="uRole" class="field"><option value="agent">Agent</option><option value="admin">Admin</option></select>
-        </div>
-        <button id="btnAddUser" class="btn btn-primary btn-block mt3">Add agent</button>
-        <p id="uErr" class="err mt hidden"></p>
-      </div>
-      <div class="card">
-        <h2>New campaign</h2>
-        <label class="lbl">Campaign name</label>
-        <input id="cName" class="field" placeholder="e.g. Florida FSBO June" />
-        <button id="btnAddCamp" class="btn btn-primary btn-block mt3">Create campaign</button>
-        <p class="dim mt3" style="font-size:12px">After creating: assign agents, upload a lead CSV, then start.</p>
-      </div>
+  <div id="adminConsole" class="wrap wide">
+    <div class="row" style="align-items:flex-end;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+      <div class="fw" style="min-width:240px"><span class="lbl">Campaign</span><select id="anCamp" class="field"></select></div>
+      <div class="fw"><span class="lbl">Date</span><input id="anDate" class="field" type="date"></div>
+      <button id="anApply" class="btn btn-primary" style="height:36px">Apply</button>
+      <button id="anToday" class="btn btn-sm" style="height:36px">Today</button>
+      <button id="anRefresh" class="btn btn-sm" style="height:36px">↻ Refresh</button>
+      <div class="sp" style="flex:1"></div>
+      <span class="dim" id="anRange" style="font-size:12px"></span>
     </div>
-    <div class="card mt">
-      <h2>Campaigns</h2>
-      <div id="campList"></div>
-    </div>
+    <div id="anGrid" class="angrid"></div>
   </div>
 
   <div id="adminReports" class="wrap wide hidden">
@@ -884,29 +885,16 @@ document.addEventListener('keydown', e=>{
 });
 
 // ═══════════ ADMIN ═══════════
-async function loadAdmin(){ await Promise.all([loadUsers(), loadCampaigns()]); enhanceSelect($('uRole')); }
+async function loadAdmin(){ await loadUsers(); initAnalytics(); }
 async function loadUsers(){
   const j = await apiJson('/api/admin/users'); usersCache=j.users;
-  const tb=$('usersTbl').querySelector('tbody'); tb.innerHTML='';
+  const tb=$('usersTbl'); if(!tb) return;   // console no longer renders an agents table
+  const body=tb.querySelector('tbody'); if(!body) return; body.innerHTML='';
   j.users.forEach(u=>{ const tr=document.createElement('tr');
     const st=u.state||'OFFLINE'; const dotc={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',WRAP_UP:'warn',BREAK:'warn'}[st]||'faint';
     tr.innerHTML=`<td>${esc(u.name)}</td><td class="dim">${esc(u.email||'')}</td><td>${u.role}</td><td><span class="pill pill--${dotc}"><span class="dot dot--${dotc}"></span> ${st}</span></td>`;
-    tb.appendChild(tr); });
+    body.appendChild(tr); });
 }
-$('btnAddUser').onclick = async () => {
-  $('uErr').classList.add('hidden');
-  const body={ name:$('uName').value.trim(), email:$('uEmail').value.trim(), password:$('uPass').value, role:$('uRole').value };
-  if(!body.name||!body.email||!body.password){ $('uErr').textContent='Fill all fields.'; $('uErr').classList.remove('hidden'); return; }
-  $('btnAddUser').disabled=true; $('btnAddUser').textContent='Adding…';
-  try { await apiJson('/api/admin/users','POST',body); $('uName').value=$('uEmail').value=$('uPass').value=''; await loadUsers(); toast('Agent added'); }
-  catch(e){ $('uErr').textContent=e.message; $('uErr').classList.remove('hidden'); }
-  finally { $('btnAddUser').disabled=false; $('btnAddUser').textContent='Add agent'; }
-};
-$('btnAddCamp').onclick = async () => {
-  const name=$('cName').value.trim(); if(!name) return; $('btnAddCamp').disabled=true;
-  try { await apiJson('/api/admin/campaigns','POST',{name}); $('cName').value=''; await loadCampaigns(); toast('Campaign created'); }
-  catch(e){ toast(e.message,'err'); } finally { $('btnAddCamp').disabled=false; }
-};
 async function loadCampaigns(){
   const j = await apiJson('/api/admin/campaigns');
   const wrap=$('campList'); wrap.innerHTML='';
@@ -964,6 +952,70 @@ async function loadCampaigns(){
   });
 }
 
+// ═══════════ ADMIN: ANALYTICS (Console) ═══════════
+let anCampId='all', anFrom='', anTo='', anWired=false;
+function fmtHrs(sec){ sec=Math.max(0,Math.round(sec||0)); const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=sec%60;
+  if(h) return `${h}h ${m}m`; if(m) return `${m}m ${s}s`; return `${s}s`; }
+async function initAnalytics(){
+  if(!anWired){
+    anWired=true;
+    $('anApply').onclick=()=>{ const d=$('anDate').value;
+      if(d){ anFrom=new Date(d+'T00:00:00').toISOString(); const e=new Date(d+'T00:00:00'); e.setDate(e.getDate()+1); anTo=e.toISOString(); }
+      else { anFrom=''; anTo=''; } loadAnalytics(); };
+    $('anToday').onclick=()=>{ $('anDate').value=''; anFrom=''; anTo=''; loadAnalytics(); };
+    $('anRefresh').onclick=()=>loadAnalytics();
+    $('anCamp').onchange=()=>{ anCampId=$('anCamp').value||'all'; loadAnalytics(); };
+  }
+  await loadAnalytics();
+}
+async function loadAnalytics(){
+  const grid=$('anGrid'); grid.innerHTML='<p class="dim">Loading…</p>';
+  const qs=[]; qs.push('campaign_id='+encodeURIComponent(anCampId||'all'));
+  if(anFrom) qs.push('from='+encodeURIComponent(anFrom)); if(anTo) qs.push('to='+encodeURIComponent(anTo));
+  let j;
+  try{ j=await apiJson('/api/admin/analytics?'+qs.join('&')); }
+  catch(e){ grid.innerHTML=`<p class="err">${esc(e.message)}</p>`; return; }
+  // campaign selector (build once, then keep selection)
+  const sel=$('anCamp');
+  const opts='<option value="all">All campaigns</option>'+(j.campaigns||[]).map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('');
+  if(sel.dataset.sig!==opts){ sel.dataset.sig=opts; sel.innerHTML=opts; enhanceSelect(sel); }
+  sel.value=anCampId; syncCsel(sel);
+  // range label
+  const rl=anFrom? new Date(anFrom).toLocaleDateString() : 'Today';
+  $('anRange').textContent=`Showing: ${rl}`;
+  const list=j.summaries||[];
+  if(!list.length){ grid.innerHTML='<p class="dim">No campaigns to show.</p>'; return; }
+  grid.innerHTML=list.map(anCard).join('');
+  // wire lifecycle buttons
+  list.forEach(s=>{ const card=grid.querySelector(`[data-cmp="${s.campaign_id}"]`); if(!card) return;
+    card.querySelectorAll('[data-act]').forEach(b=>b.onclick=async()=>{
+      b.disabled=true; try{ await apiJson(`/api/admin/campaigns/${s.campaign_id}/${b.dataset.act}`,'POST',{}); toast(`Campaign ${b.dataset.act}`); loadAnalytics(); }
+      catch(e){ toast(e.message,'err'); b.disabled=false; } }); });
+}
+function anCard(s){
+  const STPILL={RUNNING:'ok',PAUSED:'warn',STOPPED:'faint',DRAFT:'faint'};
+  const stp=STPILL[s.status]||'faint';
+  const on={start:s.status==='RUNNING'?' on--ok':'',pause:s.status==='PAUSED'?' on--warn':'',stop:s.status==='STOPPED'?' on--danger':''};
+  const rows=(s.dispositions||[]).length
+    ? s.dispositions.map(d=>`<tr><td><span class="andisp" style="background:${esc(d.color)}"></span>${esc(d.label)}</td><td>${d.count}</td><td>${d.pct}%</td></tr>`).join('')
+    : `<tr><td colspan="3" class="dim">No dispositions in this period${s.dials?` · ${s.dials} dials placed`:''}.</td></tr>`;
+  return `<div class="ancard" data-cmp="${s.campaign_id}">
+    <div class="anhead"><span class="anname">${esc(s.name)}</span><span class="pill pill--${stp}">${esc(s.status||'—')}</span>
+      <span class="dim mono" style="margin-left:auto;font-size:12px">${s.dials} dials</span></div>
+    <div class="anstats">
+      <div class="anstat"><div class="anv">${s.total_calls}</div><div class="ank">Total Calls</div></div>
+      <div class="anstat"><div class="anv">${fmtHrs(s.total_talk_sec)}</div><div class="ank">Total Call Time</div></div>
+      <div class="anstat"><div class="anv">${fmtHrs(s.avg_sec)}</div><div class="ank">Avg Call Time</div></div>
+    </div>
+    <table class="antbl"><thead><tr><th>Disposition</th><th># of Calls</th><th>% of Total</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="antransport">
+      <button class="tbtn tbtn--ok${on.start}" data-act="start">▶ Start</button>
+      <button class="tbtn tbtn--warn${on.pause}" data-act="pause">⏸ Pause</button>
+      <button class="tbtn tbtn--danger${on.stop}" data-act="stop">⏹ Stop</button>
+      <button class="tbtn tbtn--faint" data-act="reset">↺ Reset</button></div>
+  </div>`;
+}
+
 // ═══════════ ADMIN: REPORTS ═══════════
 let adminWs=null, floorAgents=[], agentRepRows=[];
 const REPTITLES={audit:'Audit logs',calls:'Call logs',agent:'Agent report',research:'Research calls',map:'Office map'};
@@ -981,6 +1033,7 @@ function adminTab(which){
   $('tabAi').classList.toggle('active', which==='ai');
   if(which==='reports') closeReport(); else closeAdminWs();
   if(which!=='ai') stopAiResultsPoll();
+  if(which==='console') initAnalytics();
   if(which==='leads') initLeads();
   if(which==='users') initUsers();
   if(which==='ai') initAi();
@@ -1789,7 +1842,7 @@ async function renderAiController(){
 }
 
 // ── Call results: live activity + stored calls (50/page, date filter) ──
-let aiResPage=0, aiResFrom='', aiResTo='', aiResPollT=null;
+let aiResPage=0, aiResFrom='', aiResTo='', aiResDmin='', aiResDmax='', aiResPollT=null;
 function stopAiResultsPoll(){ if(aiResPollT){ clearInterval(aiResPollT); aiResPollT=null; } }
 function phaseTag(p){ return p==='assistant'
   ? '<span class="stattag" style="color:var(--ok)">talking</span>'
@@ -1798,6 +1851,15 @@ async function renderAiResults(){
   $('aiBody').innerHTML=`
     <div class="row" style="align-items:flex-end;gap:12px;margin-bottom:12px">
       <div class="fw"><span class="lbl">Date</span><input id="aiResDate" class="field" type="date"></div>
+      <div class="fw"><span class="lbl">Duration</span>
+        <select id="aiResDur" class="field">
+          <option value="">Any length</option>
+          <option value="0-30">Under 30s</option>
+          <option value="30-60">30s – 1m</option>
+          <option value="60-180">1m – 3m</option>
+          <option value="180-300">3m – 5m</option>
+          <option value="300-">Over 5m</option>
+        </select></div>
       <button id="aiResGo" class="btn btn-primary" style="height:36px">Apply</button>
       <button id="aiResClear" class="btn btn-sm" style="height:36px">All dates</button>
       <div class="sp" style="flex:1"></div>
@@ -1806,10 +1868,12 @@ async function renderAiResults(){
     <div id="aiLiveWrap"></div>
     <div id="aiResWrap"></div>
     <div class="row mt3" id="aiPager" style="align-items:center;gap:10px"></div>`;
+  const applyDur=()=>{ const v=$('aiResDur').value; if(v){ const [lo,hi]=v.split('-'); aiResDmin=lo||''; aiResDmax=hi||''; } else { aiResDmin=''; aiResDmax=''; } };
   $('aiResGo').onclick=()=>{ const d=$('aiResDate').value;
     if(d){ aiResFrom=new Date(d+'T00:00:00').toISOString(); const e=new Date(d+'T00:00:00'); e.setDate(e.getDate()+1); aiResTo=e.toISOString(); }
-    else { aiResFrom=''; aiResTo=''; } aiResPage=0; loadAiResults(); };
-  $('aiResClear').onclick=()=>{ $('aiResDate').value=''; aiResFrom=''; aiResTo=''; aiResPage=0; loadAiResults(); };
+    else { aiResFrom=''; aiResTo=''; } applyDur(); aiResPage=0; loadAiResults(); };
+  $('aiResDur').onchange=()=>{ applyDur(); aiResPage=0; loadAiResults(); };
+  $('aiResClear').onclick=()=>{ $('aiResDate').value=''; $('aiResDur').value=''; aiResFrom=''; aiResTo=''; aiResDmin=''; aiResDmax=''; aiResPage=0; loadAiResults(); };
   aiResPage=0; await loadAiResults();
   stopAiResultsPoll();
   aiResPollT=setInterval(()=>{ if(aiCurTab==='results' && !$('adminAi').classList.contains('hidden')) loadAiResults(true); }, 5000);
@@ -1817,6 +1881,7 @@ async function renderAiResults(){
 async function loadAiResults(quiet){
   const q=new URLSearchParams(); q.set('page',aiResPage);
   if(aiResFrom) q.set('from',aiResFrom); if(aiResTo) q.set('to',aiResTo);
+  if(aiResDmin!=='') q.set('dmin',aiResDmin); if(aiResDmax!=='') q.set('dmax',aiResDmax);
   if(!quiet && $('aiResWrap')) $('aiResWrap').innerHTML='<div class="dim" style="padding:16px">Loading…</div>';
   let j; try{ j=await apiJson('/api/admin/ai/calls?'+q.toString()); }
   catch(e){ if(!quiet && $('aiResWrap')) $('aiResWrap').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
