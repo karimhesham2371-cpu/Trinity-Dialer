@@ -1498,7 +1498,7 @@ app.get('/api/admin/ai/calls', auth, adminOnly, async (req, res) => {
     phase: i.phase, campaign_id: i.campaignId, since: i.at,
   })).sort((a, b) => a.since - b.since);
   const f = [
-    'select=*,leads(first_name,last_name,address,state,phone,status)',
+    'select=*,leads(first_name,last_name,address,state,phone,status,last_outcome)',
     'agent_id=is.null', 'direction=eq.outbound',
     'order=created_at.desc', `limit=${PER + 1}`, `offset=${page * PER}`,
   ];
@@ -2327,7 +2327,8 @@ async function startAiAssistant(ccid) {
   // the mapped address. contact_name is the FIRST name; property_address is the
   // full street/city/state/zip from the campaign's uploaded lead list.
   const dyn = { contact_name: info.firstName || info.name || 'there',
-    contact_first_name: info.firstName || 'there' };
+    contact_first_name: info.firstName || 'there',
+    call_control_id: ccid };   // templated into the end_call tool URL so results route back to this leg
   if (info.address) dyn.property_address = info.address;
   try {
     await telnyx('POST', `/calls/${ccid}/actions/ai_assistant_start`, {
@@ -2386,6 +2387,54 @@ async function pickInboundAgent(campaignId) {
   if (!candidates.length) return null;
   return candidates[Math.floor(Math.random() * candidates.length)];   // random rotation
 }
+
+// ══ AI RESULT TOOL WEBHOOK ═══════════════════════════════════════════════════════
+// The assistant's `end_call` tool posts the classified outcome here, then we fast-cut
+// the call to stop billing. Token-guarded like the main webhook. ccid arrives as ?cc=
+// (templated from the call_control_id dynamic variable). Body: { result, reason,
+// callback_hours }. We disposition the lead and set resultRecorded so the later
+// call.hangup handler won't overwrite it with the generic default.
+app.post('/webhooks/ai-result', async (req, res) => {
+  if (req.query.token !== WH_TOKEN) return res.sendStatus(403);
+  const ccid = req.query.cc || (req.body && req.body.call_control_id) || null;
+  const b = req.body || {};
+  const result = String(b.result || '').trim();
+  const reason = String(b.reason || '').slice(0, 500);
+  const cbHours = Number.isFinite(+b.callback_hours) && +b.callback_hours > 0 ? +b.callback_hours : 72;
+  res.json({ ok: true });   // ack immediately so the tool call resolves fast
+
+  const info = ccid ? aiRt[ccid] : null;
+  let leadId = info && info.leadId;
+  if (!leadId && ccid) {   // slot may have been reclaimed; recover leadId from the call row
+    try { const [row] = await sbSelect('calls', `telnyx_call_control_id=eq.${ccid}&select=lead_id&limit=1`); leadId = row && row.lead_id; }
+    catch {}
+  }
+  if (info) info.resultRecorded = true;
+
+  // Map the assistant's classification to lead state. No schema migration: everything
+  // lands on existing leads columns (status/last_outcome/next_callback_at/dnc).
+  let patch = null;
+  switch (result.toLowerCase()) {
+    case 'lead':
+      patch = { status: 'CONTACTED', last_outcome: 'lead' }; break;
+    case 'call back': case 'callback':
+      patch = { status: 'CALLBACK', last_outcome: 'callback',
+        next_callback_at: new Date(Date.now() + cbHours * 3600e3).toISOString() }; break;
+    case 'not interested': case 'not_interested':
+      patch = { status: 'CONTACTED', last_outcome: 'not_interested' }; break;
+    case 'voicemail':
+      patch = { status: 'NO_ANSWER', last_outcome: 'voicemail' }; break;
+    case 'bluffer': case 'troll':
+      patch = { status: 'DNC', dnc: true, last_outcome: 'bluffer' }; break;
+    default:
+      patch = { last_outcome: result ? result.toLowerCase().slice(0, 40) : 'unknown' };
+  }
+  if (leadId && patch) sbUpdate('leads', `id=eq.${leadId}`, patch).catch(e => console.error('[ai-result:lead]', e.message));
+  console.log(`[ai-result] ${ccid ? ccid.slice(-8) : '-'} result=${result || '-'} cb=${cbHours}h reason="${reason.slice(0, 60)}"`);
+
+  // Fast-cut: end the call now so trollers/voicemails/finished convos stop billing.
+  if (ccid) telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+});
 
 // ══ WEBHOOK + BRIDGE ═════════════════════════════════════════════════════════════
 app.post('/webhooks/telnyx', async (req, res) => {
@@ -2467,12 +2516,16 @@ app.post('/webhooks/telnyx', async (req, res) => {
         // column in the UI). Non-bridged (no-answer/machine) calls have 0s of talk.
         // Stored so the duration filter in AI Call Results has a column to match on.
         const talkSec = (info && info.bridgedAt) ? Math.max(0, Math.round((Date.now() - info.bridgedAt) / 1000)) : 0;
+        const resultRecorded = !!(info && info.resultRecorded);   // end_call tool already disposed this lead
         delete aiRt[ccid];
         endAiStream(ccid);   // tear down any live-listen fork + notify listeners
         sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
           { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null,
             duration_sec: talkSec, talk_seconds: talkSec }).catch(() => {});
-        if (talked) {
+        if (resultRecorded) {
+          // The assistant's end_call tool already wrote the definitive outcome to the
+          // lead; don't clobber it with the generic ai_contacted/no_answer default.
+        } else if (talked) {
           if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.CONTACTED`, { last_outcome: 'ai_contacted' }).catch(() => {});
         } else {
           // Never reached a human (no-answer/busy/ring-timeout). Machine was already

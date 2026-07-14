@@ -2005,9 +2005,21 @@ function renderAiStored(rows){
     <thead><tr><th style="width:26px"></th><th>Time</th><th>Contact</th><th>Phone</th><th>Result</th><th>Talk</th><th>Recording</th></tr></thead>
     <tbody>${rows.map((r,i)=>aiCallRow(r,i)).join('')}</tbody></table></div></div>`;
 }
+// Map the assistant's classified outcome (leads.last_outcome, written by the end_call
+// tool) to a coloured badge. Falls back to legacy amd/status when no outcome recorded.
+function aiOutcome(r,L){
+  const o=String((L&&L.last_outcome)||'').toLowerCase();
+  const M={lead:['Lead','#16a34a'], callback:['Call back','#d97706'],
+    not_interested:['Not interested','#6b7280'], voicemail:['Voicemail','#6b7280'],
+    bluffer:['Bluffer','#dc2626'], machine:['Voicemail','#6b7280'],
+    no_answer:['No answer','#9ca3af'], ai_contacted:['Talked','#2563eb']};
+  if(M[o]) return `<span style="color:${M[o][1]};font-weight:600">${M[o][0]}</span>`;
+  if(r.amd_result==='human') return 'Talked';
+  return esc((L&&L.status)||r.hangup_cause||'—');
+}
 function aiCallRow(r,i){
   const L=r.leads||{}; const name=[L.first_name,L.last_name].filter(Boolean).join(' ')||'—';
-  const res=r.amd_result==='human'?'Talked':(L.status||r.hangup_cause||'—');
+  const res=aiOutcome(r,L);
   const rec=(r.recording_id||r.recording_url)
     ?`<button class="btn btn-sm" onclick="listenRec(this,'${r.id}')">Listen</button> <button class="btn btn-sm" onclick="dlRec('${r.id}')">Download</button>`
     :'<span class="dim">—</span>';
@@ -2017,7 +2029,7 @@ function aiCallRow(r,i){
       <td class="dim" id="${det}-arw">▸</td>
       <td class="mono dim">${fmtTime(r.created_at)}</td>
       <td>${esc(name)}</td><td class="mono">${esc(r.to_number||L.phone||'—')}</td>
-      <td>${esc(res)}</td><td class="mono">${callTalk(r)}</td>
+      <td>${res}</td><td class="mono">${callTalk(r)}</td>
       <td onclick="event.stopPropagation()">${rec}</td></tr>
     <tr id="${det}" class="hidden"><td></td><td colspan="6">
       <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 24px;padding:10px 2px 12px;font-size:13px">
