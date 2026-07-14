@@ -2005,8 +2005,8 @@ function renderAiStored(rows){
 function aiCallRow(r,i){
   const L=r.leads||{}; const name=[L.first_name,L.last_name].filter(Boolean).join(' ')||'—';
   const res=r.amd_result==='human'?'Talked':(L.status||r.hangup_cause||'—');
-  const rec=r.recording_id
-    ?`<button class="btn btn-sm" onclick="listenRec(this,'${r.recording_id}')">Listen</button> <button class="btn btn-sm" onclick="dlRec('${r.recording_id}')">Download</button>`
+  const rec=(r.recording_id||r.recording_url)
+    ?`<button class="btn btn-sm" onclick="listenRec(this,'${r.id}')">Listen</button> <button class="btn btn-sm" onclick="dlRec('${r.id}')">Download</button>`
     :'<span class="dim">—</span>';
   const det=`ai-det-${i}`;
   const dt=(iso)=>iso?new Date(iso).toLocaleString([], {hour12:false,month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';

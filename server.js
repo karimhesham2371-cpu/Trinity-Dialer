@@ -1682,7 +1682,12 @@ app.get('/api/admin/reports/recording/:id/stream', auth, adminOnly, async (req, 
       return res.status(502).json({ error: `recording fetch ${upstream.status}` });
     }
     const download = req.query.download === '1';
-    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'audio/mpeg');
+    // Telnyx serves mp3 recordings as application/octet-stream, which some browsers
+    // refuse to play/scrub in an <audio> element. We record as mp3, so normalise a
+    // generic/missing upstream type to audio/mpeg.
+    let ctype = upstream.headers.get('content-type') || '';
+    if (!ctype || /octet-stream/i.test(ctype)) ctype = 'audio/mpeg';
+    res.setHeader('Content-Type', ctype);
     const len = upstream.headers.get('content-length'); if (len) res.setHeader('Content-Length', len);
     res.setHeader('Cache-Control', 'private, max-age=3600');
     if (download) {
