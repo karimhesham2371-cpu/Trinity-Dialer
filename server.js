@@ -1673,6 +1673,70 @@ app.get('/api/admin/reports/calls', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// CSV export of the call log — same filters as above, but every matching row
+// (no pagination) with full contact detail: owner, address, phone, result,
+// time, duration, agent, campaign, recording link.
+const CALL_RESULT_LABELS = {
+  sale: 'Sale / Appt', callback: 'Callback', not_interested: 'Not interested',
+  no_answer: 'No answer', voicemail: 'Voicemail', wrong_number: 'Wrong number',
+  dnc: 'Do not call', machine: 'Voicemail', busy: 'Busy',
+  lead: 'Lead', bluffer: 'Bluffer', ai_contacted: 'Talked', manual_hangup: 'Talked',
+};
+const csvCell = (v) => {
+  const s = v == null ? '' : String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const hhmmss = (secs) => {
+  if (secs == null || isNaN(secs) || secs < 0) return '';
+  const s = Math.round(secs), m = Math.floor(s / 60);
+  return `${m}:${String(s % 60).padStart(2, '0')}`;
+};
+app.get('/api/admin/reports/calls/export', auth, adminOnly, async (req, res) => {
+  const { from, to, agent_id, campaign_id } = req.query;
+  const dmin = req.query.dmin != null && req.query.dmin !== '' ? Math.max(0, parseInt(req.query.dmin, 10) || 0) : null;
+  const dmax = req.query.dmax != null && req.query.dmax !== '' ? Math.max(0, parseInt(req.query.dmax, 10) || 0) : null;
+  const result = String(req.query.result || '').trim().toLowerCase();
+  const join = result && result !== 'all' ? 'leads!inner' : 'leads';
+  const f = [
+    `select=*,${join}(first_name,last_name,address,state,phone,status,last_outcome),campaigns(name)`,
+    'agent_id=not.is.null', 'order=created_at.desc', 'limit=50000',
+  ];
+  if (from)        f.push(`created_at=gte.${encodeURIComponent(from)}`);
+  if (to)          f.push(`created_at=lte.${encodeURIComponent(to)}`);
+  if (agent_id)    f.push(`agent_id=eq.${agent_id}`);
+  if (campaign_id) f.push(`campaign_id=eq.${campaign_id}`);
+  if (dmin != null) f.push(`duration_sec=gte.${dmin}`);
+  if (dmax != null) f.push(`duration_sec=lte.${dmax}`);
+  if (result && result !== 'all') {
+    if (result === 'no_answer') f.push('leads.or=(last_outcome.ilike.no_answer,last_outcome.ilike.machine,last_outcome.ilike.busy)');
+    else f.push(`leads.last_outcome=ilike.${encodeURIComponent(result)}`);
+  }
+  try {
+    const [rows, names] = await Promise.all([sbSelect('calls', f.join('&')), agentNameMap()]);
+    const head = ['Time', 'Owner', 'Phone', 'Result', 'Agent', 'Campaign', 'State',
+      'Property Address', 'Called From', 'Talk', 'Duration (s)', 'Lead Status',
+      'Started', 'Ended', 'Recording URL'];
+    const lines = [head.join(',')];
+    for (const r of rows) {
+      const L = r.leads || {};
+      const owner = [L.first_name, L.last_name].filter(Boolean).join(' ');
+      const oc = String(L.last_outcome || '').toLowerCase();
+      const resLabel = CALL_RESULT_LABELS[oc] || (r.amd_result === 'human' ? 'Talked' : (L.status || r.hangup_cause || ''));
+      const talk = (r.bridged_at && r.ended_at) ? hhmmss((new Date(r.ended_at) - new Date(r.bridged_at)) / 1000) : '';
+      lines.push([
+        r.created_at, owner, r.to_number || L.phone || '', resLabel,
+        names[r.agent_id] || '', (r.campaigns && r.campaigns.name) || '', L.state || '',
+        L.address || '', r.from_number || '', talk, r.duration_sec != null ? r.duration_sec : '',
+        L.status || '', r.created_at || '', r.ended_at || '', r.recording_url || '',
+      ].map(csvCell).join(','));
+    }
+    audit(req.user, 'EXPORT_CALL_LOGS', { target_type: 'calls', meta: { count: rows.length } });
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="call-logs.csv"');
+    res.send(lines.join('\r\n'));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // 3) Research Calls — find calls by phone number (matches either leg).
 app.get('/api/admin/reports/research', auth, adminOnly, async (req, res) => {
   const digits = String(req.query.phone || '').replace(/[^\d]/g, '');

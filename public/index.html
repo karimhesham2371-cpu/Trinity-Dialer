@@ -1084,7 +1084,7 @@ function adminTab(which){
 function closeReport(){ $('repPanel').classList.add('hidden'); $('repHome').classList.remove('hidden'); closeAdminWs(); }
 function openReport(kind){
   $('repHome').classList.add('hidden'); $('repPanel').classList.remove('hidden');
-  $('repTitle').textContent=REPTITLES[kind]||''; $('repExport').classList.toggle('hidden', kind!=='agent');
+  $('repTitle').textContent=REPTITLES[kind]||''; $('repExport').classList.toggle('hidden', kind!=='agent'&&kind!=='calls');
   $('repFilters').innerHTML=''; $('repBody').innerHTML='';
   if(kind!=='map') closeAdminWs();
   ({audit:initAudit,calls:initCalls,agent:initAgent,research:initResearch,map:renderMap}[kind]||(()=>{}))();
@@ -1260,20 +1260,40 @@ async function initCalls(){
   $('clGo').onclick=reload;
   ['clAgent','clCamp','clDur','clResult'].forEach(id=>{ const el=$(id); if(el) el.onchange=reload; });
   $('clClear').onclick=()=>{ ['clDate','clAgent','clCamp','clDur','clResult'].forEach(id=>{ const el=$(id); if(el) el.value=''; }); clPage=0; loadCalls(); };
+  $('repExport').onclick=exportCallLogsCsv;
   loadCalls();
 }
-async function loadCalls(){
-  const q=new URLSearchParams(); q.set('page',clPage);
+// Shared filter → query string (used by both the paged view and the CSV export).
+function clFilterParams(){
+  const q=new URLSearchParams();
   const d=$('clDate')&&$('clDate').value;
   if(d){ q.set('from',new Date(d+'T00:00:00').toISOString()); const e=new Date(d+'T00:00:00'); e.setDate(e.getDate()+1); q.set('to',e.toISOString()); }
   const ag=$('clAgent')&&$('clAgent').value; if(ag) q.set('agent_id',ag);
   const cp=$('clCamp')&&$('clCamp').value; if(cp) q.set('campaign_id',cp);
   const dur=$('clDur')&&$('clDur').value; if(dur){ const [lo,hi]=dur.split('-'); if(lo) q.set('dmin',lo); if(hi) q.set('dmax',hi); }
   const rs=$('clResult')&&$('clResult').value; if(rs) q.set('result',rs);
+  return q;
+}
+async function loadCalls(){
+  const q=clFilterParams(); q.set('page',clPage);
   $('repBody').innerHTML='<div class="dim" style="padding:16px">Loading…</div>';
   let j; try{ j=await apiJson('/api/admin/reports/calls?'+q.toString()); }
   catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
   renderClStored(j.rows||[], j);
+}
+// Export the FULL filtered result set (all pages) to CSV with complete contact detail.
+async function exportCallLogsCsv(){
+  const btn=$('repExport'); const q=clFilterParams();
+  btn.disabled=true; const label=btn.textContent; btn.textContent='Exporting…';
+  try{
+    const r=await api('/api/admin/reports/calls/export?'+q.toString());
+    if(!r.ok){ let m='Export failed'; try{ m=(await r.json()).error||m; }catch(e){} throw new Error(m); }
+    const txt=await r.text();
+    const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([txt],{type:'text/csv'}));
+    a.download='call-logs-'+dstr(new Date())+'.csv'; a.click(); URL.revokeObjectURL(a.href);
+    toast('Call logs exported');
+  }catch(e){ toast(e.message||'Export failed','err'); }
+  btn.disabled=false; btn.textContent=label;
 }
 function renderClStored(rows, j){
   if(!rows.length){ $('repBody').innerHTML='<div class="empty">No calls match these filters.</div>'; return; }
