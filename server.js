@@ -2681,7 +2681,10 @@ async function reaperTick() {
 const server = http.createServer(app);
 
 // WebSocket gateway: /ws?token=<jwt>. Auth via the same JWT as the REST API.
-const wss = new WebSocketServer({ server, path: '/ws' });
+// All three WS servers run in noServer mode and share ONE upgrade router below —
+// attaching multiple { server, path } WSS to one HTTP server makes each non-matching
+// server abortHandshake() the socket, which would kill the others' connections.
+const wss = new WebSocketServer({ noServer: true });
 wss.on('connection', (ws, req) => {
   let user = null;
   try {
@@ -2709,7 +2712,7 @@ setInterval(() => { for (const c of wsClients) { try { c.ws.ping(); } catch {} }
 // audio as JSON frames: {event:'media', media:{track, payload:<base64 μ-law 8k>}}.
 // We prefix each payload with a track byte (0=inbound/contact, 1=outbound/AI) and
 // relay the raw μ-law bytes as a binary frame to every browser listening to this call.
-const mediaWss = new WebSocketServer({ server, path: '/telnyx-media' });
+const mediaWss = new WebSocketServer({ noServer: true });
 mediaWss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://x');
   const ccid = url.searchParams.get('ccid');
@@ -2733,7 +2736,7 @@ mediaWss.on('connection', (ws, req) => {
 // ── Live AI audio: admin browser egress ──────────────────────────────────────────
 // Admin opens /ws/ai-listen?token=<jwt>&ccid=<ccid> to hear a live AI call. First
 // listener triggers the Telnyx fork; last listener leaving stops it.
-const listenWss = new WebSocketServer({ server, path: '/ws/ai-listen' });
+const listenWss = new WebSocketServer({ noServer: true });
 listenWss.on('connection', async (ws, req) => {
   const url = new URL(req.url, 'http://x');
   let user; try { user = jwt.verify(url.searchParams.get('token'), JWT_SECRET); } catch { ws.close(4001, 'unauthorized'); return; }
@@ -2758,6 +2761,19 @@ listenWss.on('connection', async (ws, req) => {
     else if (s.listeners.size === 0) aiStreams.delete(ccid);
   });
   ws.on('error', () => {});
+});
+
+// Single upgrade router: pick the right WS server by pathname, or drop the socket.
+server.on('upgrade', (req, socket, head) => {
+  let pathname;
+  try { pathname = new URL(req.url, 'http://x').pathname; }
+  catch { socket.destroy(); return; }
+  const target = pathname === '/ws' ? wss
+    : pathname === '/telnyx-media' ? mediaWss
+    : pathname === '/ws/ai-listen' ? listenWss
+    : null;
+  if (!target) { socket.destroy(); return; }
+  target.handleUpgrade(req, socket, head, (ws) => target.emit('connection', ws, req));
 });
 
 server.listen(PORT, async () => {
