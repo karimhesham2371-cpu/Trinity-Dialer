@@ -15,6 +15,7 @@
 const express = require('express');
 const http    = require('http');
 const path    = require('path');
+const crypto  = require('crypto');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const { WebSocketServer } = require('ws');
@@ -38,6 +39,9 @@ const SB_KEY             = env('SUPABASE_KEY');
 const DEFAULT_FROM       = env('DEFAULT_FROM', '+19168850241');
 const JWT_SECRET         = env('JWT_SECRET', 'trinity-dev-secret-change-me');
 const PACING_MS          = Number(process.env.PACING_MS || 3000);
+// Public hostname used to build the wss:// URL Telnyx forks live AI-call audio to.
+// Render injects RENDER_EXTERNAL_HOSTNAME automatically; override with PUBLIC_HOST if needed.
+const PUBLIC_HOST        = env('PUBLIC_HOST', process.env.RENDER_EXTERNAL_HOSTNAME || '');
 const CALLER_IDS_ENV     = (process.env.CALLER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 const TELNYX_BASE = 'https://api.telnyx.com/v2';
@@ -170,6 +174,41 @@ async function loadAiConfig() {
 //   phase: 'dialing' (ringing / pre-answer) | 'assistant' (assistant attached).
 // The size of this map is the live spend; AI.concurrency is the hard ceiling.
 const aiRt = {};
+
+// ── Live AI-call audio monitoring ────────────────────────────────────────────────
+// aiStreams: ccid -> { listeners:Set<ws browser>, telnyxWs, starting }. On the first
+// admin listener we ask Telnyx to fork the call's audio (both legs) to /telnyx-media
+// as a WebSocket; each media frame is relayed to the listeners, who decode + play it
+// in the browser. On the last listener leaving (or call hangup) we stop the fork so
+// media streaming only costs money while someone is actually listening.
+const aiStreams = new Map();
+// Signed per-call key so only Telnyx (using the URL we handed it) can push audio.
+function streamKey(ccid) {
+  return crypto.createHmac('sha256', JWT_SECRET).update('aistream:' + ccid).digest('hex').slice(0, 24);
+}
+async function startAiStream(ccid) {
+  if (!PUBLIC_HOST) throw new Error('PUBLIC_HOST not set — cannot build media stream URL');
+  const url = `wss://${PUBLIC_HOST}/telnyx-media?ccid=${encodeURIComponent(ccid)}&k=${streamKey(ccid)}`;
+  await telnyx('POST', `/calls/${ccid}/actions/streaming_start`,
+    { stream_url: url, stream_track: 'both_tracks' });
+  console.log(`[ai-listen] fork started ${ccid.slice(-8)}`);
+}
+// Listener-initiated stop: call is still live, so tell Telnyx to stop forking.
+async function stopAiStream(ccid) {
+  const st = aiStreams.get(ccid);
+  aiStreams.delete(ccid);
+  if (st && st.telnyxWs) { try { st.telnyxWs.close(); } catch {} }
+  try { await telnyx('POST', `/calls/${ccid}/actions/streaming_stop`, {}); } catch {}
+  console.log(`[ai-listen] fork stopped ${ccid.slice(-8)}`);
+}
+// Call ended: notify + close listeners; the fork dies with the call.
+function endAiStream(ccid) {
+  const st = aiStreams.get(ccid);
+  if (!st) return;
+  aiStreams.delete(ccid);
+  for (const l of st.listeners) { try { l.send(JSON.stringify({ event: 'ended' })); l.close(); } catch {} }
+  if (st.telnyxWs) { try { st.telnyxWs.close(); } catch {} }
+}
 
 // ── Telnyx REST ───────────────────────────────────────────────────────────────
 async function telnyx(method, endpoint, body) {
@@ -2409,6 +2448,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
       if (event === 'call.hangup') {
         const talked = info && info.phase === 'assistant';
         delete aiRt[ccid];
+        endAiStream(ccid);   // tear down any live-listen fork + notify listeners
         sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
           { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
         if (talked) {
@@ -2663,6 +2703,62 @@ wss.on('connection', (ws, req) => {
 });
 // Heartbeat: drop dead sockets.
 setInterval(() => { for (const c of wsClients) { try { c.ws.ping(); } catch {} } }, 30 * 1000);
+
+// ── Live AI audio: Telnyx media fork ingress ─────────────────────────────────────
+// Telnyx connects here (URL we handed it in streaming_start) and streams the call's
+// audio as JSON frames: {event:'media', media:{track, payload:<base64 μ-law 8k>}}.
+// We prefix each payload with a track byte (0=inbound/contact, 1=outbound/AI) and
+// relay the raw μ-law bytes as a binary frame to every browser listening to this call.
+const mediaWss = new WebSocketServer({ server, path: '/telnyx-media' });
+mediaWss.on('connection', (ws, req) => {
+  const url = new URL(req.url, 'http://x');
+  const ccid = url.searchParams.get('ccid');
+  const st = ccid && aiStreams.get(ccid);
+  if (!st || url.searchParams.get('k') !== streamKey(ccid)) { ws.close(4003, 'forbidden'); return; }
+  st.telnyxWs = ws;
+  ws.on('message', (data) => {
+    let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
+    if (msg.event === 'media' && msg.media && msg.media.payload) {
+      const track = msg.media.track === 'outbound' ? 1 : 0;
+      const pcm = Buffer.from(msg.media.payload, 'base64');
+      const frame = Buffer.concat([Buffer.from([track]), pcm]);
+      const s = aiStreams.get(ccid);
+      if (s) for (const l of s.listeners) { if (l.readyState === 1) { try { l.send(frame); } catch {} } }
+    }
+  });
+  ws.on('close', () => { const s = aiStreams.get(ccid); if (s && s.telnyxWs === ws) s.telnyxWs = null; });
+  ws.on('error', () => {});
+});
+
+// ── Live AI audio: admin browser egress ──────────────────────────────────────────
+// Admin opens /ws/ai-listen?token=<jwt>&ccid=<ccid> to hear a live AI call. First
+// listener triggers the Telnyx fork; last listener leaving stops it.
+const listenWss = new WebSocketServer({ server, path: '/ws/ai-listen' });
+listenWss.on('connection', async (ws, req) => {
+  const url = new URL(req.url, 'http://x');
+  let user; try { user = jwt.verify(url.searchParams.get('token'), JWT_SECRET); } catch { ws.close(4001, 'unauthorized'); return; }
+  if (user.role !== 'admin') { ws.close(4003, 'forbidden'); return; }
+  const ccid = url.searchParams.get('ccid');
+  if (!ccid || !aiRt[ccid]) { try { ws.send(JSON.stringify({ event: 'error', error: 'call is not live' })); } catch {} ws.close(); return; }
+  let st = aiStreams.get(ccid);
+  if (!st) { st = { listeners: new Set(), telnyxWs: null, starting: false }; aiStreams.set(ccid, st); }
+  st.listeners.add(ws);
+  try { ws.send(JSON.stringify({ event: 'ready', sampleRate: 8000, codec: 'PCMU' })); } catch {}
+  if (!st.telnyxWs && !st.starting) {
+    st.starting = true;
+    try { await startAiStream(ccid); }
+    catch (e) { try { ws.send(JSON.stringify({ event: 'error', error: e.message })); } catch {} }
+    finally { const s = aiStreams.get(ccid); if (s) s.starting = false; }
+  }
+  ws.on('close', () => {
+    const s = aiStreams.get(ccid);
+    if (!s) return;
+    s.listeners.delete(ws);
+    if (s.listeners.size === 0 && aiRt[ccid]) stopAiStream(ccid);   // call still live → stop the fork
+    else if (s.listeners.size === 0) aiStreams.delete(ccid);
+  });
+  ws.on('error', () => {});
+});
 
 server.listen(PORT, async () => {
   console.log(`Trinity Dialer (phase0) listening on :${PORT}`);

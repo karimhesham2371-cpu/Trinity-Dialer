@@ -576,7 +576,8 @@ async function apiJson(path, method='GET', body){
 
 function show(view){ ['Login','Agent','Admin'].forEach(v=>$('view'+v).classList.toggle('hidden', v.toLowerCase()!==view)); }
 function logout(){ localStorage.removeItem('trinity_token'); localStorage.removeItem('trinity_user'); TOKEN=''; USER=null;
-  if(ws){try{ws.close();}catch{}} if(client){try{client.disconnect();}catch{}} if(timerInt)clearInterval(timerInt); show('login'); }
+  if(ws){try{ws.close();}catch{}} if(client){try{client.disconnect();}catch{}} if(timerInt)clearInterval(timerInt);
+  if(typeof stopLiveListen==='function') stopLiveListen(); show('login'); }
 
 // ── Login ──
 $('btnLogin').onclick = async () => {
@@ -1881,7 +1882,7 @@ async function renderAiController(){
 
 // ── Call results: live activity + stored calls (50/page, date filter) ──
 let aiResPage=0, aiResFrom='', aiResTo='', aiResDmin='', aiResDmax='', aiResPollT=null;
-function stopAiResultsPoll(){ if(aiResPollT){ clearInterval(aiResPollT); aiResPollT=null; } }
+function stopAiResultsPoll(){ if(aiResPollT){ clearInterval(aiResPollT); aiResPollT=null; } if(liveTickT){ clearInterval(liveTickT); liveTickT=null; } if(typeof stopLiveListen==='function') stopLiveListen(); }
 function phaseTag(p){ return p==='assistant'
   ? '<span class="stattag" style="color:var(--ok)">talking</span>'
   : '<span class="stattag" style="color:var(--info)">dialing</span>'; }
@@ -1935,15 +1936,64 @@ async function loadAiResults(quiet){
   if($('aiPrev')) $('aiPrev').onclick=()=>{ if(aiResPage>0){ aiResPage--; loadAiResults(); } };
   if($('aiNext')) $('aiNext').onclick=()=>{ if(j.hasMore){ aiResPage++; loadAiResults(); } };
 }
+let aiLastLive=[];
 function renderAiLive(live){
+  aiLastLive=live||[];
   const pill=$('aiLivePill'); if(pill) pill.innerHTML=`<span class="dot dot--${live.length?'ok':'faint'}"></span> ${live.length} live call${live.length===1?'':'s'}`;
   const wrap=$('aiLiveWrap'); if(!wrap) return;
+  // Keep listening to a call whose ccid dropped off the live list? It ended — stop.
+  if(liveListen && !live.some(l=>l.ccid===liveListen.ccid)) stopLiveListen();
   if(!live.length){ wrap.innerHTML=''; return; }
   wrap.innerHTML=`<div class="card" style="margin-bottom:12px"><h2>Live now</h2><div class="tblwrap"><table>
-    <thead><tr><th>Contact</th><th>Phone</th><th>Property</th><th>Status</th><th>Elapsed</th></tr></thead>
-    <tbody>${live.map(l=>`<tr><td>${esc(l.name||'—')}</td><td class="mono">${esc(l.phone||'—')}</td>
+    <thead><tr><th>Contact</th><th>Phone</th><th>Property</th><th>Status</th><th>Elapsed</th><th>Monitor</th></tr></thead>
+    <tbody>${live.map(l=>{
+      const on=liveListen&&liveListen.ccid===l.ccid;
+      const btn=l.ccid?`<button class="btn btn-sm${on?' btn-danger':''}" onclick="aiLiveListen('${esc(l.ccid)}')">${on?'■ Stop':'▶ Listen'}</button>`:'<span class="dim">—</span>';
+      return `<tr><td>${esc(l.name||'—')}</td><td class="mono">${esc(l.phone||'—')}</td>
       <td>${esc(l.address||'—')}</td><td>${phaseTag(l.phase)}</td>
-      <td class="mono dim">${fmtDur((Date.now()-l.since)/1000)}</td></tr>`).join('')}</tbody></table></div></div>`;
+      <td class="mono dim" data-live-since="${l.since}">${fmtDur((Date.now()-l.since)/1000)}</td>
+      <td>${btn}</td></tr>`;}).join('')}</tbody></table></div></div>`;
+  if(!liveTickT) liveTickT=setInterval(tickLiveElapsed,1000);
+}
+function tickLiveElapsed(){
+  const cells=document.querySelectorAll('#aiLiveWrap [data-live-since]');
+  if(!cells.length){ clearInterval(liveTickT); liveTickT=null; return; }
+  cells.forEach(c=>{ const s=Number(c.getAttribute('data-live-since'))||Date.now(); c.textContent=fmtDur((Date.now()-s)/1000); });
+}
+// ── Live AI call audio monitoring (Telnyx media fork → μ-law → Web Audio) ──
+let liveListen=null, liveTickT=null;
+function ulawDecode(u){ u=~u&0xff; const sign=u&0x80, exp=(u&0x70)>>4, mant=u&0x0f;
+  let mag=((mant<<3)+0x84)<<exp; mag-=0x84; return sign?-mag:mag; }
+function aiLiveListen(ccid){
+  if(liveListen){ const same=liveListen.ccid===ccid; stopLiveListen(); if(same) return; }
+  let ctx; try{ ctx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ toast('Audio not supported','err'); return; }
+  const gain=ctx.createGain(); gain.gain.value=1.0; gain.connect(ctx.destination);
+  const proto=location.protocol==='https:'?'wss':'ws';
+  const ws=new WebSocket(proto+'://'+location.host+'/ws/ai-listen?token='+encodeURIComponent(TOKEN)+'&ccid='+encodeURIComponent(ccid));
+  ws.binaryType='arraybuffer';
+  const sched={0:{next:0},1:{next:0}};   // one playhead per leg; destination mixes them
+  ws.onmessage=(ev)=>{
+    if(typeof ev.data==='string'){ let m={}; try{m=JSON.parse(ev.data);}catch{}
+      if(m.event==='error'){ toast(m.error||'Live audio error','err'); stopLiveListen(); }
+      else if(m.event==='ended'){ toast('Call ended','info'); stopLiveListen(); }
+      return; }
+    const b=new Uint8Array(ev.data); if(b.length<2) return;
+    const track=b[0]===1?1:0, n=b.length-1, f=new Float32Array(n);
+    for(let i=0;i<n;i++) f[i]=ulawDecode(b[i+1])/32768;
+    const buf=ctx.createBuffer(1,n,8000); buf.getChannelData(0).set(f);
+    const src=ctx.createBufferSource(); src.buffer=buf; src.connect(gain);
+    const s=sched[track], t=Math.max(ctx.currentTime+0.12,s.next); src.start(t); s.next=t+n/8000;
+  };
+  ws.onclose=()=>{ if(liveListen&&liveListen.ws===ws) stopLiveListen(); };
+  ws.onerror=()=>{};
+  liveListen={ccid,ws,ctx,gain};
+  renderAiLive(aiLastLive);
+  toast('Listening to live call…','info');
+}
+function stopLiveListen(){
+  if(!liveListen) return; const l=liveListen; liveListen=null;
+  try{ l.ws.close(); }catch{} try{ l.ctx.close(); }catch{}
+  if($('aiLiveWrap')) renderAiLive(aiLastLive);
 }
 function renderAiStored(rows){
   const wrap=$('aiResWrap'); if(!wrap) return;
