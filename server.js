@@ -2414,7 +2414,11 @@ async function pickInboundAgent(campaignId) {
 // call.hangup handler won't overwrite it with the generic default.
 app.post('/webhooks/ai-result', async (req, res) => {
   if (req.query.token !== WH_TOKEN) return res.sendStatus(403);
-  const ccid = req.query.cc || (req.body && req.body.call_control_id) || null;
+  // Resolve the call id from the most reliable source available. Telnyx sends
+  // x-telnyx-call-control-id on webhook-tool requests; the ?cc= query is the
+  // {{call_control_id}} template; body is a last resort. Any one is enough.
+  const ccid = req.query.cc && !/^\{\{/.test(req.query.cc) ? req.query.cc
+    : (req.headers['x-telnyx-call-control-id'] || (req.body && req.body.call_control_id) || null);
   const b = req.body || {};
   const result = String(b.result || '').trim();
   const reason = String(b.reason || '').slice(0, 500);
@@ -2450,8 +2454,13 @@ app.post('/webhooks/ai-result', async (req, res) => {
   if (leadId && patch) sbUpdate('leads', `id=eq.${leadId}`, patch).catch(e => console.error('[ai-result:lead]', e.message));
   console.log(`[ai-result] ${ccid ? ccid.slice(-8) : '-'} result=${result || '-'} cb=${cbHours}h reason="${reason.slice(0, 60)}"`);
 
-  // Fast-cut: end the call now so trollers/voicemails/finished convos stop billing.
-  if (ccid) telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+  // End the call server-side so termination is guaranteed even if the model doesn't
+  // also fire its hangup tool. Fast-cut wasteful calls (troller/voicemail) to save
+  // money; give real conversations a few seconds so the closing line isn't chopped.
+  const r = result.toLowerCase();
+  const fast = r === 'bluffer' || r === 'troll' || r === 'voicemail';
+  const delayMs = fast ? 500 : 5000;
+  if (ccid) setTimeout(() => { telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {}); }, delayMs);
 });
 
 // ══ WEBHOOK + BRIDGE ═════════════════════════════════════════════════════════════
