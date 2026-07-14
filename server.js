@@ -33,7 +33,15 @@ const TELNYX_KEY         = env('TELNYX_KEY');
 const CONNECTION_ID      = env('TELNYX_CONNECTION_ID');                    // Call Control app (dials leads + agent SIP)
 const CRED_CONNECTION_ID = env('TELNYX_CRED_CONNECTION_ID', '3001006440748943295'); // Credential Connection (agent WebRTC)
 const WH_TOKEN           = env('WH_TOKEN', 'trinity-2026');
-const AMD_MODE           = env('AMD_MODE', 'premium');
+// AMD_MODE:
+//   'greet_first' (default) — greet the instant the line is answered, keep premium
+//        AMD running in the background; if AMD later says "machine" the call is
+//        dropped a few seconds in. Zero human-lead loss (no 5-6s AMD gate before
+//        the bot speaks), tiny cost of a few seconds of assistant on voicemails.
+//   'premium'    — wait for premium AMD to confirm human before greeting (no
+//        assistant cost on voicemails, but ~5-6s of dead air → owners hang up).
+//   'disabled'   — greet on answer, no AMD at all (assistant fully engages VMs).
+const AMD_MODE           = env('AMD_MODE', 'greet_first');
 const SB_HOST            = env('SUPABASE_HOST');
 const SB_KEY             = env('SUPABASE_KEY');
 const DEFAULT_FROM       = env('DEFAULT_FROM', '+19168850241');
@@ -2648,18 +2656,25 @@ app.post('/webhooks/telnyx', async (req, res) => {
     // only on a confirmed human so voicemails never incur assistant cost.
     if (role === 'ai') {
       const info = aiRt[ccid];
-      // AMD disabled: a straight answer is the connect signal.
-      if (event === 'call.answered' && AMD_MODE === 'disabled' && info && info.phase === 'dialing') {
+      // Greet the instant the line is answered (greet_first + disabled). This
+      // removes the 5-6s of dead air that made owners hang up. In greet_first,
+      // premium AMD keeps running in the background and can still drop voicemails.
+      if (event === 'call.answered' && (AMD_MODE === 'greet_first' || AMD_MODE === 'disabled')
+          && info && info.phase === 'dialing') {
         await startAiAssistant(ccid);
         return;
       }
-      // Premium AMD gate: attach on human/ambiguous, hang up + mark machine otherwise.
+      // Premium AMD result. In 'premium' mode this is the gate that first attaches
+      // the assistant. In 'greet_first' the assistant is already talking, so a human
+      // result is a no-op and only a machine result matters — drop the voicemail.
       if (event === 'call.machine.premium.detection.ended') {
         const r = payload.result || '';
         const isHuman = r.startsWith('human') || r === 'silence' || r === 'not_sure';   // TCPA-safe
         if (isHuman) {
-          if (info && info.phase === 'dialing') await startAiAssistant(ccid);
+          if (info && info.phase === 'dialing') await startAiAssistant(ccid);   // premium mode: first attach
         } else {
+          // Machine confirmed. Kill the leg even if the greeting has already
+          // started (greet_first), so voicemails don't run the full assistant.
           delete aiRt[ccid];
           await telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
           if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
