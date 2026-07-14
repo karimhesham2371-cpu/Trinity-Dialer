@@ -92,6 +92,10 @@
   @keyframes tel-pulse{0%{box-shadow:0 0 0 0 var(--pulse)}100%{box-shadow:0 0 0 6px transparent}}
   .dot--pulse{animation:tel-pulse 1.6s ease-out infinite}
   @media(prefers-reduced-motion:reduce){.dot--pulse{animation:none;box-shadow:0 0 0 2px var(--pulse)}}
+  @keyframes row-overdue-flash{0%,100%{background:var(--danger-tint)}50%{background:transparent}}
+  tr.row-overdue{animation:row-overdue-flash 1.2s ease-in-out infinite}
+  tr.row-overdue td{color:var(--danger)!important;font-weight:600}
+  @media(prefers-reduced-motion:reduce){tr.row-overdue{animation:none;background:var(--danger-tint)}}
 
   /* ── pills ── */
   .pill{height:22px;display:inline-flex;align-items:center;gap:7px;padding:0 10px;border-radius:999px;
@@ -1947,21 +1951,73 @@ function renderAiLive(live){
   // Keep listening to a call whose ccid dropped off the live list? It ended — stop.
   if(liveListen && !live.some(l=>l.ccid===liveListen.ccid)) stopLiveListen();
   if(!live.length){ wrap.innerHTML=''; return; }
+  // Prune alarm memory for calls that have ended so a future call can re-alarm.
+  const liveSet=new Set(live.map(l=>l.ccid));
+  overdueAlarmed.forEach(id=>{ if(!liveSet.has(id)) overdueAlarmed.delete(id); });
   wrap.innerHTML=`<div class="card" style="margin-bottom:12px"><h2>Live now</h2><div class="tblwrap"><table>
     <thead><tr><th>Contact</th><th>Phone</th><th>Property</th><th>Status</th><th>Elapsed</th><th>Monitor</th></tr></thead>
     <tbody>${live.map(l=>{
       const on=liveListen&&liveListen.ccid===l.ccid;
-      const btn=l.ccid?`<button class="btn btn-sm${on?' btn-danger':''}" onclick="aiLiveListen('${esc(l.ccid)}')">${on?'■ Stop':'▶ Listen'}</button>`:'<span class="dim">—</span>';
-      return `<tr><td>${esc(l.name||'—')}</td><td class="mono">${esc(l.phone||'—')}</td>
+      const listen=l.ccid?`<button class="btn btn-sm${on?' btn-danger':''}" onclick="aiLiveListen('${esc(l.ccid)}')">${on?'■ Stop':'▶ Listen'}</button>`:'<span class="dim">—</span>';
+      const hang=l.ccid?` <button class="btn btn-sm btn-danger" onclick="aiHangup('${esc(l.ccid)}',this)">Hang up</button>`:'';
+      const over=(Date.now()-l.since)/1000>=OVERDUE_SEC;
+      return `<tr data-live-ccid="${esc(l.ccid||'')}" data-live-name="${esc(l.name||'')}"${over?' class="row-overdue"':''}><td>${esc(l.name||'—')}</td><td class="mono">${esc(l.phone||'—')}</td>
       <td>${esc(l.address||'—')}</td><td>${phaseTag(l.phase)}</td>
       <td class="mono dim" data-live-since="${l.since}">${fmtDur((Date.now()-l.since)/1000)}</td>
-      <td>${btn}</td></tr>`;}).join('')}</tbody></table></div></div>`;
+      <td>${listen}${hang}</td></tr>`;}).join('')}</tbody></table></div></div>`;
   if(!liveTickT) liveTickT=setInterval(tickLiveElapsed,1000);
+}
+// A qualified lead runs ~5 min; anything longer should be reviewed by the quality team.
+const OVERDUE_SEC=300;
+const overdueAlarmed=new Set();
+// Hang up one live AI call (admin safety button — e.g. a troller wasting time/money).
+async function aiHangup(ccid,btn){
+  if(!ccid) return;
+  if(!confirm('Hang up this live call now?')) return;
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{
+    await apiJson('/api/admin/ai/hangup','POST',{ccid});
+    toast('Call hung up','ok');
+    if(liveListen&&liveListen.ccid===ccid) stopLiveListen();
+    loadAiResults(false);
+  }catch(e){ toast(e.message||'Hang up failed','err'); if(btn){ btn.disabled=false; btn.textContent='Hang up'; } }
+}
+// 5-second alarm tone (synthesized — alternating two-tone beep), auto-stops.
+function playOverdueAlarm(){
+  try{
+    const ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const t0=ctx.currentTime, DUR=5, STEP=0.4;
+    for(let i=0,time=0; time<DUR; i++,time+=STEP){
+      const o=ctx.createOscillator(), g=ctx.createGain();
+      o.type='square'; o.frequency.value=(i%2)?660:988;
+      g.gain.setValueAtTime(0.0001,t0+time);
+      g.gain.exponentialRampToValueAtTime(0.25,t0+time+0.02);
+      g.gain.setValueAtTime(0.25,t0+time+0.25);
+      g.gain.exponentialRampToValueAtTime(0.0001,t0+time+0.3);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t0+time); o.stop(t0+time+0.32);
+    }
+    setTimeout(()=>{ try{ctx.close();}catch{} }, (DUR+0.5)*1000);
+  }catch(e){}
 }
 function tickLiveElapsed(){
   const cells=document.querySelectorAll('#aiLiveWrap [data-live-since]');
   if(!cells.length){ clearInterval(liveTickT); liveTickT=null; return; }
-  cells.forEach(c=>{ const s=Number(c.getAttribute('data-live-since'))||Date.now(); c.textContent=fmtDur((Date.now()-s)/1000); });
+  cells.forEach(c=>{
+    const s=Number(c.getAttribute('data-live-since'))||Date.now();
+    const sec=(Date.now()-s)/1000;
+    c.textContent=fmtDur(sec);
+    const tr=c.closest('tr'); if(!tr) return;
+    const ccid=tr.getAttribute('data-live-ccid')||'';
+    if(sec>=OVERDUE_SEC){
+      tr.classList.add('row-overdue');
+      if(ccid && !overdueAlarmed.has(ccid)){   // fire once per call
+        overdueAlarmed.add(ccid);
+        playOverdueAlarm();
+        toast('⚠ Live call over 5 min — quality team should review: '+(tr.getAttribute('data-live-name')||'call'),'err');
+      }
+    }
+  });
 }
 // ── Live AI call audio monitoring (Telnyx media fork → μ-law → Web Audio) ──
 let liveListen=null, liveTickT=null;

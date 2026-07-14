@@ -1514,6 +1514,24 @@ app.get('/api/admin/ai/calls', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Admin safety button: hang up one live AI call by ccid. Guarded to the AI lane
+// (must be in aiRt) so it can't be pointed at agent/inbound legs. Records the lead
+// as manually ended so the pacer won't immediately redial it, and sets
+// resultRecorded so the call.hangup handler won't overwrite that disposition.
+app.post('/api/admin/ai/hangup', auth, adminOnly, async (req, res) => {
+  const ccid = (req.body && req.body.ccid) || '';
+  const info = ccid && aiRt[ccid];
+  if (!info) return res.status(404).json({ error: 'call not live (already ended?)' });
+  info.resultRecorded = true;
+  if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`,
+    { status: 'CONTACTED', last_outcome: 'manual_hangup' }).catch(() => {});
+  try {
+    await telnyx('POST', `/calls/${ccid}/actions/hangup`, {});
+    console.log(`[ai] manual hangup ${ccid.slice(-8)} by admin`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══ ADMIN: reports ══════════════════════════════════════════════════════════════
 // 1) Audit Logs — user activity trail. Filters: from, to, actor_id, action, limit.
 app.get('/api/admin/reports/audit', auth, adminOnly, async (req, res) => {
