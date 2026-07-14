@@ -273,6 +273,69 @@ async function sbSelectAll(table, q = '', page = 1000) {
   return out;
 }
 
+// ── Durable recording archive ────────────────────────────────────────────────
+// Telnyx's public recording URLs are presigned S3 links that expire after 10 min
+// (X-Amz-Expires=600) — so any URL we store is dead ~10 min after the call, which
+// is the root cause of "0:00 / unplayable" recordings. Fix: copy the audio ONCE
+// into Supabase Storage (bucket 'recordings') and serve from there forever. The
+// calls.recording_url is rewritten to the marker `sb:recordings/<id>.mp3`, which
+// the /stream proxy expands to a Supabase object fetch. Telnyx retains the source
+// audio for its retention window and hands out a fresh URL via GET /recordings/{id},
+// so even calls whose stored URL already expired can still be recovered.
+const REC_BUCKET = 'recordings';
+const isArchived = (u) => typeof u === 'string' && u.startsWith('sb:');
+async function archiveRecording(recId, sourceUrl) {
+  if (!recId) throw new Error('no recording_id');
+  // Pull a FRESH download URL from Telnyx (the webhook's URL may already be minutes
+  // old); fall back to whatever URL we were handed.
+  let url = sourceUrl || null;
+  try {
+    const meta = await telnyx('GET', `/recordings/${recId}`);
+    const d = meta && meta.data;
+    url = (d && d.download_urls && (d.download_urls.mp3 || d.download_urls.wav)) || url;
+  } catch { /* keep sourceUrl */ }
+  if (!url) throw new Error('no source url');
+  const isTelnyxApi = /api\.telnyx\.com/i.test(url);
+  const dl = await fetch(url, { headers: isTelnyxApi ? { Authorization: `Bearer ${TELNYX_KEY}` } : {} });
+  if (!dl.ok) throw new Error(`download ${dl.status}`);
+  const buf = Buffer.from(await dl.arrayBuffer());
+  if (!buf.length) throw new Error('empty download');
+  const path = `${recId}.mp3`;
+  const up = await fetch(`https://${SB_HOST}/storage/v1/object/${REC_BUCKET}/${path}`, {
+    method: 'POST',
+    headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'audio/mpeg', 'x-upsert': 'true' },
+    body: buf,
+  });
+  if (!up.ok) throw new Error(`upload ${up.status}: ${(await up.text()).slice(0, 120)}`);
+  return { marker: `sb:${REC_BUCKET}/${path}`, bytes: buf.length };
+}
+// Archive one call's recording and persist the durable marker onto its row.
+async function archiveCallRecording(ccidOrId, recId, sourceUrl, byId) {
+  const r = await archiveRecording(recId, sourceUrl);
+  const q = byId ? `id=eq.${ccidOrId}` : `telnyx_call_control_id=eq.${ccidOrId}`;
+  await sbUpdate('calls', q, { recording_url: r.marker }).catch(e => console.error('[rec-archive:update]', e.message));
+  return r;
+}
+// Safety-net sweep: find recorded calls whose URL isn't archived yet (archive failed,
+// lagged, or predates this feature) and pull them into Supabase Storage. Idempotent.
+let recSweepBusy = false;
+async function reconcileRecordings() {
+  if (recSweepBusy || !SB_HOST || !SB_KEY || !TELNYX_KEY) return;
+  recSweepBusy = true;
+  try {
+    const rows = await sbSelect('calls',
+      'recording_id=not.is.null&select=id,recording_id,recording_url&order=created_at.desc&limit=300');
+    const pending = rows.filter(r => r.recording_id && !isArchived(r.recording_url)).slice(0, 12);
+    for (const r of pending) {
+      try {
+        const { bytes } = await archiveCallRecording(r.id, r.recording_id, r.recording_url, true);
+        console.log(`[rec-sweep] archived ${r.recording_id} (${bytes}B)`);
+      } catch (e) { console.error(`[rec-sweep] ${r.recording_id}: ${e.message}`); }
+    }
+  } catch (e) { console.error('[rec-sweep]', e.message); }
+  finally { recSweepBusy = false; }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 const enc = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64');
 const dec = (b64) => { if (!b64) return null; try { return JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch { return null; } };
@@ -1703,14 +1766,30 @@ app.get('/api/admin/reports/recording/:id/stream', auth, adminOnly, async (req, 
     const rows = await sbSelect('calls', `id=eq.${req.params.id}&select=id,recording_url,to_number`);
     const c = rows[0];
     if (!c || !c.recording_url) return res.status(404).json({ error: 'no recording' });
-    const isTelnyx = /telnyx\.com/i.test(c.recording_url);
+    // Resolve the storage source. `sb:recordings/<id>.mp3` = durable copy in our own
+    // Supabase bucket (permanent). Otherwise it's a Telnyx URL — api.telnyx.com needs
+    // Bearer; presigned S3 links work directly but expire ~10 min after the call.
+    let src = c.recording_url, extra = {};
+    if (isArchived(c.recording_url)) {
+      src = `https://${SB_HOST}/storage/v1/object/${c.recording_url.slice(3)}`;
+      extra = { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` };
+    } else if (/api\.telnyx\.com/i.test(c.recording_url)) {
+      extra = { Authorization: `Bearer ${TELNYX_KEY}` };
+    }
     // Forward the browser's Range header so <audio> can seek/buffer. Without range
-    // support some browsers stall playback after ~1s. Telnyx recording URLs honour Range.
+    // support some browsers stall playback after ~1s. Both Telnyx and Supabase honour Range.
     const range = req.headers.range;
-    const upstream = await fetch(c.recording_url, {
-      headers: Object.assign({}, isTelnyx ? { 'Authorization': `Bearer ${TELNYX_KEY}` } : {},
-        range ? { 'Range': range } : {}),
-    });
+    let upstream = await fetch(src, { headers: Object.assign({}, extra, range ? { 'Range': range } : {}) });
+    // Self-heal: a legacy/expired Telnyx presigned URL (403/410) that was never
+    // archived — pull a fresh copy into Supabase now, then serve it. This makes even
+    // old "0:00" recordings play on the first click without a manual backfill.
+    if (!upstream.ok && !isArchived(c.recording_url) && c.recording_id) {
+      try {
+        const r = await archiveCallRecording(c.id, c.recording_id, null, true);
+        src = `https://${SB_HOST}/storage/v1/object/${r.marker.slice(3)}`;
+        upstream = await fetch(src, { headers: Object.assign({ apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` }, range ? { 'Range': range } : {}) });
+      } catch (e) { console.error('[stream:self-heal]', e.message); }
+    }
     if (!upstream.ok || !upstream.body) {
       return res.status(502).json({ error: `recording fetch ${upstream.status}` });
     }
@@ -2539,15 +2618,22 @@ app.post('/webhooks/telnyx', async (req, res) => {
   sbLog('call_events', { event_type: event, telnyx_call_control_id: ccid, client_state: cs, payload });
 
   try {
-    // Recording saved -> attach URL to the calls row for in-browser playback.
+    // Recording saved -> archive the audio into Supabase Storage so it stays
+    // playable forever. Telnyx's public URLs are presigned and die after 10 min,
+    // so we can't just store one. We first write the ephemeral URL (so a call you
+    // open in the next few minutes plays instantly), then copy the bytes into our
+    // own bucket and rewrite recording_url to the durable `sb:` marker.
     if (event === 'call.recording.saved') {
-      // Prefer public_recording_urls (browser-playable, no auth) over recording_urls
-      // (api.telnyx.com, needs Bearer). The /stream proxy handles either, but this
-      // keeps stored URLs directly usable too.
+      const recId = payload.recording_id || null;
       const url = (payload.public_recording_urls && (payload.public_recording_urls.mp3 || payload.public_recording_urls.wav)) ||
                   (payload.recording_urls && (payload.recording_urls.mp3 || payload.recording_urls.wav)) || null;
-      if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
-        { recording_url: url, recording_id: payload.recording_id || null }).catch(() => {});
+      if (ccid) await sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
+        { recording_url: url, recording_id: recId }).catch(() => {});
+      if (ccid && recId) {
+        archiveCallRecording(ccid, recId, url, false)
+          .then(r => console.log(`[rec-archive] ${ccid.slice(-8)} -> ${recId} (${r.bytes}B)`))
+          .catch(e => console.error(`[rec-archive] ${ccid.slice(-8)}: ${e.message}`));
+      }
       return;
     }
 
@@ -2966,4 +3052,6 @@ server.listen(PORT, async () => {
   setInterval(loadAiConfig, 60 * 1000);
   sweepExpiredDnc();
   setInterval(sweepExpiredDnc, 10 * 60 * 1000);   // auto-remove expired (e.g. 90-day) DNC entries
+  reconcileRecordings();                          // archive any recordings that slipped through
+  setInterval(reconcileRecordings, 3 * 60 * 1000);
 });
