@@ -1633,16 +1633,43 @@ async function agentNameMap() {
   const rows = await sbSelect('agents', 'select=id,name');
   return rows.reduce((m, a) => (m[a.id] = a.name, m), {});
 }
+// Regular-dialer call log — human-agent calls only (agent_id set; AI lane is null).
+// Mirrors the AI results page: embeds lead contact + campaign name, badges the
+// disposition (leads.last_outcome), and paginates 50/page. Filters: date range,
+// agent, campaign, duration (dmin/dmax seconds), result (disposition code).
 app.get('/api/admin/reports/calls', auth, adminOnly, async (req, res) => {
-  const { from, to, agent_id } = req.query;
-  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
-  const f = ['select=*', 'order=created_at.desc', `limit=${limit}`];
-  if (from)     f.push(`created_at=gte.${encodeURIComponent(from)}`);
-  if (to)       f.push(`created_at=lte.${encodeURIComponent(to)}`);
-  if (agent_id) f.push(`agent_id=eq.${agent_id}`);
+  const page = Math.max(0, parseInt(req.query.page, 10) || 0);
+  const PER = 50;
+  const { from, to, agent_id, campaign_id } = req.query;
+  const dmin = req.query.dmin != null && req.query.dmin !== '' ? Math.max(0, parseInt(req.query.dmin, 10) || 0) : null;
+  const dmax = req.query.dmax != null && req.query.dmax !== '' ? Math.max(0, parseInt(req.query.dmax, 10) || 0) : null;
+  // Result filter — matches leads.last_outcome (the disposition code written by
+  // /api/agent/disposition). ilike is case-insensitive so uppercase codes match.
+  const result = String(req.query.result || '').trim().toLowerCase();
+  const join = result && result !== 'all' ? 'leads!inner' : 'leads';
+  const f = [
+    `select=*,${join}(first_name,last_name,address,state,phone,status,last_outcome),campaigns(name)`,
+    'agent_id=not.is.null',
+    'order=created_at.desc', `limit=${PER + 1}`, `offset=${page * PER}`,
+  ];
+  if (from)        f.push(`created_at=gte.${encodeURIComponent(from)}`);
+  if (to)          f.push(`created_at=lte.${encodeURIComponent(to)}`);
+  if (agent_id)    f.push(`agent_id=eq.${agent_id}`);
+  if (campaign_id) f.push(`campaign_id=eq.${campaign_id}`);
+  if (dmin != null) f.push(`duration_sec=gte.${dmin}`);
+  if (dmax != null) f.push(`duration_sec=lte.${dmax}`);
+  if (result && result !== 'all') {
+    // "No answer" groups the machine/busy system outcomes with the agent code.
+    if (result === 'no_answer') f.push('leads.or=(last_outcome.ilike.no_answer,last_outcome.ilike.machine,last_outcome.ilike.busy)');
+    else f.push(`leads.last_outcome=ilike.${encodeURIComponent(result)}`);
+  }
   try {
     const [rows, names] = await Promise.all([sbSelect('calls', f.join('&')), agentNameMap()]);
-    res.json({ rows: rows.map(r => ({ ...r, agent_name: names[r.agent_id] || null })) });
+    const hasMore = rows.length > PER;
+    res.json({
+      rows: rows.slice(0, PER).map(r => ({ ...r, agent_name: names[r.agent_id] || null })),
+      page, per: PER, hasMore,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

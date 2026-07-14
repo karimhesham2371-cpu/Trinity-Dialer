@@ -1219,19 +1219,122 @@ function listenRec(btn,id){ const td=btn.closest('td'); td.dataset.recPrev=encod
   td.innerHTML=`<span style="display:inline-flex;align-items:center;gap:6px"><audio class="mini" controls autoplay src="${recStreamUrl(id,false)}"></audio><button class="btn btn-sm" title="Close player" onclick="closeRec(this)" style="padding:2px 8px">✕</button></span>`; }
 function closeRec(btn){ const td=btn.closest('td'); const p=td.dataset.recPrev; if(p!=null){ td.innerHTML=decodeURIComponent(p); delete td.dataset.recPrev; } }
 function dlRec(id){ const a=document.createElement('a'); a.href=recStreamUrl(id,true); a.download=''; document.body.appendChild(a); a.click(); a.remove(); }
-function initCalls(){
+// Call logs mirror the AI-results page: click a row to expand contact info,
+// coloured disposition badge, plus Agent + Campaign filters (the two extras the
+// regular dialer needs over the AI page) and 50/page pagination.
+let clPage=0;
+async function initCalls(){
+  clPage=0;
+  let agents=[], camps=[];
+  try{ const u=await apiJson('/api/admin/users'); agents=(u.users||[]).filter(x=>x.role==='agent'); }catch(e){}
+  try{ const c=await apiJson('/api/admin/campaigns'); camps=c.campaigns||[]; }catch(e){}
+  const aOpts=['<option value="">All agents</option>'].concat(agents.map(a=>`<option value="${a.id}">${esc(a.name||a.email||a.id)}</option>`)).join('');
+  const cOpts=['<option value="">All campaigns</option>'].concat(camps.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`)).join('');
   $('repFilters').innerHTML=`
-    <div class="fw"><span class="lbl">From</span><input id="fClFrom" class="field" type="datetime-local"></div>
-    <div class="fw"><span class="lbl">To</span><input id="fClTo" class="field" type="datetime-local"></div>
-    <button id="fClGo" class="btn btn-primary" style="height:36px">Apply</button>`;
-  $('fClGo').onclick=loadCalls; loadCalls();
+    <div class="fw"><span class="lbl">Date</span><input id="clDate" class="field" type="date"></div>
+    <div class="fw"><span class="lbl">Agent</span><select id="clAgent" class="field">${aOpts}</select></div>
+    <div class="fw"><span class="lbl">Campaign</span><select id="clCamp" class="field">${cOpts}</select></div>
+    <div class="fw"><span class="lbl">Duration</span>
+      <select id="clDur" class="field">
+        <option value="">Any length</option>
+        <option value="0-30">Under 30s</option>
+        <option value="30-60">30s – 1m</option>
+        <option value="60-180">1m – 3m</option>
+        <option value="180-300">3m – 5m</option>
+        <option value="300-">Over 5m</option>
+      </select></div>
+    <div class="fw"><span class="lbl">Result</span>
+      <select id="clResult" class="field">
+        <option value="">All results</option>
+        <option value="sale">Sale / Appt</option>
+        <option value="callback">Callback</option>
+        <option value="not_interested">Not interested</option>
+        <option value="no_answer">No answer</option>
+        <option value="voicemail">Voicemail</option>
+        <option value="wrong_number">Wrong number</option>
+        <option value="dnc">Do not call</option>
+      </select></div>
+    <button id="clGo" class="btn btn-primary" style="height:36px">Apply</button>
+    <button id="clClear" class="btn btn-sm" style="height:36px">Clear filters</button>`;
+  const reload=()=>{ clPage=0; loadCalls(); };
+  $('clGo').onclick=reload;
+  ['clAgent','clCamp','clDur','clResult'].forEach(id=>{ const el=$(id); if(el) el.onchange=reload; });
+  $('clClear').onclick=()=>{ ['clDate','clAgent','clCamp','clDur','clResult'].forEach(id=>{ const el=$(id); if(el) el.value=''; }); clPage=0; loadCalls(); };
+  loadCalls();
 }
 async function loadCalls(){
-  const q=new URLSearchParams(); const f=$('fClFrom').value,t=$('fClTo').value;
-  if(f) q.set('from',new Date(f).toISOString()); if(t) q.set('to',new Date(t).toISOString());
-  q.set('limit','500'); $('repBody').innerHTML='<div class="dim" style="padding:16px">Loading…</div>';
-  try{ const j=await apiJson('/api/admin/reports/calls?'+q.toString()); renderCallsTable(j.rows,'No calls in this range.'); }
-  catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; }
+  const q=new URLSearchParams(); q.set('page',clPage);
+  const d=$('clDate')&&$('clDate').value;
+  if(d){ q.set('from',new Date(d+'T00:00:00').toISOString()); const e=new Date(d+'T00:00:00'); e.setDate(e.getDate()+1); q.set('to',e.toISOString()); }
+  const ag=$('clAgent')&&$('clAgent').value; if(ag) q.set('agent_id',ag);
+  const cp=$('clCamp')&&$('clCamp').value; if(cp) q.set('campaign_id',cp);
+  const dur=$('clDur')&&$('clDur').value; if(dur){ const [lo,hi]=dur.split('-'); if(lo) q.set('dmin',lo); if(hi) q.set('dmax',hi); }
+  const rs=$('clResult')&&$('clResult').value; if(rs) q.set('result',rs);
+  $('repBody').innerHTML='<div class="dim" style="padding:16px">Loading…</div>';
+  let j; try{ j=await apiJson('/api/admin/reports/calls?'+q.toString()); }
+  catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
+  renderClStored(j.rows||[], j);
+}
+function renderClStored(rows, j){
+  if(!rows.length){ $('repBody').innerHTML='<div class="empty">No calls match these filters.</div>'; return; }
+  const body=rows.map((r,i)=>clCallRow(r,i)).join('');
+  $('repBody').innerHTML=`<div class="tblwrap"><table>
+    <thead><tr><th style="width:26px"></th><th>Time</th><th>Contact</th><th>Phone</th><th>Result</th><th>Agent</th><th>Talk</th><th>Recording</th></tr></thead>
+    <tbody>${body}</tbody></table></div>
+    <div class="row mt3" id="clPager" style="align-items:center;gap:10px">
+      <button class="btn btn-sm" id="clPrev"${clPage<=0?' disabled':''}>← Prev</button>
+      <span class="dim" style="font-size:12px">Page ${clPage+1}</span>
+      <button class="btn btn-sm" id="clNext"${j.hasMore?'':' disabled'}>Next →</button></div>`;
+  if($('clPrev')) $('clPrev').onclick=()=>{ if(clPage>0){ clPage--; loadCalls(); } };
+  if($('clNext')) $('clNext').onclick=()=>{ if(j.hasMore){ clPage++; loadCalls(); } };
+}
+// Badge the disposition (leads.last_outcome). Falls back to amd/status like the AI page.
+function clOutcome(r,L){
+  const o=String((L&&L.last_outcome)||'').toLowerCase();
+  const M={sale:['Sale / Appt','#16a34a'], callback:['Callback','#d97706'],
+    not_interested:['Not interested','#6b7280'], no_answer:['No answer','#9ca3af'],
+    voicemail:['Voicemail','#a371f7'], wrong_number:['Wrong number','#f0883e'],
+    dnc:['Do not call','#dc2626'], machine:['Voicemail','#6b7280'], busy:['Busy','#9ca3af']};
+  if(M[o]) return `<span style="color:${M[o][1]};font-weight:600">${M[o][0]}</span>`;
+  if(r.amd_result==='human') return 'Talked';
+  return esc((L&&L.status)||r.hangup_cause||'—');
+}
+function clCallRow(r,i){
+  const L=r.leads||{}; const name=[L.first_name,L.last_name].filter(Boolean).join(' ')||'—';
+  const res=clOutcome(r,L);
+  const answered=!!(r.bridged_at || (r.amd_result && r.amd_result!=='') || r.hangup_cause==='normal_clearing');
+  let rec;
+  if(r.recording_url){
+    rec=`<button class="btn btn-sm" onclick="listenRec(this,'${r.id}')">Listen</button> <button class="btn btn-sm" onclick="dlRec('${r.id}')">Download</button>`;
+  } else if(!r.ended_at){
+    rec='<span style="color:#2563eb;font-weight:600">● Recording…</span>';
+  } else if(answered){
+    rec='<span class="dim" title="Recording is still being processed — refreshes automatically">Processing…</span>';
+  } else {
+    rec='<span class="dim" title="Call was never answered (ring timeout or busy) — no audio to record">Not answered</span>';
+  }
+  const det=`cl-det-${i}`;
+  const dt=(iso)=>iso?new Date(iso).toLocaleString([], {hour12:false,month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+  const camp=(r.campaigns&&r.campaigns.name)||'—';
+  return `<tr onclick="toggleAiDet('${det}')" style="cursor:pointer">
+      <td class="dim" id="${det}-arw">▸</td>
+      <td class="mono dim">${fmtTime(r.created_at)}</td>
+      <td>${esc(name)}</td><td class="mono">${esc(r.to_number||L.phone||'—')}</td>
+      <td>${res}</td><td>${esc(r.agent_name||'—')}</td><td class="mono">${callTalk(r)}</td>
+      <td onclick="event.stopPropagation()">${rec}</td></tr>
+    <tr id="${det}" class="hidden"><td></td><td colspan="7">
+      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 24px;padding:10px 2px 12px;font-size:13px">
+        <div><span class="lbl">Name</span> ${esc(name)}</div>
+        <div><span class="lbl">Phone</span> <span class="mono">${esc(r.to_number||L.phone||'—')}</span></div>
+        <div><span class="lbl">Property address</span> ${esc(L.address||'—')}</div>
+        <div><span class="lbl">State</span> ${esc(L.state||'—')}</div>
+        <div><span class="lbl">Agent</span> ${esc(r.agent_name||'—')}</div>
+        <div><span class="lbl">Campaign</span> ${esc(camp)}</div>
+        <div><span class="lbl">Called from</span> <span class="mono">${esc(r.from_number||'—')}</span></div>
+        <div><span class="lbl">Lead status</span> ${esc(L.status||'—')}</div>
+        <div><span class="lbl">Started</span> ${dt(r.created_at)}</div>
+        <div><span class="lbl">Ended</span> ${dt(r.ended_at)}</div>
+      </div></td></tr>`;
 }
 
 // ── 3) Agent report ──
