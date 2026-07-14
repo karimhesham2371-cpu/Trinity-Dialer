@@ -2462,11 +2462,17 @@ async function startAiAssistant(ccid) {
   if (!info) return;
   // The bot addresses the contact by first name and asks about the property at
   // the mapped address. contact_name is the FIRST name; property_address is the
-  // full street/city/state/zip from the campaign's uploaded lead list.
+  // STREET ONLY (first comma-segment). Lead lists often have messy/duplicated
+  // city+state tails (e.g. "13232 Saint Helena Pl, New Orleans, LA 70129, New
+  // Orleans, LA"); saying just the street ("13232 Saint Helena Pl") sounds natural
+  // and avoids reading the garbled tail aloud.
   const dyn = { contact_name: info.firstName || info.name || 'there',
     contact_first_name: info.firstName || 'there',
     call_control_id: ccid };   // templated into the end_call tool URL so results route back to this leg
-  if (info.address) dyn.property_address = info.address;
+  if (info.address) {
+    const street = String(info.address).split(',')[0].trim();
+    dyn.property_address = street || info.address;
+  }
   try {
     await telnyx('POST', `/calls/${ccid}/actions/ai_assistant_start`, {
       assistant: { id: AI.assistant_id, dynamic_variables: dyn },
