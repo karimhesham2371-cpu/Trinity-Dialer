@@ -1926,9 +1926,12 @@ async function loadAiResults(quiet){
   catch(e){ if(!quiet && $('aiResWrap')) $('aiResWrap').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
   if(!$('aiResWrap')) return;   // tab was switched away mid-fetch
   renderAiLive(j.live||[]);
-  // On a quiet auto-refresh, don't blow away an expanded dropdown the user is reading.
+  // On a quiet auto-refresh, don't blow away an expanded dropdown the user is reading,
+  // nor a recording the user is currently listening to (re-rendering the table would
+  // destroy the injected <audio> element and cancel playback mid-listen).
   const anyOpen=document.querySelectorAll('#aiResWrap tr[id^="ai-det-"]:not(.hidden)').length>0;
-  if(!(quiet && anyOpen)) renderAiStored(j.rows||[]);
+  const anyAudio=!!document.querySelector('#aiResWrap audio');
+  if(!(quiet && (anyOpen||anyAudio))) renderAiStored(j.rows||[]);
   const pager=$('aiPager');
   pager.innerHTML=`<button class="btn btn-sm" id="aiPrev"${aiResPage<=0?' disabled':''}>← Prev</button>
     <span class="dim" style="font-size:12px">Page ${aiResPage+1}</span>

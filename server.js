@@ -1675,8 +1675,12 @@ app.get('/api/admin/reports/recording/:id/stream', auth, adminOnly, async (req, 
     const c = rows[0];
     if (!c || !c.recording_url) return res.status(404).json({ error: 'no recording' });
     const isTelnyx = /telnyx\.com/i.test(c.recording_url);
+    // Forward the browser's Range header so <audio> can seek/buffer. Without range
+    // support some browsers stall playback after ~1s. Telnyx recording URLs honour Range.
+    const range = req.headers.range;
     const upstream = await fetch(c.recording_url, {
-      headers: isTelnyx ? { 'Authorization': `Bearer ${TELNYX_KEY}` } : {},
+      headers: Object.assign({}, isTelnyx ? { 'Authorization': `Bearer ${TELNYX_KEY}` } : {},
+        range ? { 'Range': range } : {}),
     });
     if (!upstream.ok || !upstream.body) {
       return res.status(502).json({ error: `recording fetch ${upstream.status}` });
@@ -1688,6 +1692,12 @@ app.get('/api/admin/reports/recording/:id/stream', auth, adminOnly, async (req, 
     let ctype = upstream.headers.get('content-type') || '';
     if (!ctype || /octet-stream/i.test(ctype)) ctype = 'audio/mpeg';
     res.setHeader('Content-Type', ctype);
+    res.setHeader('Accept-Ranges', 'bytes');
+    // Relay a partial-content response verbatim so the browser's range machinery works.
+    if (upstream.status === 206) {
+      res.status(206);
+      const cr = upstream.headers.get('content-range'); if (cr) res.setHeader('Content-Range', cr);
+    }
     const len = upstream.headers.get('content-length'); if (len) res.setHeader('Content-Length', len);
     res.setHeader('Cache-Control', 'private, max-age=3600');
     if (download) {
