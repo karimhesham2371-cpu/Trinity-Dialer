@@ -173,6 +173,7 @@
   .col{display:flex;flex-direction:column;gap:16px;min-height:0;overflow:auto}
   #scriptBody{white-space:pre-wrap;line-height:1.6;font-size:14px;color:var(--text)}
   #scriptBody .mf{color:var(--accent);font-weight:500}
+  .mf{color:var(--accent);font-weight:500}
   .ltabs{display:flex;gap:4px;margin:0 0 14px;border-bottom:1px solid var(--border)}
   .ltab{background:none;border:none;color:var(--text-dim);font:600 12px var(--font-ui);letter-spacing:.04em;text-transform:uppercase;padding:6px 10px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
   .ltab:hover{color:var(--text)}
@@ -251,6 +252,23 @@
   .permitem input{margin-top:2px;flex:none}
   .permitem .pi-label{font:600 13px var(--font-ui);color:var(--text)}
   .permitem .pi-hint{display:block;font:400 11px var(--font-ui);color:var(--text-dim);margin-top:2px}
+  .wbgrid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+  @media(max-width:1100px){.wbgrid{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:600px){.wbgrid{grid-template-columns:repeat(2,1fr)}}
+  .wbcard{background:var(--surface);border:1px solid var(--border-strong);border-radius:10px;padding:16px}
+  .wbk-val{font:700 30px/1 var(--font-ui);color:var(--text)}
+  .wbk-lbl{font:500 11px var(--font-ui);text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);margin-top:8px}
+  .wbk-sub{font:400 11px var(--font-ui);color:var(--text-faint);margin-top:3px}
+  .wbtbl th{font:500 11px var(--font-ui);text-transform:uppercase;letter-spacing:.04em;color:var(--text-dim)}
+  .wbbar{display:flex;align-items:center;gap:10px;margin:8px 0;font-size:13px}
+  .wbbar-l{flex:0 0 42%;display:flex;align-items:center;gap:8px;color:var(--text)}
+  .wbbar-l .dot{width:9px;height:9px;border-radius:50%;flex:none}
+  .wbbar-track{flex:1;height:8px;background:var(--surface-2);border-radius:5px;overflow:hidden}
+  .wbbar-fill{height:100%;border-radius:5px}
+  .wbbar-n{flex:0 0 auto;color:var(--text-dim);min-width:32px;text-align:right}
+  .qastar{cursor:pointer;font-size:18px;line-height:1;color:var(--border-strong);transition:color .1s}
+  .qastar.on{color:#f5a623}
+  .qastars:hover .qastar{color:var(--border-strong)}
   .rgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
   @media(max-width:900px){.rgrid{grid-template-columns:1fr 1fr}}
   @media(max-width:600px){.rgrid{grid-template-columns:1fr}}
@@ -438,6 +456,7 @@
     <!-- landing -->
     <div id="repHome">
       <div class="rgrid">
+        <button id="rtile-wallboard" class="rtile" onclick="openReport('wallboard')"><h3>Wallboard</h3><p>Live team dashboard — dials, contact rate, sales and per-agent status.</p></button>
         <button id="rtile-audit" class="rtile" onclick="openReport('audit')"><h3>Audit logs</h3><p>Every user action — logins, calls, saved files, campaign changes.</p></button>
         <button id="rtile-calls" class="rtile" onclick="openReport('calls')"><h3>Call logs</h3><p>All calls placed. Listen to and download recordings.</p></button>
         <button id="rtile-agent" class="rtile" onclick="openReport('agent')"><h3>Agent report</h3><p>Logged-in, dialing, talk, wrap and break time per agent. Export CSV.</p></button>
@@ -468,6 +487,7 @@
     <div id="ldSearchResults" class="hidden"></div>
     <div class="navtabs" id="ldSub" style="margin-bottom:14px">
       <button class="navtab active" data-lt="import" onclick="leadTab('import')">Import</button>
+      <button class="navtab" data-lt="script" onclick="leadTab('script')">Script</button>
       <button class="navtab" data-lt="playlists" onclick="leadTab('playlists')">Playlists</button>
       <button class="navtab" data-lt="numbers" onclick="leadTab('numbers')">Numbers</button>
       <button class="navtab" data-lt="folders" onclick="leadTab('folders')">Action folders</button>
@@ -540,7 +560,7 @@ function can(key){
   const perms = Array.isArray(USER.permissions) ? USER.permissions : [];
   return Array.isArray(key) ? key.some(k=>perms.includes(k)) : perms.includes(key);
 }
-const REPORT_PERMS=['reports.call_logs','reports.call_logs_export','reports.office_map','reports.research','reports.agent_report'];
+const REPORT_PERMS=['reports.call_logs','reports.call_logs_export','reports.office_map','reports.research','reports.agent_report','reports.wallboard'];
 function canAnyReport(){ return REPORT_PERMS.some(k=>can(k)); }
 
 function log(m){ const el=$('log'); if(!el) return; el.textContent += (new Date().toLocaleTimeString([], {hour12:false})+'  '+m+'\n'); el.scrollTop=el.scrollHeight; }
@@ -1025,6 +1045,51 @@ async function loadCampaigns(){
   });
 }
 
+// ── Leads → Script sub-tab ──
+// Agents see this text during a live call with {{merge_fields}} substituted from
+// the lead (server-side mergeScript). Renders inline into #ldBody for the
+// currently-selected campaign (ldCampId).
+const SCRIPT_MERGE_FIELDS=['first_name','last_name','address','city','state','zip','phone'];
+const SCRIPT_SAMPLE={first_name:'Maria',last_name:'Lopez',address:'214 Oak St',city:'Charlotte',state:'NC',zip:'28202',phone:'(704) 555-0142'};
+function scriptPreviewHtml(text){
+  return esc(text||'').replace(/\{\{\s*([\w.]+)\s*\}\}/g,(_,k)=>{
+    const v=k.startsWith('custom.')?'…':(SCRIPT_SAMPLE[k]!=null?SCRIPT_SAMPLE[k]:'—');
+    return `<span class="mf">${esc(v)}</span>`;
+  });
+}
+function renderScript(){
+  const c=leadCampaigns.find(x=>x.id===ldCampId)||{};
+  const chips=SCRIPT_MERGE_FIELDS.map(f=>`<button type="button" class="btn btn-sm" data-mf="${f}" style="margin:0 6px 6px 0">{{${f}}}</button>`).join('');
+  $('ldBody').innerHTML=`<div class="grid2">
+    <div class="card">
+      <h2>Call script — ${esc(c.name||'')}</h2>
+      <p class="dim" style="font-size:13px;margin-top:-4px">Shown on the agent's screen during every call for this campaign. Click a field to insert it; agents see the lead's real data in its place.</p>
+      <div class="mt3">${chips}<span class="dim" style="font-size:11px"> · custom CSV columns work too, e.g. {{custom.owner_type}}</span></div>
+      <textarea id="scEdit" class="field mt2" style="min-height:300px;font:400 13.5px/1.6 var(--font-ui);resize:vertical" placeholder="Hi {{first_name}}, this is ___ calling about your property at {{address}}…">${esc(c.script||'')}</textarea>
+      <div class="row mt3"><button id="scSave" class="btn btn-primary">Save script</button><span id="scMsg" class="dim" style="align-self:center;margin-left:10px;font-size:12px"></span></div>
+    </div>
+    <div class="card">
+      <h2>Live preview</h2>
+      <p class="dim" style="font-size:13px;margin-top:-4px">Sample lead data shown in <span class="mf">accent</span>.</p>
+      <div id="scPrev" class="mt2" style="white-space:pre-wrap;line-height:1.6;font-size:14px">${scriptPreviewHtml(c.script)}</div>
+    </div>
+  </div>`;
+  const ta=$('scEdit'), prev=$('scPrev');
+  ta.oninput=()=>{ prev.innerHTML=scriptPreviewHtml(ta.value); };
+  $('ldBody').querySelectorAll('[data-mf]').forEach(b=>b.onclick=()=>{
+    const tok='{{'+b.dataset.mf+'}}'; const s=ta.selectionStart||ta.value.length, e=ta.selectionEnd||ta.value.length;
+    ta.value=ta.value.slice(0,s)+tok+ta.value.slice(e); ta.focus(); const p=s+tok.length; ta.setSelectionRange(p,p); prev.innerHTML=scriptPreviewHtml(ta.value);
+  });
+  $('scSave').onclick=async()=>{
+    const btn=$('scSave'); btn.disabled=true; $('scMsg').textContent='Saving…';
+    try{ await apiJson('/api/admin/campaigns/'+ldCampId,'PATCH',{script:ta.value});
+      const cc=leadCampaigns.find(x=>x.id===ldCampId); if(cc) cc.script=ta.value;
+      $('scMsg').textContent='Saved ✓'; toast('Script saved'); }
+    catch(err){ $('scMsg').textContent=''; toast(err.message,'err'); }
+    finally{ btn.disabled=false; }
+  };
+}
+
 // ═══════════ ADMIN: ANALYTICS (Console) ═══════════
 let anCampId='all', anFrom='', anTo='', anWired=false;
 function fmtHrs(sec){ sec=Math.max(0,Math.round(sec||0)); const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=sec%60;
@@ -1091,7 +1156,7 @@ function anCard(s){
 
 // ═══════════ ADMIN: REPORTS ═══════════
 let adminWs=null, floorAgents=[], agentRepRows=[];
-const REPTITLES={audit:'Audit logs',calls:'Call logs',agent:'Agent report',research:'Research calls',map:'Office map'};
+const REPTITLES={audit:'Audit logs',calls:'Call logs',agent:'Agent report',research:'Research calls',map:'Office map',wallboard:'Wallboard'};
 
 function adminTab(which){
   $('adminConsole').classList.toggle('hidden', which!=='console');
@@ -1111,9 +1176,9 @@ function adminTab(which){
   if(which==='users') initUsers();
   if(which==='ai') initAi();
 }
-function closeReport(){ $('repPanel').classList.add('hidden'); $('repHome').classList.remove('hidden'); closeAdminWs(); }
+function closeReport(){ $('repPanel').classList.add('hidden'); $('repHome').classList.remove('hidden'); closeAdminWs(); stopWallboard(); }
 // Which permission key gates each report tile. Audit is admin-only (no key).
-const REPORT_TILE_PERM={ calls:'reports.call_logs', agent:'reports.agent_report', research:'reports.research', map:'reports.office_map' };
+const REPORT_TILE_PERM={ calls:'reports.call_logs', agent:'reports.agent_report', research:'reports.research', map:'reports.office_map', wallboard:'reports.wallboard' };
 function canOpenReport(kind){
   if(USER && USER.role==='admin') return true;
   if(kind==='audit') return false;               // audit logs are admin-only
@@ -1122,6 +1187,7 @@ function canOpenReport(kind){
 }
 function openReport(kind){
   if(!canOpenReport(kind)){ toast('You don\'t have access to that report','err'); return; }
+  stopWallboard();
   $('repHome').classList.add('hidden'); $('repPanel').classList.remove('hidden');
   // The export button shows for the agent report, and for call logs only when the
   // user is allowed to export (view-vs-export is a separate permission).
@@ -1129,7 +1195,7 @@ function openReport(kind){
   $('repTitle').textContent=REPTITLES[kind]||''; $('repExport').classList.toggle('hidden', !showExport);
   $('repFilters').innerHTML=''; $('repBody').innerHTML='';
   if(kind!=='map') closeAdminWs();
-  ({audit:initAudit,calls:initCalls,agent:initAgent,research:initResearch,map:renderMap}[kind]||(()=>{}))();
+  ({audit:initAudit,calls:initCalls,agent:initAgent,research:initResearch,map:renderMap,wallboard:initWallboard}[kind]||(()=>{}))();
 }
 // Hide the top-level admin tabs and report tiles a support user lacks. Admins see
 // everything. Called on every entry into the admin view.
@@ -1144,6 +1210,7 @@ function applyNavAccess(){
   // Report landing tiles
   const setTile=(id,ok)=>{ const el=$(id); if(el) el.classList.toggle('hidden', !ok); };
   setTile('rtile-audit', isAdmin);
+  setTile('rtile-wallboard', isAdmin || can('reports.wallboard'));
   setTile('rtile-calls', isAdmin || can('reports.call_logs'));
   setTile('rtile-agent', isAdmin || can('reports.agent_report'));
   setTile('rtile-research', isAdmin || can('reports.research'));
@@ -1363,12 +1430,19 @@ async function initCalls(){
         <option value="wrong_number">Wrong number</option>
         <option value="dnc">Do not call</option>
       </select></div>
+    ${can('reports.qa')?`<div class="fw"><span class="lbl">QA</span>
+      <select id="clQa" class="field">
+        <option value="">Any</option>
+        <option value="flagged">Flagged</option>
+        <option value="reviewed">Reviewed</option>
+        <option value="unreviewed">Not reviewed</option>
+      </select></div>`:''}
     <button id="clGo" class="btn btn-primary" style="height:36px">Apply</button>
     <button id="clClear" class="btn btn-sm" style="height:36px">Clear filters</button>`;
   const reload=()=>{ clPage=0; loadCalls(); };
   $('clGo').onclick=reload;
-  ['clAgent','clCamp','clDur','clResult'].forEach(id=>{ const el=$(id); if(el) el.onchange=reload; });
-  $('clClear').onclick=()=>{ ['clDate','clAgent','clCamp','clDur','clResult'].forEach(id=>{ const el=$(id); if(el) el.value=''; }); clPage=0; loadCalls(); };
+  ['clAgent','clCamp','clDur','clResult','clQa'].forEach(id=>{ const el=$(id); if(el) el.onchange=reload; });
+  $('clClear').onclick=()=>{ ['clDate','clAgent','clCamp','clDur','clResult','clQa'].forEach(id=>{ const el=$(id); if(el) el.value=''; }); clPage=0; loadCalls(); };
   $('repExport').onclick=exportCallLogsCsv;
   loadCalls();
 }
@@ -1381,6 +1455,7 @@ function clFilterParams(){
   const cp=$('clCamp')&&$('clCamp').value; if(cp) q.set('campaign_id',cp);
   const dur=$('clDur')&&$('clDur').value; if(dur){ const [lo,hi]=dur.split('-'); if(lo) q.set('dmin',lo); if(hi) q.set('dmax',hi); }
   const rs=$('clResult')&&$('clResult').value; if(rs) q.set('result',rs);
+  const qa=$('clQa')&&$('clQa').value; if(qa) q.set('qa',qa);
   return q;
 }
 async function loadCalls(){
@@ -1445,10 +1520,11 @@ function clCallRow(r,i){
   const det=`cl-det-${i}`;
   const dt=(iso)=>iso?new Date(iso).toLocaleString([], {hour12:false,month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
   const camp=(r.campaigns&&r.campaigns.name)||'—';
+  const flag=r.qa_flagged?' <span title="Flagged for QA review" style="color:#dc2626;font-weight:700">⚑</span>':'';
   return `<tr onclick="toggleAiDet('${det}')" style="cursor:pointer">
       <td class="dim" id="${det}-arw">▸</td>
       <td class="mono dim">${fmtTime(r.created_at)}</td>
-      <td>${esc(name)}</td><td class="mono">${esc(r.to_number||L.phone||'—')}</td>
+      <td>${esc(name)}${flag}</td><td class="mono">${esc(r.to_number||L.phone||'—')}</td>
       <td>${res}</td><td>${esc(r.agent_name||'—')}</td><td class="mono">${callTalk(r)}</td>
       <td onclick="event.stopPropagation()">${rec}</td></tr>
     <tr id="${det}" class="hidden"><td></td><td colspan="7">
@@ -1463,7 +1539,50 @@ function clCallRow(r,i){
         <div><span class="lbl">Lead status</span> ${esc(L.status||'—')}</div>
         <div><span class="lbl">Started</span> ${dt(r.created_at)}</div>
         <div><span class="lbl">Ended</span> ${dt(r.ended_at)}</div>
-      </div></td></tr>`;
+      </div>${can('reports.qa')?qaEditorHtml(r):''}</td></tr>`;
+}
+// Recording QA editor — embedded in the call-log detail row (reports.qa only).
+function qaEditorHtml(r){
+  const cur=r.qa_score||0;
+  const stars=[1,2,3,4,5].map(n=>`<span class="qastar${n<=cur?' on':''}" data-n="${n}" onclick="qaStar(this)">★</span>`).join('');
+  const rev=r.qa_reviewed_at?`<span class="dim" style="font-size:11px">Last reviewed ${new Date(r.qa_reviewed_at).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</span>`:'';
+  return `<div class="qawrap" data-call="${r.id}" style="border-top:1px solid var(--border);margin-top:6px;padding:10px 2px 4px">
+    <div class="row" style="align-items:center;gap:14px;flex-wrap:wrap">
+      <span class="lbl" style="font-weight:600">Quality review</span>
+      <label class="row" style="gap:6px;align-items:center;font-size:13px;cursor:pointer">
+        <input type="checkbox" class="qaflag"${r.qa_flagged?' checked':''}> Flag for review</label>
+      <span class="row" style="gap:2px;align-items:center"><span class="lbl">Score</span> <span class="qastars">${stars}</span>
+        <button class="btn btn-sm" style="height:22px;padding:0 6px" onclick="qaClearScore(this)">clear</button></span>
+      ${rev}
+    </div>
+    <textarea class="qanote field" rows="2" placeholder="QA notes…" style="margin-top:8px;width:100%;resize:vertical">${esc(r.qa_note||'')}</textarea>
+    <div class="row mt2" style="gap:8px;align-items:center">
+      <button class="btn btn-primary btn-sm" onclick="saveQa(this)">Save review</button>
+      <span class="qamsg dim" style="font-size:12px"></span>
+    </div></div>`;
+}
+function qaStar(el){
+  const n=+el.dataset.n; const box=el.closest('.qastars');
+  box.dataset.score=n;
+  [...box.querySelectorAll('.qastar')].forEach(s=>s.classList.toggle('on',+s.dataset.n<=n));
+}
+function qaClearScore(btn){
+  const box=btn.closest('.qawrap').querySelector('.qastars');
+  box.dataset.score='0'; [...box.querySelectorAll('.qastar')].forEach(s=>s.classList.remove('on'));
+}
+async function saveQa(btn){
+  const w=btn.closest('.qawrap'); const id=w.dataset.call;
+  const box=w.querySelector('.qastars');
+  const score=box.dataset.score!=null?+box.dataset.score:([...box.querySelectorAll('.qastar.on')].length);
+  const body={ flagged:w.querySelector('.qaflag').checked, note:w.querySelector('.qanote').value,
+    score: score>0?score:null };
+  const msg=w.querySelector('.qamsg'); btn.disabled=true; msg.textContent='Saving…';
+  try{
+    const r=await api('/api/admin/reports/calls/'+id+'/qa',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){ let m='Save failed'; try{ m=(await r.json()).error||m; }catch(e){} throw new Error(m); }
+    msg.textContent='Saved ✓'; toast('QA review saved');
+  }catch(e){ msg.textContent=''; toast(e.message||'Save failed','err'); }
+  btn.disabled=false;
 }
 
 // ── 3) Agent report ──
@@ -1568,6 +1687,67 @@ function makeDraggable(el, agentId){
   });
 }
 
+// ═══════════ ADMIN: WALLBOARD (live team dashboard) ═══════════
+let wbPollT=null;
+function stopWallboard(){ if(wbPollT){ clearInterval(wbPollT); wbPollT=null; } }
+const WB_STATEC={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',CLAIMING:'info',CONNECTING:'info',WRAP_UP:'warn',BREAK:'warn',OFFLINE:'faint'};
+function wbDur(s){ s=Math.round(s||0); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
+  return h?`${h}h ${m}m`:(m?`${m}m ${ss}s`:`${ss}s`); }
+async function initWallboard(){
+  stopWallboard();
+  $('repFilters').innerHTML='';
+  $('repBody').innerHTML='<div id="wbRoot"><p class="dim">Loading live board…</p></div>';
+  const tick=async()=>{
+    let j; try{ j=await apiJson('/api/admin/reports/wallboard'); }
+    catch(e){ if($('wbRoot')) $('wbRoot').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
+    if(!$('wbRoot')) { stopWallboard(); return; }   // navigated away
+    renderWallboard(j);
+  };
+  await tick();
+  wbPollT=setInterval(tick, 4000);
+}
+function wbKpi(label,val,sub){ return `<div class="wbcard"><div class="wbk-val">${val}</div><div class="wbk-lbl">${esc(label)}</div>${sub?`<div class="wbk-sub">${sub}</div>`:''}</div>`; }
+function renderWallboard(j){
+  const t=j.team||{};
+  const kpis=[
+    wbKpi('Dials today', t.dials||0),
+    wbKpi('Contacts', t.contacts||0, `${t.contact_rate||0}% contact rate`),
+    wbKpi('Sales / Appts', t.sales||0),
+    wbKpi('Talk time', wbDur(t.talk_sec), 'team total'),
+    wbKpi('Agents online', (t.agents_online||0), `${t.agents_on_call||0} on a call`),
+    wbKpi('Campaigns running', t.campaigns_running||0),
+  ].join('');
+  const agents=(j.agents||[]);
+  const rows = agents.length ? agents.map((a,i)=>{
+    const dc=WB_STATEC[a.state]||'faint';
+    return `<tr>
+      <td class="mono dim">${i+1}</td>
+      <td>${esc(a.name)}</td>
+      <td><span class="pill pill--${dc}"><span class="dot dot--${dc}"></span> ${esc(a.state)}</span></td>
+      <td style="text-align:right">${a.dials||0}</td>
+      <td style="text-align:right">${a.contacts||0}</td>
+      <td style="text-align:right">${a.contact_rate||0}%</td>
+      <td style="text-align:right"><b>${a.sales||0}</b></td>
+      <td style="text-align:right">${wbDur(a.talk)}</td></tr>`;
+  }).join('') : '<tr><td colspan="8" class="dim">No agents online or no dials yet today.</td></tr>';
+  const disps=(j.dispositions||[]);
+  const maxc=disps.reduce((m,d)=>Math.max(m,d.count),0)||1;
+  const dispBars=disps.length ? disps.map(d=>`
+    <div class="wbbar"><div class="wbbar-l"><span class="dot" style="background:${d.color||'#8b95a5'}"></span>${esc(d.label||d.code)}</div>
+      <div class="wbbar-track"><div class="wbbar-fill" style="width:${Math.round(d.count/maxc*100)}%;background:${d.color||'#8b95a5'}"></div></div>
+      <div class="wbbar-n mono">${d.count}</div></div>`).join('') : '<p class="dim">No dispositions logged today.</p>';
+  $('wbRoot').innerHTML=`
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:12px">
+      <span class="dim" style="font-size:12px">Since ${new Date(j.since).toLocaleDateString()} · updated ${new Date(j.ts).toLocaleTimeString([],{hour12:false})} · auto-refresh 4s</span></div>
+    <div class="wbgrid">${kpis}</div>
+    <div class="grid2 mt">
+      <div class="card"><h2>Agent leaderboard</h2>
+        <div class="tblwrap"><table class="wbtbl"><thead><tr><th>#</th><th>Agent</th><th>Status</th><th style="text-align:right">Dials</th><th style="text-align:right">Contacts</th><th style="text-align:right">Rate</th><th style="text-align:right">Sales</th><th style="text-align:right">Talk</th></tr></thead>
+        <tbody>${rows}</tbody></table></div></div>
+      <div class="card"><h2>Dispositions today</h2>${dispBars}</div>
+    </div>`;
+}
+
 // ═══════════ ADMIN: LEADS (Sprint 1 — Lead Management) ═══════════
 let leadCampaigns=[], ldCampId=null, ldCurTab='import', ldCampFields=[];
 function enhanceAll(root){ (root||document).querySelectorAll('select:not([data-enh])').forEach(enhanceSelect); }
@@ -1595,8 +1775,8 @@ function leadTab(t){
   ldCurTab=t;
   $('ldSub').querySelectorAll('[data-lt]').forEach(b=>b.classList.toggle('active', b.dataset.lt===t));
   const body=$('ldBody'); body.innerHTML='<p class="dim">Loading…</p>';
-  if(!ldCampId && ['import','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
-  ({import:renderImport,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow}[t]||(()=>{}))();
+  if(!ldCampId && ['import','script','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
+  ({import:renderImport,script:renderScript,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow}[t]||(()=>{}))();
 }
 
 // ── Global lead search ──

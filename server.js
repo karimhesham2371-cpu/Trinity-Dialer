@@ -366,6 +366,8 @@ const PERMISSIONS = [
   { key: 'reports.office_map',       label: 'Office map',       area: 'reports', hint: 'Live floor — each agent\'s seat and status.' },
   { key: 'reports.research',         label: 'Research calls',   area: 'reports', hint: 'Look up a call by phone number.' },
   { key: 'reports.agent_report',     label: 'Agent report',     area: 'reports', hint: 'Per-agent logged-in / talk / wrap time.' },
+  { key: 'reports.wallboard',        label: 'Wallboard',        area: 'reports', hint: 'Live team dashboard — dials, contact rate, sales, per-agent status.' },
+  { key: 'reports.qa',               label: 'Recording QA',     area: 'reports', hint: 'Flag / score / annotate recordings for quality review (inside Call logs).' },
 ];
 const PERM_KEYS = new Set(PERMISSIONS.map(p => p.key));
 const normPerms = (v) => (Array.isArray(v) ? v.filter(k => PERM_KEYS.has(k)) : []);
@@ -402,8 +404,10 @@ function userCan(user, need) {
 // report filters depend on are opened to any support user with a report grant.
 function permForPath(path, method) {
   if (path.startsWith('/api/admin/reports/calls/export')) return 'reports.call_logs_export';
+  if (/^\/api\/admin\/reports\/calls\/[^/]+\/qa$/.test(path)) return 'reports.qa';
   if (path.startsWith('/api/admin/reports/calls'))        return 'reports.call_logs';
   if (path.startsWith('/api/admin/reports/agent'))        return 'reports.agent_report';
+  if (path.startsWith('/api/admin/reports/wallboard'))    return 'reports.wallboard';
   if (path.startsWith('/api/admin/reports/research'))     return 'reports.research';
   if (path.startsWith('/api/admin/reports/recording'))    return ['reports.call_logs', 'reports.research'];
   if (path.startsWith('/api/admin/floor'))                return 'reports.office_map';
@@ -843,6 +847,29 @@ app.post('/api/admin/campaigns', auth, adminOnly, async (req, res) => {
     const [row] = await sbInsert('campaigns', { name, status: 'DRAFT', active: false });
     audit(req.user, 'CREATE_CAMPAIGN', { target_type: 'campaign', target_id: row.id, meta: { name } });
     res.json({ ok: true, campaign: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Edit campaign config. Whitelisted fields only. Admin-only (permForPath returns
+// null for PATCH here, so a support user falls through adminOnly to 403).
+app.patch('/api/admin/campaigns/:id', auth, adminOnly, async (req, res) => {
+  const b = req.body || {};
+  const patch = {};
+  if (b.name != null && String(b.name).trim()) patch.name = String(b.name).trim();
+  if (b.script != null) patch.script = String(b.script);
+  if (b.wrap_seconds != null) patch.wrap_seconds = Math.max(0, Math.min(60, parseInt(b.wrap_seconds, 10) || 0));
+  if (b.dial_ratio != null) patch.dial_ratio = Math.max(1, Math.min(4, Number(b.dial_ratio) || 1));
+  if (b.amd_mode != null && ['premium', 'detect', 'disabled'].includes(b.amd_mode)) patch.amd_mode = b.amd_mode;
+  if (b.record_calls != null) patch.record_calls = !!b.record_calls;
+  if (b.local_presence != null) patch.local_presence = !!b.local_presence;
+  if (b.vm_drop_enabled != null) patch.vm_drop_enabled = !!b.vm_drop_enabled;
+  if (b.vm_drop_url != null) patch.vm_drop_url = String(b.vm_drop_url).trim() || null;
+  if (!Object.keys(patch).length) return res.status(400).json({ error: 'nothing to update' });
+  try {
+    await sbUpdate('campaigns', `id=eq.${req.params.id}`, patch);
+    const meta = { ...patch }; if (meta.script != null) meta.script = `(${meta.script.length} chars)`;
+    audit(req.user, 'UPDATE_CAMPAIGN', { target_type: 'campaign', target_id: req.params.id, meta });
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1766,6 +1793,10 @@ app.get('/api/admin/reports/calls', auth, adminOnly, async (req, res) => {
     if (result === 'no_answer') f.push('leads.or=(last_outcome.ilike.no_answer,last_outcome.ilike.machine,last_outcome.ilike.busy)');
     else f.push(`leads.last_outcome=ilike.${encodeURIComponent(result)}`);
   }
+  const qa = String(req.query.qa || '').trim().toLowerCase();
+  if (qa === 'flagged')    f.push('qa_flagged=is.true');
+  if (qa === 'reviewed')   f.push('qa_reviewed_at=not.is.null');
+  if (qa === 'unreviewed') f.push('qa_reviewed_at=is.null');
   try {
     const [rows, names] = await Promise.all([sbSelect('calls', f.join('&')), agentNameMap()]);
     const hasMore = rows.length > PER;
@@ -1837,6 +1868,28 @@ app.get('/api/admin/reports/calls/export', auth, adminOnly, async (req, res) => 
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', 'attachment; filename="call-logs.csv"');
     res.send(lines.join('\r\n'));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Recording QA — flag / score / annotate a call recording for quality review.
+// Lives inside the Call logs report; gated by reports.qa (separate from viewing).
+app.post('/api/admin/reports/calls/:id/qa', auth, adminOnly, async (req, res) => {
+  const id = req.params.id;
+  const b = req.body || {};
+  const patch = { qa_reviewed_by: req.user.id, qa_reviewed_at: new Date().toISOString() };
+  if (b.flagged != null) patch.qa_flagged = !!b.flagged;
+  if (b.score === null || b.score === '') patch.qa_score = null;
+  else if (b.score != null) {
+    const s = parseInt(b.score, 10);
+    if (isNaN(s) || s < 1 || s > 5) return res.status(400).json({ error: 'score must be 1–5 or empty' });
+    patch.qa_score = s;
+  }
+  if (b.note != null) patch.qa_note = String(b.note).slice(0, 2000);
+  try {
+    const rows = await sbUpdate('calls', `id=eq.${id}`, patch);
+    if (!rows || !rows.length) return res.status(404).json({ error: 'call not found' });
+    audit(req.user, 'QA_REVIEW', { target_type: 'calls', target_id: id, meta: { flagged: patch.qa_flagged, score: patch.qa_score } });
+    res.json({ ok: true, call: rows[0] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1942,6 +1995,54 @@ app.get('/api/admin/analytics', auth, adminOnly, async (req, res) => {
       delete a._codes; return a;
     });
     res.json({ from: fromIso, to: toIso, campaigns, summaries });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Real-time wallboard ───────────────────────────────────────────────────────
+// Live team snapshot for a wall-mounted / always-open view: today's dials,
+// contact rate, sales, plus per-agent live state and a disposition breakdown.
+// Cheap enough to poll every few seconds. "Today" = since local midnight.
+app.get('/api/admin/reports/wallboard', auth, adminOnly, async (_req, res) => {
+  const now = Date.now();
+  const fromIso = new Date(new Date().toDateString()).toISOString();
+  const ONLINE = new Set(['CONNECTING', 'AVAILABLE', 'CLAIMING', 'DIALING', 'ON_CALL', 'WRAP_UP', 'BREAK']);
+  try {
+    const [names, calls, disps, campaigns] = await Promise.all([
+      agentNameMap(),
+      sbSelect('calls', `created_at=gte.${encodeURIComponent(fromIso)}&select=agent_id,bridged_at,duration_sec,talk_seconds&limit=200000`),
+      sbSelect('dispositions', `created_at=gte.${encodeURIComponent(fromIso)}&select=agent_id,code&limit=200000`),
+      sbSelect('campaigns', 'select=id,status'),
+    ]);
+    const per = {};
+    const A = (id) => per[id] || (per[id] = { agent_id: id, name: names[id] || '—',
+      dials: 0, contacts: 0, talk: 0, sales: 0, state: (rt[id] && rt[id].state) || 'OFFLINE' });
+    let dials = 0, contacts = 0, talk = 0;
+    for (const c of calls || []) {
+      dials++; if (c.bridged_at) contacts++; talk += (c.talk_seconds || c.duration_sec || 0);
+      if (c.agent_id) { const a = A(c.agent_id); a.dials++; if (c.bridged_at) a.contacts++; a.talk += (c.talk_seconds || c.duration_sec || 0); }
+    }
+    let sales = 0; const codeBreak = {};
+    for (const d of disps || []) {
+      codeBreak[d.code] = (codeBreak[d.code] || 0) + 1;
+      if (d.code === 'SALE') { sales++; if (d.agent_id) A(d.agent_id).sales++; }
+    }
+    // Surface every currently-online agent, even with no dials yet today.
+    for (const id of Object.keys(rt)) if (ONLINE.has(rt[id] && rt[id].state)) A(id);
+    const agents = Object.values(per).map(a => {
+      a.talk = Math.round(a.talk);
+      a.contact_rate = a.dials ? Math.round((a.contacts / a.dials) * 1000) / 10 : 0;
+      return a;
+    }).sort((x, y) => (y.sales - x.sales) || (y.contacts - x.contacts) || (y.dials - x.dials));
+    const online = Object.keys(rt).filter(id => ONLINE.has(rt[id] && rt[id].state));
+    const dispositions = Object.entries(codeBreak)
+      .map(([code, count]) => ({ code, ...dispMeta(code), count })).sort((a, b) => b.count - a.count);
+    res.json({ ts: now, since: fromIso,
+      team: { dials, contacts, talk_sec: Math.round(talk), sales,
+        contact_rate: dials ? Math.round((contacts / dials) * 1000) / 10 : 0,
+        agents_online: online.length,
+        agents_on_call: Object.keys(rt).filter(id => rt[id].state === 'ON_CALL').length,
+        campaigns_running: (campaigns || []).filter(c => c.status === 'RUNNING').length },
+      agents, dispositions });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

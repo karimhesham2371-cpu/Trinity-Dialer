@@ -459,3 +459,12 @@ end $$;
 -- the PERMISSIONS registry in server.js: reports.call_logs, reports.call_logs_export,
 -- reports.office_map, reports.research, reports.agent_report.
 alter table agents add column if not exists permissions jsonb not null default '[]'::jsonb;
+
+-- v10 — Recording QA. Reviewers (admins / support with reports.qa) flag, score
+-- (1–5) and annotate call recordings for quality review, embedded in Call logs.
+alter table calls add column if not exists qa_flagged     boolean not null default false;
+alter table calls add column if not exists qa_score       smallint;
+alter table calls add column if not exists qa_note        text;
+alter table calls add column if not exists qa_reviewed_by uuid references agents(id);
+alter table calls add column if not exists qa_reviewed_at timestamptz;
+create index if not exists idx_calls_qa_flagged on calls(qa_flagged) where qa_flagged;
