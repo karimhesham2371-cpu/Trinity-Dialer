@@ -349,7 +349,68 @@ const enc = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64');
 const dec = (b64) => { if (!b64) return null; try { return JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch { return null; } };
 
 function signToken(a) {
-  return jwt.sign({ id: a.id, role: a.role, name: a.name, email: a.email }, JWT_SECRET, { expiresIn: '12h' });
+  return jwt.sign(
+    { id: a.id, role: a.role, name: a.name, email: a.email, permissions: normPerms(a.permissions) },
+    JWT_SECRET, { expiresIn: '12h' });
+}
+
+// ── Role tiers & granular support permissions ────────────────────────────────
+// Three tiers: admin (everything), support (only the capabilities an admin
+// grants — enforced per-request), agent (softphone only). The registry below is
+// the single source of truth; the admin UI renders a checkbox per entry, so
+// adding a new grantable capability is a one-line change here + a permForPath
+// mapping. Keep keys stable (they're persisted on the user row).
+const PERMISSIONS = [
+  { key: 'reports.call_logs',        label: 'Call logs',        area: 'reports', hint: 'View the call log (listen to recordings).' },
+  { key: 'reports.call_logs_export', label: 'Export call logs', area: 'reports', hint: 'Download the call log as CSV. Separate from viewing, to limit data egress.' },
+  { key: 'reports.office_map',       label: 'Office map',       area: 'reports', hint: 'Live floor — each agent\'s seat and status.' },
+  { key: 'reports.research',         label: 'Research calls',   area: 'reports', hint: 'Look up a call by phone number.' },
+  { key: 'reports.agent_report',     label: 'Agent report',     area: 'reports', hint: 'Per-agent logged-in / talk / wrap time.' },
+];
+const PERM_KEYS = new Set(PERMISSIONS.map(p => p.key));
+const normPerms = (v) => (Array.isArray(v) ? v.filter(k => PERM_KEYS.has(k)) : []);
+
+// Live permission cache (userId -> { role, perms:Set }). Authoritative for
+// access checks so an admin's grant/revoke takes effect on the support user's
+// very next request — no need to wait out their 12h session token.
+const permCache = new Map();
+function cacheUser(u) {
+  if (u && u.id) permCache.set(u.id, { role: u.role, perms: new Set(normPerms(u.permissions)) });
+}
+async function loadPermCache() {
+  try {
+    const rows = await sbSelect('agents', 'select=id,role,permissions');
+    permCache.clear();
+    for (const u of rows) cacheUser(u);
+    console.log(`[perms] cached ${permCache.size} users`);
+  } catch (e) { console.error('[perms] cache load failed:', e.message); }
+}
+// Does this user hold (any of) the required permission key(s)?
+function userCan(user, need) {
+  if (!user) return false;
+  const c = permCache.get(user.id);
+  const role = c ? c.role : user.role;
+  if (role === 'admin') return true;
+  if (role !== 'support') return false;
+  const perms = c ? c.perms : new Set(normPerms(user.permissions));
+  const needs = Array.isArray(need) ? need : [need];
+  return needs.some(k => perms.has(k));
+}
+// Map an admin API request to the permission(s) that unlock it for a support
+// user. null = admin-only (no support grant exists for that path). Most-specific
+// paths first (…/calls/export must beat …/calls). Read-only list endpoints the
+// report filters depend on are opened to any support user with a report grant.
+function permForPath(path, method) {
+  if (path.startsWith('/api/admin/reports/calls/export')) return 'reports.call_logs_export';
+  if (path.startsWith('/api/admin/reports/calls'))        return 'reports.call_logs';
+  if (path.startsWith('/api/admin/reports/agent'))        return 'reports.agent_report';
+  if (path.startsWith('/api/admin/reports/research'))     return 'reports.research';
+  if (path.startsWith('/api/admin/reports/recording'))    return ['reports.call_logs', 'reports.research'];
+  if (path.startsWith('/api/admin/floor'))                return 'reports.office_map';
+  if (path === '/api/admin/permissions')                  return PERMISSIONS.map(p => p.key); // any grant
+  if (method === 'GET' && (path === '/api/admin/users' || path === '/api/admin/campaigns'))
+    return PERMISSIONS.map(p => p.key); // agent/campaign name lookups for report filters
+  return null;
 }
 function auth(req, res, next) {
   const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
@@ -360,9 +421,25 @@ function auth(req, res, next) {
   try { req.user = jwt.verify(token, JWT_SECRET); next(); }
   catch { return res.sendStatus(401); }
 }
+// Guards every /api/admin/* route. Admins pass unconditionally; support users
+// pass only on paths mapped to a permission they hold; everyone else is denied.
 function adminOnly(req, res, next) {
-  if (!req.user || req.user.role !== 'admin') return res.sendStatus(403);
-  next();
+  if (!req.user) return res.sendStatus(403);
+  const c = permCache.get(req.user.id);
+  const role = c ? c.role : req.user.role;
+  if (role === 'admin') return next();
+  if (role === 'support') {
+    const need = permForPath(req.path, req.method);
+    if (need && userCan(req.user, need)) return next();
+  }
+  return res.sendStatus(403);
+}
+// Strict admin gate for escalation-sensitive writes (creating/editing users).
+// Never satisfiable by a support permission, so support can't grant itself power.
+function adminRoleOnly(req, res, next) {
+  const c = permCache.get(req.user && req.user.id);
+  const role = c ? c.role : (req.user && req.user.role);
+  return role === 'admin' ? next() : res.sendStatus(403);
 }
 function findAgentByLeg(legId) {
   for (const id of Object.keys(rt)) {
@@ -575,7 +652,8 @@ function areaCodeOf(e164) {
 // clients: Set of { ws, userId, role }
 const wsClients = new Set();
 function wsSend(ws, obj) { try { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); } catch {} }
-function wsToAdmins(obj) { for (const c of wsClients) if (c.role === 'admin') wsSend(c.ws, obj); }
+// Admins + support users (the latter for the live office map) see the floor feed.
+function wsToAdmins(obj) { for (const c of wsClients) if (c.role === 'admin' || c.role === 'support') wsSend(c.ws, obj); }
 function wsToAgent(id, obj) { for (const c of wsClients) if (c.userId === id) wsSend(c.ws, obj); }
 function agentSnapshot(id) {
   const st = rt[id] || { state: 'OFFLINE' };
@@ -615,8 +693,9 @@ app.post('/api/login', async (req, res) => {
     if (!a || !a.active || !a.password_hash) return res.status(401).json({ error: 'invalid login' });
     const ok = await bcrypt.compare(password, a.password_hash);
     if (!ok) return res.status(401).json({ error: 'invalid login' });
+    cacheUser(a);   // keep the live permission cache fresh on every login
     audit({ id: a.id, name: a.name, role: a.role }, 'LOGIN', { target_type: 'session' });
-    res.json({ token: signToken(a), user: { id: a.id, name: a.name, email: a.email, role: a.role } });
+    res.json({ token: signToken(a), user: { id: a.id, name: a.name, email: a.email, role: a.role, permissions: normPerms(a.permissions) } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -634,9 +713,14 @@ app.get('/health', (_req, res) => {
 });
 
 // ══ ADMIN: users ════════════════════════════════════════════════════════════════
+// The permission registry drives the support-role checkbox UI. Admin-managed only.
+app.get('/api/admin/permissions', auth, adminOnly, adminRoleOnly, (_req, res) => {
+  res.json({ permissions: PERMISSIONS });
+});
+
 app.get('/api/admin/users', auth, adminOnly, async (_req, res) => {
   try {
-    const rows = await sbSelect('agents', 'select=id,name,email,role,active,state,telnyx_credential_id,campaign_id&order=created_at.asc');
+    const rows = await sbSelect('agents', 'select=id,name,email,role,active,state,telnyx_credential_id,campaign_id,permissions&order=created_at.asc');
     // Overlay the live in-memory runtime state; the DB `state` column is only a
     // creation-time seed and is never persisted per state change.
     const users = rows.map(u => ({ ...u, state: (rt[u.id] && rt[u.id].state) || 'OFFLINE' }));
@@ -644,16 +728,18 @@ app.get('/api/admin/users', auth, adminOnly, async (_req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/admin/users', auth, adminOnly, async (req, res) => {
-  const { name, email, password, role } = req.body || {};
+app.post('/api/admin/users', auth, adminOnly, adminRoleOnly, async (req, res) => {
+  const { name, email, password, role: rawRole, permissions } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: 'name, email, password required' });
+  const role = ['admin', 'support', 'agent'].includes(rawRole) ? rawRole : 'agent';
+  const perms = role === 'support' ? normPerms(permissions) : [];
   try {
     const existing = await sbSelect('agents', `email=eq.${encodeURIComponent(email)}&select=id`);
     if (existing.length) return res.status(409).json({ error: 'email already exists' });
 
-    // Provision a Telnyx WebRTC telephony credential on the Credential Connection.
+    // Only agents take calls, so only agents get a Telnyx WebRTC credential.
     let credId = null, sip = null;
-    if (TELNYX_KEY) {
+    if (role === 'agent' && TELNYX_KEY) {
       const cred = await telnyx('POST', '/telephony_credentials', {
         connection_id: CRED_CONNECTION_ID, name: `trinity-${String(email).replace(/[^a-z0-9]/gi, '')}`,
       });
@@ -662,17 +748,19 @@ app.post('/api/admin/users', auth, adminOnly, async (req, res) => {
     }
     const hash = await bcrypt.hash(password, 10);
     const [row] = await sbInsert('agents', {
-      name, email: String(email).trim(), password_hash: hash, role: role === 'admin' ? 'admin' : 'agent',
+      name, email: String(email).trim(), password_hash: hash, role,
       telnyx_credential_id: credId, sip_username: sip, active: true, state: 'OFFLINE',
+      permissions: perms,
     });
-    audit(req.user, 'ADD_AGENT', { target_type: 'agent', target_id: row.id, meta: { name: row.name, email: row.email, role: row.role } });
-    res.json({ ok: true, user: { id: row.id, name: row.name, email: row.email, role: row.role, sip_username: sip } });
+    cacheUser({ ...row, permissions: perms });
+    audit(req.user, 'ADD_AGENT', { target_type: 'agent', target_id: row.id, meta: { name: row.name, email: row.email, role, permissions: perms } });
+    res.json({ ok: true, user: { id: row.id, name: row.name, email: row.email, role, sip_username: sip } });
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
-app.patch('/api/admin/users/:id', auth, adminOnly, async (req, res) => {
+app.patch('/api/admin/users/:id', auth, adminOnly, adminRoleOnly, async (req, res) => {
   const patch = {};
-  const { name, email, password, active, role } = req.body || {};
+  const { name, email, password, active, role, permissions } = req.body || {};
   if (name != null) patch.name = name;
   if (email != null && String(email).trim()) {
     const other = await sbSelect('agents',
@@ -681,10 +769,24 @@ app.patch('/api/admin/users/:id', auth, adminOnly, async (req, res) => {
     patch.email = String(email).trim();
   }
   if (active != null) patch.active = !!active;
-  if (role != null) patch.role = role === 'admin' ? 'admin' : 'agent';
+  let newRole = null;
+  if (role != null) {
+    newRole = ['admin', 'support', 'agent'].includes(role) ? role : 'agent';
+    patch.role = newRole;
+    // A non-support user holds no permissions; clear them on role change.
+    if (newRole !== 'support') patch.permissions = [];
+  }
+  // Permission edits apply when the (resulting) role is support.
+  if (permissions != null) {
+    const effectiveRole = newRole || null;
+    if (effectiveRole === 'support' || effectiveRole == null) patch.permissions = normPerms(permissions);
+  }
   if (password) patch.password_hash = await bcrypt.hash(password, 10);
   try {
     await sbUpdate('agents', `id=eq.${req.params.id}`, patch);
+    // Refresh the live permission cache so revocation/grant is immediate.
+    const [fresh] = await sbSelect('agents', `id=eq.${req.params.id}&select=id,role,permissions`);
+    if (fresh) cacheUser(fresh);
     const meta = { ...patch }; delete meta.password_hash;
     if (password) meta.password = 'reset';
     audit(req.user, 'UPDATE_AGENT', { target_type: 'agent', target_id: req.params.id, meta });
@@ -692,7 +794,7 @@ app.patch('/api/admin/users/:id', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/admin/users/:id', auth, adminOnly, async (req, res) => {
+app.delete('/api/admin/users/:id', auth, adminOnly, adminRoleOnly, async (req, res) => {
   const id = req.params.id;
   if (id === req.user.id) return res.status(400).json({ error: "you can't delete your own account" });
   try {
@@ -710,6 +812,7 @@ app.delete('/api/admin/users/:id', auth, adminOnly, async (req, res) => {
     await sbDelete('campaign_agents', `agent_id=eq.${id}`).catch(() => {});
     await sbDelete('agents', `id=eq.${id}`);
     delete rt[id];
+    permCache.delete(id);
     audit(req.user, 'DELETE_AGENT', { target_type: 'agent', target_id: id,
       meta: { name: target.name, email: target.email, role: target.role } });
     res.json({ ok: true });
@@ -3062,7 +3165,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => wsClients.delete(client));
   ws.on('error', () => wsClients.delete(client));
   // Prime the new client with the current picture.
-  if (user.role === 'admin') {
+  if (user.role === 'admin' || user.role === 'support') {
     for (const id of Object.keys(rt)) wsSend(ws, { type: 'floor.agent', ...agentSnapshot(id) });
   } else {
     wsSend(ws, { type: 'agent.state', ...agentSnapshot(user.id) });
@@ -3144,6 +3247,7 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(PORT, async () => {
   console.log(`Trinity Dialer (phase0) listening on :${PORT}`);
   await bootstrapAdmin();
+  await loadPermCache();
   await rehydrateRt();
   await refreshCallerPool();
   await loadCallingWindow();

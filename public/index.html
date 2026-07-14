@@ -246,6 +246,11 @@
   .navtab.active{color:var(--accent-ink);background:var(--accent)}
   .wrap.wide{max-width:1200px}
   /* ── reports landing tiles ── */
+  .permgrid{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+  .permitem{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);cursor:pointer}
+  .permitem input{margin-top:2px;flex:none}
+  .permitem .pi-label{font:600 13px var(--font-ui);color:var(--text)}
+  .permitem .pi-hint{display:block;font:400 11px var(--font-ui);color:var(--text-dim);margin-top:2px}
   .rgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
   @media(max-width:900px){.rgrid{grid-template-columns:1fr 1fr}}
   @media(max-width:600px){.rgrid{grid-template-columns:1fr}}
@@ -433,11 +438,11 @@
     <!-- landing -->
     <div id="repHome">
       <div class="rgrid">
-        <button class="rtile" onclick="openReport('audit')"><h3>Audit logs</h3><p>Every user action — logins, calls, saved files, campaign changes.</p></button>
-        <button class="rtile" onclick="openReport('calls')"><h3>Call logs</h3><p>All calls placed. Listen to and download recordings.</p></button>
-        <button class="rtile" onclick="openReport('agent')"><h3>Agent report</h3><p>Logged-in, dialing, talk, wrap and break time per agent. Export CSV.</p></button>
-        <button class="rtile" onclick="openReport('research')"><h3>Research calls</h3><p>Find a specific call by its phone number.</p></button>
-        <button class="rtile" onclick="openReport('map')"><h3>Office map</h3><p>Live floor — each agent's seat and current status.</p></button>
+        <button id="rtile-audit" class="rtile" onclick="openReport('audit')"><h3>Audit logs</h3><p>Every user action — logins, calls, saved files, campaign changes.</p></button>
+        <button id="rtile-calls" class="rtile" onclick="openReport('calls')"><h3>Call logs</h3><p>All calls placed. Listen to and download recordings.</p></button>
+        <button id="rtile-agent" class="rtile" onclick="openReport('agent')"><h3>Agent report</h3><p>Logged-in, dialing, talk, wrap and break time per agent. Export CSV.</p></button>
+        <button id="rtile-research" class="rtile" onclick="openReport('research')"><h3>Research calls</h3><p>Find a specific call by its phone number.</p></button>
+        <button id="rtile-map" class="rtile" onclick="openReport('map')"><h3>Office map</h3><p>Live floor — each agent's seat and current status.</p></button>
       </div>
     </div>
     <!-- panel -->
@@ -488,11 +493,15 @@
         <div class="row"><input id="nuName" class="field" placeholder="Full name" /><input id="nuEmail" class="field" placeholder="Email or username" /></div>
         <div class="row mt3">
           <input id="nuPass" class="field" type="password" placeholder="Password" />
-          <select id="nuRole" class="field"><option value="agent">Agent</option><option value="admin">Admin</option></select>
+          <select id="nuRole" class="field"><option value="agent">Agent</option><option value="support">Support</option><option value="admin">Admin</option></select>
+        </div>
+        <div id="nuPermsWrap" class="mt3 hidden">
+          <span class="lbl">Support access — grant only what this user needs</span>
+          <div id="nuPerms" class="permgrid"></div>
         </div>
         <button id="btnCreateUser" class="btn btn-primary btn-block mt3">Create user</button>
         <p id="nuErr" class="err mt hidden"></p>
-        <p class="dim mt3" style="font-size:12px">Agents get a Telnyx softphone credential automatically.</p>
+        <p class="dim mt3" style="font-size:12px">Agents get a Telnyx softphone credential automatically. Support users get only the report access you check above.</p>
       </div>
       <div class="card">
         <h2>About user management</h2>
@@ -520,6 +529,19 @@ let USER  = JSON.parse(localStorage.getItem('trinity_user') || 'null');
 let client=null, ws=null, serverState='OFFLINE', usersCache=[];
 let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null, serverWrapUntil=0;
 let dispositions=[], curCampaign=null, pendingCb=null;
+
+// ── RBAC ──────────────────────────────────────────────────────────────────────
+// Admins have implicit full access; support users hold an explicit permission
+// list; agents never reach the admin view. Mirrors server-side userCan().
+function can(key){
+  if(!USER) return false;
+  if(USER.role==='admin') return true;
+  if(USER.role!=='support') return false;
+  const perms = Array.isArray(USER.permissions) ? USER.permissions : [];
+  return Array.isArray(key) ? key.some(k=>perms.includes(k)) : perms.includes(key);
+}
+const REPORT_PERMS=['reports.call_logs','reports.call_logs_export','reports.office_map','reports.research','reports.agent_report'];
+function canAnyReport(){ return REPORT_PERMS.some(k=>can(k)); }
 
 function log(m){ const el=$('log'); if(!el) return; el.textContent += (new Date().toLocaleTimeString([], {hour12:false})+'  '+m+'\n'); el.scrollTop=el.scrollHeight; }
 function toast(m,kind){ if(kind===true)kind='err'; kind=kind||'ok';
@@ -601,7 +623,7 @@ $('liPass').addEventListener('keydown', e=>{ if(e.key==='Enter') $('btnLogin').c
 
 function route(){
   if(!TOKEN||!USER){ show('login'); return; }
-  if(USER.role==='admin'){ show('admin'); $('adWho').textContent=USER.name+' · '+USER.email; loadAdmin(); }
+  if(USER.role==='admin'||USER.role==='support'){ show('admin'); $('adWho').textContent=USER.name+' · '+USER.email; loadAdmin(); }
   else { show('agent'); $('agWho').textContent=USER.name; startAgent(); }
 }
 
@@ -928,7 +950,15 @@ document.addEventListener('keydown', e=>{
 });
 
 // ═══════════ ADMIN ═══════════
-async function loadAdmin(){ await loadUsers(); initAnalytics(); }
+async function loadAdmin(){
+  applyNavAccess();
+  if(USER && USER.role==='admin'){ await loadUsers(); adminTab('console'); return; }
+  // Support: land on the first report area they're allowed to see; analytics,
+  // leads, users and AI are admin-only and would 403.
+  try{ await loadUsers(); }catch{}          // needed for call-log filter dropdowns
+  if(canAnyReport()) adminTab('reports');
+  else { $('adminReports').classList.remove('hidden'); $('repHome').innerHTML='<p class="dim" style="padding:24px">No report access has been granted to your account yet.</p>'; }
+}
 async function loadUsers(){
   const j = await apiJson('/api/admin/users'); usersCache=j.users;
   const tb=$('usersTbl'); if(!tb) return;   // console no longer renders an agents table
@@ -1082,18 +1112,74 @@ function adminTab(which){
   if(which==='ai') initAi();
 }
 function closeReport(){ $('repPanel').classList.add('hidden'); $('repHome').classList.remove('hidden'); closeAdminWs(); }
+// Which permission key gates each report tile. Audit is admin-only (no key).
+const REPORT_TILE_PERM={ calls:'reports.call_logs', agent:'reports.agent_report', research:'reports.research', map:'reports.office_map' };
+function canOpenReport(kind){
+  if(USER && USER.role==='admin') return true;
+  if(kind==='audit') return false;               // audit logs are admin-only
+  const need=REPORT_TILE_PERM[kind];
+  return need ? can(need) : false;
+}
 function openReport(kind){
+  if(!canOpenReport(kind)){ toast('You don\'t have access to that report','err'); return; }
   $('repHome').classList.add('hidden'); $('repPanel').classList.remove('hidden');
-  $('repTitle').textContent=REPTITLES[kind]||''; $('repExport').classList.toggle('hidden', kind!=='agent'&&kind!=='calls');
+  // The export button shows for the agent report, and for call logs only when the
+  // user is allowed to export (view-vs-export is a separate permission).
+  const showExport = (kind==='agent') || (kind==='calls' && can('reports.call_logs_export'));
+  $('repTitle').textContent=REPTITLES[kind]||''; $('repExport').classList.toggle('hidden', !showExport);
   $('repFilters').innerHTML=''; $('repBody').innerHTML='';
   if(kind!=='map') closeAdminWs();
   ({audit:initAudit,calls:initCalls,agent:initAgent,research:initResearch,map:renderMap}[kind]||(()=>{}))();
 }
+// Hide the top-level admin tabs and report tiles a support user lacks. Admins see
+// everything. Called on every entry into the admin view.
+function applyNavAccess(){
+  const isAdmin = USER && USER.role==='admin';
+  const setTab=(id,ok)=>{ const el=$(id); if(el) el.classList.toggle('hidden', !ok); };
+  setTab('tabConsole', isAdmin);
+  setTab('tabLeads', isAdmin);
+  setTab('tabUsers', isAdmin);
+  setTab('tabAi', isAdmin);
+  setTab('tabReports', isAdmin || canAnyReport());
+  // Report landing tiles
+  const setTile=(id,ok)=>{ const el=$(id); if(el) el.classList.toggle('hidden', !ok); };
+  setTile('rtile-audit', isAdmin);
+  setTile('rtile-calls', isAdmin || can('reports.call_logs'));
+  setTile('rtile-agent', isAdmin || can('reports.agent_report'));
+  setTile('rtile-research', isAdmin || can('reports.research'));
+  setTile('rtile-map', isAdmin || can('reports.office_map'));
+}
 
 // ── User management ──
 let umUsers=[];
+let PERM_REGISTRY=[];
+async function loadPermRegistry(){
+  if(PERM_REGISTRY.length) return PERM_REGISTRY;
+  try{ const j=await apiJson('/api/admin/permissions'); PERM_REGISTRY=j.permissions||[]; }catch{ PERM_REGISTRY=[]; }
+  return PERM_REGISTRY;
+}
+// Render the permission checkbox list into a container, pre-checking `selected`.
+function renderPermChecks(container, selected){
+  const sel=new Set(selected||[]);
+  container.innerHTML='';
+  PERM_REGISTRY.forEach(p=>{
+    const id='perm_'+p.key.replace(/\W/g,'_')+'_'+Math.random().toString(36).slice(2,6);
+    const lab=document.createElement('label'); lab.className='permitem';
+    lab.innerHTML=`<input type="checkbox" value="${esc(p.key)}" id="${id}"${sel.has(p.key)?' checked':''}>`+
+      `<span><span class="pi-label">${esc(p.label)}</span>${p.hint?`<span class="pi-hint">${esc(p.hint)}</span>`:''}</span>`;
+    container.appendChild(lab);
+  });
+}
+function readPermChecks(container){
+  return Array.from(container.querySelectorAll('input[type=checkbox]:checked')).map(c=>c.value);
+}
 async function initUsers(){
   enhanceSelect($('nuRole'));
+  await loadPermRegistry();
+  renderPermChecks($('nuPerms'), []);
+  const sync=()=>$('nuPermsWrap').classList.toggle('hidden', $('nuRole').value!=='support');
+  const rs=$('nuRole'); if(rs && !rs._wired){ rs._wired=true; rs.addEventListener('change', sync); }
+  sync();
   const btn=$('btnCreateUser');
   if(btn && !btn._wired){ btn._wired=true; btn.onclick=createUser; }
   await loadUmUsers();
@@ -1114,7 +1200,7 @@ function renderUmUsers(){
     tr.innerHTML=
       `<td>${esc(u.name)}${self?' <span class="dim">(you)</span>':''}</td>`+
       `<td class="dim">${esc(u.email||'')}</td>`+
-      `<td><span class="pill pill--${u.role==='admin'?'info':'faint'}">${u.role}</span></td>`+
+      `<td><span class="pill pill--${u.role==='admin'?'info':(u.role==='support'?'warn':'faint')}">${u.role}</span></td>`+
       `<td><span class="pill pill--${active?'ok':'danger'}">${active?'active':'inactive'}</span></td>`+
       `<td><span class="pill pill--${dotc}"><span class="dot dot--${dotc}"></span> ${st}</span></td>`+
       `<td style="text-align:right;white-space:nowrap">`+
@@ -1132,11 +1218,17 @@ function renderUmUsers(){
 }
 async function createUser(){
   $('nuErr').classList.add('hidden');
-  const body={ name:$('nuName').value.trim(), email:$('nuEmail').value.trim(), password:$('nuPass').value, role:$('nuRole').value };
+  const role=$('nuRole').value;
+  const body={ name:$('nuName').value.trim(), email:$('nuEmail').value.trim(), password:$('nuPass').value, role };
   if(!body.name||!body.email||!body.password){ $('nuErr').textContent='Fill name, email and password.'; $('nuErr').classList.remove('hidden'); return; }
+  if(role==='support'){
+    body.permissions=readPermChecks($('nuPerms'));
+    if(!body.permissions.length){ $('nuErr').textContent='Grant the support user at least one access.'; $('nuErr').classList.remove('hidden'); return; }
+  }
   const btn=$('btnCreateUser'); btn.disabled=true; btn.textContent='Creating…';
   try{ await apiJson('/api/admin/users','POST',body);
-    $('nuName').value=$('nuEmail').value=$('nuPass').value=''; await loadUmUsers(); toast('User created'); }
+    $('nuName').value=$('nuEmail').value=$('nuPass').value=''; renderPermChecks($('nuPerms'), []);
+    await loadUmUsers(); toast('User created'); }
   catch(e){ $('nuErr').textContent=e.message; $('nuErr').classList.remove('hidden'); }
   finally{ btn.disabled=false; btn.textContent='Create user'; }
 }
@@ -1147,11 +1239,28 @@ async function umResetPw(u){
   catch(e){ toast(e.message,'err'); }
 }
 async function umEdit(u){
-  const name=prompt('Name:',u.name); if(name==null) return;
-  const email=prompt('Email / username:',u.email||''); if(email==null) return;
-  const role=confirm('OK = Admin, Cancel = Agent.\n(Current: '+u.role+')')?'admin':'agent';
-  try{ await apiJson('/api/admin/users/'+u.id,'PATCH',{name:name.trim(),email:email.trim(),role}); await loadUmUsers(); toast('User updated'); }
-  catch(e){ toast(e.message,'err'); }
+  await loadPermRegistry();
+  const roleOpts=[['agent','Agent'],['support','Support'],['admin','Admin']]
+    .map(([v,l])=>`<option value="${v}"${u.role===v?' selected':''}>${l}</option>`).join('');
+  const body=`
+    <span class="lbl">Name</span><input id="ueName" class="field" value="${esc(u.name||'')}">
+    <span class="lbl mt3">Email / username</span><input id="ueEmail" class="field" value="${esc(u.email||'')}">
+    <span class="lbl mt3">Role</span><select id="ueRole" class="field">${roleOpts}</select>
+    <div id="uePermsWrap" class="mt3 hidden"><span class="lbl">Support access</span><div id="uePerms" class="permgrid"></div></div>`;
+  const close=showModal('Edit user', u.email||'', body, 'Save changes');
+  renderPermChecks($('uePerms'), Array.isArray(u.permissions)?u.permissions:[]);
+  const sync=()=>$('uePermsWrap').classList.toggle('hidden', $('ueRole').value!=='support');
+  $('ueRole').addEventListener('change', sync); sync();
+  $('modalOk').onclick=async()=>{
+    const role=$('ueRole').value;
+    const patch={ name:$('ueName').value.trim(), email:$('ueEmail').value.trim(), role };
+    if(role==='support'){
+      patch.permissions=readPermChecks($('uePerms'));
+      if(!patch.permissions.length){ toast('Grant at least one access, or pick a different role','err'); return; }
+    }
+    try{ await apiJson('/api/admin/users/'+u.id,'PATCH',patch); close(); await loadUmUsers(); toast('User updated'); }
+    catch(e){ toast(e.message,'err'); }
+  };
 }
 async function umToggle(u,active){
   try{ await apiJson('/api/admin/users/'+u.id,'PATCH',{active:!active}); await loadUmUsers(); toast(active?'Deactivated':'Activated'); }

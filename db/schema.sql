@@ -452,3 +452,10 @@ begin
   returning * into r;
   return r;
 end $$;
+
+-- v9 — Fine-grained RBAC for the 'support' role. Admins grant individual report
+-- capabilities at user-creation time (adjustable, revoked live). Empty array for
+-- admins (implicit full access) and agents (no back-office access). Keys map to
+-- the PERMISSIONS registry in server.js: reports.call_logs, reports.call_logs_export,
+-- reports.office_map, reports.research, reports.agent_report.
+alter table agents add column if not exists permissions jsonb not null default '[]'::jsonb;
