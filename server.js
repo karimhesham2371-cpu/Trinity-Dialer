@@ -2334,6 +2334,7 @@ async function startAiAssistant(ccid) {
       assistant: { id: AI.assistant_id, dynamic_variables: dyn },
     });
     info.phase = 'assistant';
+    info.bridgedAt = Date.now();   // talk-clock start, used to compute duration_sec on hangup
     sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
       { bridged_at: new Date().toISOString(), amd_result: 'human' }).catch(() => {});
     if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`, { status: 'CONTACTED' }).catch(() => {});
@@ -2462,10 +2463,15 @@ app.post('/webhooks/telnyx', async (req, res) => {
       // Call ended: free the slot and disposition the lead.
       if (event === 'call.hangup') {
         const talked = info && info.phase === 'assistant';
+        // Talk duration = time from assistant bridge to hangup (matches the "Talk"
+        // column in the UI). Non-bridged (no-answer/machine) calls have 0s of talk.
+        // Stored so the duration filter in AI Call Results has a column to match on.
+        const talkSec = (info && info.bridgedAt) ? Math.max(0, Math.round((Date.now() - info.bridgedAt) / 1000)) : 0;
         delete aiRt[ccid];
         endAiStream(ccid);   // tear down any live-listen fork + notify listeners
         sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
-          { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
+          { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null,
+            duration_sec: talkSec, talk_seconds: talkSec }).catch(() => {});
         if (talked) {
           if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.CONTACTED`, { last_outcome: 'ai_contacted' }).catch(() => {});
         } else {
