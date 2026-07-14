@@ -1885,7 +1885,7 @@ async function renderAiController(){
 }
 
 // ── Call results: live activity + stored calls (50/page, date filter) ──
-let aiResPage=0, aiResFrom='', aiResTo='', aiResDmin='', aiResDmax='', aiResPollT=null;
+let aiResPage=0, aiResFrom='', aiResTo='', aiResDmin='', aiResDmax='', aiResResult='', aiResPollT=null;
 function stopAiResultsPoll(){ if(aiResPollT){ clearInterval(aiResPollT); aiResPollT=null; } if(liveTickT){ clearInterval(liveTickT); liveTickT=null; } if(typeof stopLiveListen==='function') stopLiveListen(); }
 function phaseTag(p){ return p==='assistant'
   ? '<span class="stattag" style="color:var(--ok)">talking</span>'
@@ -1903,6 +1903,17 @@ async function renderAiResults(){
           <option value="180-300">3m – 5m</option>
           <option value="300-">Over 5m</option>
         </select></div>
+      <div class="fw"><span class="lbl">Result</span>
+        <select id="aiResResult" class="field">
+          <option value="">All results</option>
+          <option value="lead">Lead</option>
+          <option value="callback">Call back</option>
+          <option value="not_interested">Not interested</option>
+          <option value="voicemail">Voicemail</option>
+          <option value="bluffer">Bluffer</option>
+          <option value="talked">Talked</option>
+          <option value="no_answer">No answer</option>
+        </select></div>
       <button id="aiResGo" class="btn btn-primary" style="height:36px">Apply</button>
       <button id="aiResClear" class="btn btn-sm" style="height:36px">All dates</button>
       <div class="sp" style="flex:1"></div>
@@ -1916,7 +1927,8 @@ async function renderAiResults(){
     if(d){ aiResFrom=new Date(d+'T00:00:00').toISOString(); const e=new Date(d+'T00:00:00'); e.setDate(e.getDate()+1); aiResTo=e.toISOString(); }
     else { aiResFrom=''; aiResTo=''; } applyDur(); aiResPage=0; loadAiResults(); };
   $('aiResDur').onchange=()=>{ applyDur(); aiResPage=0; loadAiResults(); };
-  $('aiResClear').onclick=()=>{ $('aiResDate').value=''; $('aiResDur').value=''; aiResFrom=''; aiResTo=''; aiResDmin=''; aiResDmax=''; aiResPage=0; loadAiResults(); };
+  $('aiResResult').onchange=()=>{ aiResResult=$('aiResResult').value; aiResPage=0; loadAiResults(); };
+  $('aiResClear').onclick=()=>{ $('aiResDate').value=''; $('aiResDur').value=''; $('aiResResult').value=''; aiResFrom=''; aiResTo=''; aiResDmin=''; aiResDmax=''; aiResResult=''; aiResPage=0; loadAiResults(); };
   aiResPage=0; await loadAiResults();
   stopAiResultsPoll();
   aiResPollT=setInterval(()=>{ if(aiCurTab==='results' && !$('adminAi').classList.contains('hidden')) loadAiResults(true); }, 5000);
@@ -1925,6 +1937,7 @@ async function loadAiResults(quiet){
   const q=new URLSearchParams(); q.set('page',aiResPage);
   if(aiResFrom) q.set('from',aiResFrom); if(aiResTo) q.set('to',aiResTo);
   if(aiResDmin!=='') q.set('dmin',aiResDmin); if(aiResDmax!=='') q.set('dmax',aiResDmax);
+  if(aiResResult) q.set('result',aiResResult);
   if(!quiet && $('aiResWrap')) $('aiResWrap').innerHTML='<div class="dim" style="padding:16px">Loading…</div>';
   let j; try{ j=await apiJson('/api/admin/ai/calls?'+q.toString()); }
   catch(e){ if(!quiet && $('aiResWrap')) $('aiResWrap').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
@@ -2068,7 +2081,8 @@ function aiOutcome(r,L){
   const M={lead:['Lead','#16a34a'], callback:['Call back','#d97706'],
     not_interested:['Not interested','#6b7280'], voicemail:['Voicemail','#6b7280'],
     bluffer:['Bluffer','#dc2626'], machine:['Voicemail','#6b7280'],
-    no_answer:['No answer','#9ca3af'], ai_contacted:['Talked','#2563eb']};
+    no_answer:['No answer','#9ca3af'], ai_contacted:['Talked','#2563eb'],
+    manual_hangup:['Talked','#2563eb']};
   if(M[o]) return `<span style="color:${M[o][1]};font-weight:600">${M[o][0]}</span>`;
   if(r.amd_result==='human') return 'Talked';
   return esc((L&&L.status)||r.hangup_cause||'—');

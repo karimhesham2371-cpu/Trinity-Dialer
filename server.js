@@ -1492,13 +1492,17 @@ app.get('/api/admin/ai/calls', auth, adminOnly, async (req, res) => {
   const { from, to } = req.query;
   const dmin = req.query.dmin != null && req.query.dmin !== '' ? Math.max(0, parseInt(req.query.dmin, 10) || 0) : null;
   const dmax = req.query.dmax != null && req.query.dmax !== '' ? Math.max(0, parseInt(req.query.dmax, 10) || 0) : null;
+  // Result filter — matches on leads.last_outcome (the value aiOutcome() badges from).
+  // Uses an inner join so DB-side pagination stays correct. Empty/'all' = no filter.
+  const result = String(req.query.result || '').trim().toLowerCase();
   // Live lane snapshot (server memory) — drives the "bot is calling now" panel.
   const live = Object.entries(aiRt).map(([ccid, i]) => ({
     ccid, phone: i.leadNumber, name: i.name, address: i.address,
     phase: i.phase, campaign_id: i.campaignId, since: i.at,
   })).sort((a, b) => a.since - b.since);
+  const join = result && result !== 'all' ? 'leads!inner' : 'leads';
   const f = [
-    'select=*,leads(first_name,last_name,address,state,phone,status,last_outcome)',
+    `select=*,${join}(first_name,last_name,address,state,phone,status,last_outcome)`,
     'agent_id=is.null', 'direction=eq.outbound',
     'order=created_at.desc', `limit=${PER + 1}`, `offset=${page * PER}`,
   ];
@@ -1507,6 +1511,13 @@ app.get('/api/admin/ai/calls', auth, adminOnly, async (req, res) => {
   // Duration filter — matches on call duration_sec (seconds). Keeps DB-side pagination correct.
   if (dmin != null) f.push(`duration_sec=gte.${dmin}`);
   if (dmax != null) f.push(`duration_sec=lte.${dmax}`);
+  // Result filter — ilike is case-insensitive so it catches legacy uppercase
+  // outcomes (VOICEMAIL / NOT_INTERESTED). Grouped categories use an embedded OR.
+  if (result && result !== 'all') {
+    if (result === 'talked') f.push('leads.or=(last_outcome.ilike.ai_contacted,last_outcome.ilike.manual_hangup)');
+    else if (result === 'no_answer') f.push('leads.or=(last_outcome.ilike.no_answer,last_outcome.ilike.machine)');
+    else f.push(`leads.last_outcome=ilike.${encodeURIComponent(result)}`);
+  }
   try {
     const rows = await sbSelect('calls', f.join('&'));
     const hasMore = rows.length > PER;
@@ -2336,6 +2347,35 @@ async function dialAiLead(lead) {
   console.log(`[ai] -> ${lead.phone} from ${from} (${Object.keys(aiRt).length}/${AI.concurrency} live)`);
 }
 
+// Post-call transcript classifier (safety net for missed end_call). Reads the
+// message array from call.conversation.ended and returns 'lead' | 'callback' |
+// 'not_interested' | null. Conservative: only upgrades to 'lead' on a genuine
+// signal of selling interest, never on a bare "hello". Returns null when unsure
+// so the generic 'ai_contacted' ("Talked") stays put.
+function classifyTranscript(messages) {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  const userTurns = messages
+    .filter(m => m && (m.role === 'user' || m.role === 'human'))
+    .map(m => String(m.content || m.text || '').toLowerCase().trim())
+    .filter(Boolean);
+  if (!userTurns.length) return null;
+  const all = userTurns.join(' ');
+
+  // Explicit disinterest wins (unless immediately contradicted by an interest cue).
+  const notInterested = /\b(not interested|no thanks|no thank you|don'?t call|stop calling|remove me|take me off|not selling|not for sale|leave me alone|wrong number)\b/;
+  const callback = /\b(call (me )?back|call (me )?later|not a good time|busy right now|another time|tomorrow|next week|reach me (at|later)|call after|in an hour)\b/;
+  const interest = /\b(sell|selling|interested|how much|what.s your offer|cash offer|make an offer|buy my|thinking (about|of) selling|willing to sell|what can you offer|price|open to)\b/;
+  // Info-sharing signals: seller volunteering property/contact details = real lead.
+  const gaveInfo = /\b(bedroom|bathroom|square feet|sq ft|acres|my (address|number|email|name is)|it.s located|the (house|property|home) is|built in|roof|foundation|condition|mortgage|owe|tenant|rented)\b/;
+
+  const hasInterest = interest.test(all) || gaveInfo.test(all);
+  if (notInterested.test(all) && !hasInterest) return 'not_interested';
+  if (hasInterest) return 'lead';
+  if (callback.test(all)) return 'callback';
+  // Multiple substantive turns (engaged conversation) but no clear cue: leave as Talked.
+  return null;
+}
+
 // Attach the assistant to a live, confirmed-human leg. Dynamic variables are nested
 // under assistant.dynamic_variables per the Telnyx ai_assistant_start contract.
 async function startAiAssistant(ccid) {
@@ -2561,6 +2601,32 @@ app.post('/webhooks/telnyx', async (req, res) => {
             { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
         }
         console.log(`[ai] hangup ${ccid ? ccid.slice(-8) : '-'} (${talked ? 'talked' : 'no-answer'})`);
+        return;
+      }
+      // ── Post-call safety net ───────────────────────────────────────────────
+      // Fires AFTER call.hangup, carries the full transcript. If the assistant's
+      // end_call tool never ran (seller hung up right after giving their info),
+      // the lead is sitting at the generic 'ai_contacted' default and shows as
+      // "Talked" even though they were interested. Re-classify from the transcript
+      // and upgrade — but ONLY when end_call didn't already write a real outcome.
+      if (event === 'call.conversation.ended') {
+        const leadId = cs.leadId;
+        if (!leadId) return;
+        // Only touch leads still on a non-structured outcome. end_call always wins.
+        let cur = null;
+        try { const [row] = await sbSelect('leads', `id=eq.${leadId}&select=last_outcome,status&limit=1`); cur = row; } catch {}
+        const STRUCTURED = ['lead','callback','not_interested','voicemail','bluffer','manual_hangup','machine'];
+        const lo = (cur && cur.last_outcome || '').toLowerCase();
+        if (STRUCTURED.includes(lo)) return;   // definitive result already recorded
+        const guess = classifyTranscript(payload.messages || payload.transcript || []);
+        if (!guess) return;
+        const patch = guess === 'callback'
+          ? { status: 'CALLBACK', last_outcome: 'callback', next_callback_at: new Date(Date.now() + 72 * 3600e3).toISOString() }
+          : guess === 'not_interested'
+            ? { status: 'CONTACTED', last_outcome: 'not_interested' }
+            : { status: 'CONTACTED', last_outcome: 'lead' };
+        sbUpdate('leads', `id=eq.${leadId}`, patch).catch(e => console.error('[ai-safetynet]', e.message));
+        console.log(`[ai] safety-net ${ccid ? ccid.slice(-8) : '-'} transcript->${guess} (was ${lo || 'none'})`);
         return;
       }
       return;   // ignore other AI-lane events (call.initiated, ai_assistant.*, etc.)
