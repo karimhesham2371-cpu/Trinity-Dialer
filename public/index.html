@@ -295,6 +295,16 @@
   .seat{position:absolute;transform:translate(-50%,-50%);min-width:110px;padding:8px 10px;border-radius:10px;
         background:var(--surface-2);border:1px solid var(--border);cursor:grab;user-select:none}
   .seat.drag{cursor:grabbing;z-index:5;box-shadow:0 4px 16px rgba(0,0,0,.4)}
+  .agpanel{position:fixed;top:0;right:0;height:100vh;width:320px;max-width:88vw;background:var(--surface);
+           border-left:1px solid var(--border-strong);box-shadow:-8px 0 28px rgba(0,0,0,.35);z-index:60;
+           transform:translateX(102%);transition:transform .18s ease;display:flex;flex-direction:column}
+  .agpanel.open{transform:translateX(0)}
+  .agp-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:18px 18px 14px;border-bottom:1px solid var(--border)}
+  .agp-name{font:600 16px var(--font-ui)}
+  .agp-state{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-dim);margin-top:4px}
+  .agp-x{background:none;border:none;color:var(--text-dim);font-size:16px;cursor:pointer;line-height:1;padding:2px 6px}
+  .agp-x:hover{color:var(--text)}
+  .agp-body{padding:18px}
   .seat b{display:block;font:600 12.5px var(--font-ui);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
   .seat .seatstate{font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.04em;color:var(--text-dim);margin-top:3px;display:flex;align-items:center;gap:5px}
   .seat--ok{border-left:2px solid var(--ok);background:var(--ok-tint)}
@@ -330,6 +340,7 @@
 <!-- ═══ AGENT ═══ -->
 <div id="viewAgent" class="hidden">
   <div id="reconnBanner" class="reconn hidden">Reconnecting…</div>
+  <div id="kickBanner" class="reconn hidden" style="background:#dc2626"></div>
   <div class="appbar">
     <div class="brand"><div class="mark">T</div><h1>Trinity</h1></div>
     <span id="agState" class="pill pill--faint"><span class="dot dot--faint"></span> Offline</span>
@@ -620,10 +631,20 @@ async function apiJson(path, method='GET', body){
   return j;
 }
 
+// A supervisor kicked this agent off the dialer: drop the softphone, force the UI
+// to OFFLINE, and tell them plainly. They can Go Available again when ready.
+function handleKicked(m){
+  try{ if(client) client.disconnect(); }catch{}
+  try{ applyState('OFFLINE',{state:'OFFLINE'}); }catch{}
+  const by=(m&&m.by)||'a supervisor';
+  toast('You were taken off the dialer by '+by,'err');
+  const b=$('kickBanner');
+  if(b){ b.textContent='You were taken off the dialer by '+by+'. Click Go Available to rejoin.'; b.classList.remove('hidden'); }
+}
 function show(view){ ['Login','Agent','Admin'].forEach(v=>$('view'+v).classList.toggle('hidden', v.toLowerCase()!==view)); }
 function logout(){ localStorage.removeItem('trinity_token'); localStorage.removeItem('trinity_user'); TOKEN=''; USER=null;
   if(ws){try{ws.close();}catch{}} if(client){try{client.disconnect();}catch{}} if(timerInt)clearInterval(timerInt);
-  if(typeof stopLiveListen==='function') stopLiveListen(); show('login'); }
+  if(typeof stopLiveListen==='function') stopLiveListen(); if(typeof stopMonitor==='function') stopMonitor(); show('login'); }
 
 // ── Login ──
 $('btnLogin').onclick = async () => {
@@ -663,7 +684,8 @@ function openWs(){
   ws = sock;
   sock.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); log('ws open ✓'); };
   sock.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
-    if(m.type==='agent.state'){ applyState(m.state, m); } };
+    if(m.type==='agent.state'){ applyState(m.state, m); }
+    else if(m.type==='kicked'){ handleKicked(m); } };
   sock.onerror = ()=>{ log('ws error'); };
   sock.onclose = (ev)=>{
     if(sock._intentional) return;      // we replaced it on purpose
@@ -689,6 +711,7 @@ const STATE_UI = {
 };
 function applyState(s, snap){
   const prev=serverState; serverState=s;
+  if(s!=='OFFLINE'){ const kb=$('kickBanner'); if(kb) kb.classList.add('hidden'); }
   const u=STATE_UI[s]||{dot:'faint',pulse:false,txt:'—'};
   const dotHtml=`<span class="dot dot--${u.dot}${u.pulse?' dot--pulse':''}"></span>`;
   $('agState').className='pill pill--'+u.dot;
@@ -1176,7 +1199,7 @@ function adminTab(which){
   if(which==='users') initUsers();
   if(which==='ai') initAi();
 }
-function closeReport(){ $('repPanel').classList.add('hidden'); $('repHome').classList.remove('hidden'); closeAdminWs(); stopWallboard(); }
+function closeReport(){ $('repPanel').classList.add('hidden'); $('repHome').classList.remove('hidden'); closeAdminWs(); stopWallboard(); if(typeof stopMonitor==='function') stopMonitor(); closeAgentPanel(); }
 // Which permission key gates each report tile. Audit is admin-only (no key).
 const REPORT_TILE_PERM={ calls:'reports.call_logs', agent:'reports.agent_report', research:'reports.research', map:'reports.office_map', wallboard:'reports.wallboard' };
 function canOpenReport(kind){
@@ -1677,7 +1700,8 @@ function makeDraggable(el, agentId){
       el.style.left=x+'%'; el.style.top=y+'%'; el.dataset.x=x; el.dataset.y=y; };
     const up=async(ev)=>{
       document.removeEventListener('mousemove',move); document.removeEventListener('mouseup',up); el.classList.remove('drag');
-      if(!moved) return; const r=floor.getBoundingClientRect();
+      if(!moved){ openAgentPanel(agentId); return; }
+      const r=floor.getBoundingClientRect();
       const outside=ev.clientX<r.left||ev.clientX>r.right||ev.clientY<r.top||ev.clientY>r.bottom;
       try{ await apiJson('/api/admin/floor/seat','POST', outside?{agent_id:agentId,x:null,y:null}:{agent_id:agentId,x:parseFloat(el.dataset.x),y:parseFloat(el.dataset.y)}); }
       catch(err){ toast(err.message,'err'); }
@@ -1685,6 +1709,79 @@ function makeDraggable(el, agentId){
     };
     document.addEventListener('mousemove',move); document.addEventListener('mouseup',up);
   });
+}
+
+// ── Office-map supervisor panel: click an agent → Kick / Live monitor ──
+let monListen=null;                 // {agentId, ws, ctx, gain}
+function canFloorAction(){ return can('floor.kick') || can('floor.monitor'); }
+async function openAgentPanel(agentId){
+  const a=floorAgents.find(x=>x.id===agentId); if(!a) return;
+  if(!canFloorAction()){ return; }   // no supervisor powers → plain map, no panel
+  let p=$('agPanel');
+  if(!p){ p=document.createElement('div'); p.id='agPanel'; p.className='agpanel'; document.body.appendChild(p); }
+  p.dataset.aid=agentId;
+  const state=(a.state||'OFFLINE');
+  const monitoring = monListen && monListen.agentId===agentId;
+  p.innerHTML=`
+    <div class="agp-head">
+      <div><div class="agp-name">${esc(a.name||'—')}</div>
+        <div class="agp-state"><span class="dot dot--${stateDot(state)}"></span> ${esc(state)}</div></div>
+      <button class="agp-x" onclick="closeAgentPanel()">✕</button>
+    </div>
+    <div class="agp-body">
+      ${can('floor.monitor')?`<button id="agpMon" class="btn ${monitoring?'btn-danger':'btn-primary'}" style="width:100%">${monitoring?'■ Stop monitoring':'▶ Live monitor'}</button>
+        <p class="dim" style="font-size:11px;margin:6px 0 0">Listen in on the live call. The agent and contact are not notified.</p>
+        <div id="agpMonMsg" class="dim" style="font-size:12px;margin-top:6px"></div>`:''}
+      ${(can('floor.kick')&&can('floor.monitor'))?'<div style="height:1px;background:var(--border);margin:14px 0"></div>':''}
+      ${can('floor.kick')?`<button id="agpKick" class="btn btn-danger" style="width:100%">Kick off dialer</button>
+        <p class="dim" style="font-size:11px;margin:6px 0 0">Ends any live call and logs them out. They can rejoin by going Available.</p>`:''}
+    </div>`;
+  p.classList.add('open');
+  if($('agpMon')) $('agpMon').onclick=()=>toggleMonitor(agentId);
+  if($('agpKick')) $('agpKick').onclick=()=>kickAgent(agentId);
+}
+function closeAgentPanel(){ const p=$('agPanel'); if(p){ p.classList.remove('open'); } }
+async function kickAgent(agentId){
+  const a=floorAgents.find(x=>x.id===agentId);
+  if(!confirm('Kick '+((a&&a.name)||'this agent')+' off the dialer? Any live call ends immediately.')) return;
+  try{ await apiJson('/api/admin/floor/kick','POST',{agent_id:agentId}); toast('Agent kicked off the dialer'); if(monListen&&monListen.agentId===agentId) stopMonitor(); closeAgentPanel(); }
+  catch(e){ toast(e.message||'Kick failed','err'); }
+}
+function toggleMonitor(agentId){
+  if(monListen){ const same=monListen.agentId===agentId; stopMonitor(); if(same){ openAgentPanel(agentId); return; } }
+  startMonitor(agentId);
+}
+function startMonitor(agentId){
+  let ctx; try{ ctx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ toast('Audio not supported','err'); return; }
+  const gain=ctx.createGain(); gain.gain.value=1.0; gain.connect(ctx.destination);
+  const proto=location.protocol==='https:'?'wss':'ws';
+  const ws=new WebSocket(proto+'://'+location.host+'/ws/monitor?token='+encodeURIComponent(TOKEN)+'&agentId='+encodeURIComponent(agentId));
+  ws.binaryType='arraybuffer';
+  const sched={0:{next:0},1:{next:0}};
+  const setMsg=(t)=>{ const m=$('agpMonMsg'); if(m) m.textContent=t; };
+  ws.onmessage=(ev)=>{
+    if(typeof ev.data==='string'){ let m={}; try{m=JSON.parse(ev.data);}catch{}
+      if(m.event==='error'){ toast(m.error||'Cannot monitor','err'); stopMonitor(); }
+      else if(m.event==='ended'){ toast('Call ended','info'); stopMonitor(); }
+      else if(m.event==='ready'){ setMsg('● Listening — live'); }
+      return; }
+    const b=new Uint8Array(ev.data); if(b.length<2) return;
+    const track=b[0]===1?1:0, n=b.length-1, f=new Float32Array(n);
+    for(let i=0;i<n;i++) f[i]=ulawDecode(b[i+1])/32768;
+    const buf=ctx.createBuffer(1,n,8000); buf.getChannelData(0).set(f);
+    const src=ctx.createBufferSource(); src.buffer=buf; src.connect(gain);
+    const s=sched[track], t=Math.max(ctx.currentTime+0.12,s.next); src.start(t); s.next=t+n/8000;
+  };
+  ws.onclose=()=>{ if(monListen&&monListen.ws===ws) stopMonitor(); };
+  ws.onerror=()=>{};
+  monListen={agentId,ws,ctx,gain};
+  if($('agPanel')&&$('agPanel').dataset.aid===agentId) openAgentPanel(agentId);
+  toast('Connecting to live call…','info');
+}
+function stopMonitor(){
+  if(!monListen) return; const l=monListen; monListen=null;
+  try{ l.ws.close(); }catch{} try{ l.ctx.close(); }catch{}
+  const p=$('agPanel'); if(p&&p.classList.contains('open')&&p.dataset.aid) openAgentPanel(p.dataset.aid);
 }
 
 // ═══════════ ADMIN: WALLBOARD (live team dashboard) ═══════════

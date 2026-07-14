@@ -368,6 +368,8 @@ const PERMISSIONS = [
   { key: 'reports.agent_report',     label: 'Agent report',     area: 'reports', hint: 'Per-agent logged-in / talk / wrap time.' },
   { key: 'reports.wallboard',        label: 'Wallboard',        area: 'reports', hint: 'Live team dashboard — dials, contact rate, sales, per-agent status.' },
   { key: 'reports.qa',               label: 'Recording QA',     area: 'reports', hint: 'Flag / score / annotate recordings for quality review (inside Call logs).' },
+  { key: 'floor.monitor',            label: 'Live monitor',     area: 'reports', hint: 'Listen in on an agent\'s live call from the office map (needs Office map).' },
+  { key: 'floor.kick',               label: 'Kick agent',       area: 'reports', hint: 'Force an agent off the dialer from the office map (needs Office map).' },
 ];
 const PERM_KEYS = new Set(PERMISSIONS.map(p => p.key));
 const normPerms = (v) => (Array.isArray(v) ? v.filter(k => PERM_KEYS.has(k)) : []);
@@ -410,6 +412,8 @@ function permForPath(path, method) {
   if (path.startsWith('/api/admin/reports/wallboard'))    return 'reports.wallboard';
   if (path.startsWith('/api/admin/reports/research'))     return 'reports.research';
   if (path.startsWith('/api/admin/reports/recording'))    return ['reports.call_logs', 'reports.research'];
+  if (path === '/api/admin/floor/kick')                   return 'floor.kick';
+  if (path === '/api/admin/floor/monitor')                return 'floor.monitor';
   if (path.startsWith('/api/admin/floor'))                return 'reports.office_map';
   if (path === '/api/admin/permissions')                  return PERMISSIONS.map(p => p.key); // any grant
   if (method === 'GET' && (path === '/api/admin/users' || path === '/api/admin/campaigns'))
@@ -2137,6 +2141,38 @@ app.post('/api/admin/floor/seat', auth, adminOnly, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Supervisor action: kick an agent off the dialer. Drops any live lead leg, drops
+// the agent's WebRTC leg, forces OFFLINE, and pushes a 'kicked' event to the
+// agent's own browser so their softphone tears down. Reversible: they can log
+// back in and Go Available again.
+app.post('/api/admin/floor/kick', auth, adminOnly, async (req, res) => {
+  const id = req.body && req.body.agent_id;
+  if (!id) return res.status(400).json({ error: 'agent_id required' });
+  const st = rt[id];
+  try {
+    if (st) {
+      clearWrapTimer(st);
+      if (st.leadLeg)  await telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});
+      if (st.agentLeg) await telnyx('POST', `/calls/${st.agentLeg}/actions/hangup`, {}).catch(() => {});
+    }
+    rt[id] = { state: 'OFFLINE' };
+    await setAgentState(id, 'OFFLINE');
+    wsToAgent(id, { type: 'kicked', by: req.user.name || req.user.email || 'a supervisor' });
+    audit(req.user, 'KICK_AGENT', { target_type: 'agent', target_id: id });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Supervisor action: report whether an agent has a live call that can be
+// monitored, and return the leg's call_control_id the /ws/monitor socket forks.
+app.post('/api/admin/floor/monitor', auth, adminOnly, (req, res) => {
+  const id = req.body && req.body.agent_id;
+  if (!id) return res.status(400).json({ error: 'agent_id required' });
+  const st = rt[id];
+  const live = !!(st && st.state === 'ON_CALL' && st.leadLeg);
+  res.json({ ok: true, live, ccid: live ? st.leadLeg : null, state: (st && st.state) || 'OFFLINE' });
+});
+
 // ══ AGENT: softphone token + presence ══════════════════════════════════════════
 app.get('/api/agent/token', auth, async (req, res) => {
   try {
@@ -3135,6 +3171,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
       }
       const wasLead = st.leadLeg === ccid || (role === 'lead' && st.leadLeg == null);
       if (wasLead) {
+        if (ccid) endAiStream(ccid);   // notify + close any live-monitor listeners on this leg
         const talked = st.state === 'ON_CALL';   // agent actually spoke to a human
         if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
           { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
@@ -3332,6 +3369,43 @@ listenWss.on('connection', async (ws, req) => {
   ws.on('error', () => {});
 });
 
+// ── Live agent-call monitoring: supervisor browser egress ────────────────────────
+// A supervisor (admin, or support with floor.monitor) opens
+// /ws/monitor?token=<jwt>&agentId=<uuid> to listen in on that agent's live call.
+// We resolve the agent's current lead leg (rt[agentId].leadLeg) and reuse the same
+// Telnyx media-fork pipeline as AI monitoring — no supervisor softphone needed.
+const monitorWss = new WebSocketServer({ noServer: true });
+monitorWss.on('connection', async (ws, req) => {
+  const url = new URL(req.url, 'http://x');
+  let user; try { user = jwt.verify(url.searchParams.get('token'), JWT_SECRET); } catch { ws.close(4001, 'unauthorized'); return; }
+  if (!userCan(user, 'floor.monitor')) { ws.close(4003, 'forbidden'); return; }
+  const agentId = url.searchParams.get('agentId');
+  const ast = agentId && rt[agentId];
+  const ccid = ast && ast.state === 'ON_CALL' ? ast.leadLeg : null;
+  if (!ccid) { try { ws.send(JSON.stringify({ event: 'error', error: 'agent is not on a live call' })); } catch {} ws.close(); return; }
+  let st = aiStreams.get(ccid);
+  if (!st) { st = { listeners: new Set(), telnyxWs: null, starting: false }; aiStreams.set(ccid, st); }
+  st.listeners.add(ws);
+  try { ws.send(JSON.stringify({ event: 'ready', sampleRate: 8000, codec: 'PCMU' })); } catch {}
+  if (!st.telnyxWs && !st.starting) {
+    st.starting = true;
+    try { await startAiStream(ccid); }
+    catch (e) { try { ws.send(JSON.stringify({ event: 'error', error: e.message })); } catch {} }
+    finally { const s = aiStreams.get(ccid); if (s) s.starting = false; }
+  }
+  audit(user, 'MONITOR_CALL', { target_type: 'agent', target_id: agentId });
+  ws.on('close', () => {
+    const s = aiStreams.get(ccid);
+    if (!s) return;
+    s.listeners.delete(ws);
+    // Call still live (leg unchanged) → stop the fork to save spend; else just drop.
+    const stillLive = rt[agentId] && rt[agentId].leadLeg === ccid;
+    if (s.listeners.size === 0 && stillLive) stopAiStream(ccid);
+    else if (s.listeners.size === 0) aiStreams.delete(ccid);
+  });
+  ws.on('error', () => {});
+});
+
 // Single upgrade router: pick the right WS server by pathname, or drop the socket.
 server.on('upgrade', (req, socket, head) => {
   let pathname;
@@ -3340,6 +3414,7 @@ server.on('upgrade', (req, socket, head) => {
   const target = pathname === '/ws' ? wss
     : pathname === '/telnyx-media' ? mediaWss
     : pathname === '/ws/ai-listen' ? listenWss
+    : pathname === '/ws/monitor' ? monitorWss
     : null;
   if (!target) { socket.destroy(); return; }
   target.handleUpgrade(req, socket, head, (ws) => target.emit('connection', ws, req));
