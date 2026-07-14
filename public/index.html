@@ -1215,7 +1215,9 @@ function renderCallsTable(rows, emptyMsg){
   $('repBody').innerHTML=`<div class="tblwrap"><table><thead><tr><th>Time</th><th>Agent</th><th>From</th><th>To</th><th>Talk</th><th>Recording</th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 function recStreamUrl(id,dl){ return '/api/admin/reports/recording/'+id+'/stream?token='+encodeURIComponent(TOKEN)+(dl?'&download=1':''); }
-function listenRec(btn,id){ btn.closest('td').innerHTML=`<audio class="mini" controls autoplay src="${recStreamUrl(id,false)}"></audio>`; }
+function listenRec(btn,id){ const td=btn.closest('td'); td.dataset.recPrev=encodeURIComponent(td.innerHTML);
+  td.innerHTML=`<span style="display:inline-flex;align-items:center;gap:6px"><audio class="mini" controls autoplay src="${recStreamUrl(id,false)}"></audio><button class="btn btn-sm" title="Close player" onclick="closeRec(this)" style="padding:2px 8px">✕</button></span>`; }
+function closeRec(btn){ const td=btn.closest('td'); const p=td.dataset.recPrev; if(p!=null){ td.innerHTML=decodeURIComponent(p); delete td.dataset.recPrev; } }
 function dlRec(id){ const a=document.createElement('a'); a.href=recStreamUrl(id,true); a.download=''; document.body.appendChild(a); a.click(); a.remove(); }
 function initCalls(){
   $('repFilters').innerHTML=`
@@ -1915,7 +1917,7 @@ async function renderAiResults(){
           <option value="no_answer">No answer</option>
         </select></div>
       <button id="aiResGo" class="btn btn-primary" style="height:36px">Apply</button>
-      <button id="aiResClear" class="btn btn-sm" style="height:36px">All dates</button>
+      <button id="aiResClear" class="btn btn-sm" style="height:36px">Clear filters</button>
       <div class="sp" style="flex:1"></div>
       <span class="dim" id="aiLivePill" style="font-size:12px"></span>
     </div>
