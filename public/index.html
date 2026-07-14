@@ -2076,9 +2076,22 @@ function aiOutcome(r,L){
 function aiCallRow(r,i){
   const L=r.leads||{}; const name=[L.first_name,L.last_name].filter(Boolean).join(' ')||'—';
   const res=aiOutcome(r,L);
-  const rec=(r.recording_id||r.recording_url)
-    ?`<button class="btn btn-sm" onclick="listenRec(this,'${r.id}')">Listen</button> <button class="btn btn-sm" onclick="dlRec('${r.id}')">Download</button>`
-    :'<span class="dim">—</span>';
+  // Recording column has four honest states, not one ambiguous "—":
+  //  • ready      → Listen / Download (recording_url saved)
+  //  • live       → call still in progress, recording in flight
+  //  • processing → answered call ended, recording.saved not landed yet (fills on refresh)
+  //  • no-answer  → never picked up (ring timeout / busy), so nothing to record
+  const answered=!!(r.bridged_at || (r.amd_result && r.amd_result!=='') || r.hangup_cause==='normal_clearing');
+  let rec;
+  if(r.recording_url){
+    rec=`<button class="btn btn-sm" onclick="listenRec(this,'${r.id}')">Listen</button> <button class="btn btn-sm" onclick="dlRec('${r.id}')">Download</button>`;
+  } else if(!r.ended_at){
+    rec='<span style="color:#2563eb;font-weight:600">● Recording…</span>';
+  } else if(answered){
+    rec='<span class="dim" title="Recording is still being processed — refreshes automatically">Processing…</span>';
+  } else {
+    rec='<span class="dim" title="Call was never answered (ring timeout or busy) — no audio to record">Not answered</span>';
+  }
   const det=`ai-det-${i}`;
   const dt=(iso)=>iso?new Date(iso).toLocaleString([], {hour12:false,month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
   return `<tr onclick="toggleAiDet('${det}')" style="cursor:pointer">
