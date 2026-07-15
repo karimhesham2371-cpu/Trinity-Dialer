@@ -69,6 +69,10 @@ const DEFAULT_DISPOSITIONS = [
   // machine/voicemail AMD failed to catch (a false negative). Recorded so the
   // amd-stats disagreement report can score real-world miss rate against labels.
   { code: 'AMD_MISS',       label: 'Voicemail reached me (AMD miss)', color: '#6e40c9', hotkey: '8', recycle: 'no_answer' },
+  // System-written (agent_id null) when the predictive engine kills a leg AMD
+  // classified as a machine — never surfaced as an agent hotkey, but present so
+  // the accuracy cross-check and per-campaign reports can count machine kills.
+  { code: 'AUTO_ANSWERING_MACHINE', label: 'Answering machine (auto)', color: '#57606a', recycle: 'no_answer' },
 ];
 const DEFAULT_RECYCLE = { no_answer: { hours: 4, max: 5 }, busy: { minutes: 20, max: 8 } };
 
@@ -268,10 +272,14 @@ function amdConfigParam(config) {
 const _campAmdCache = new Map();   // campaignId -> { at, cfg }
 const CAMP_AMD_TTL_MS = 15000;
 async function campaignAmd(campaignId) {
+  const num = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
   const fallback = {
     mode: AMD_MODE === 'disabled' ? 'disabled' : 'premium',
     config: null, vmDrop: false, vmUrl: null, vmConsent: false,
     silencePolicy: 'human', gatedBridge: false,
+    // Predictive-pacing defaults (see scripts/predictive_schema.sql).
+    pacingMode: 'power', dialRatio: 2.0, dialRatioMin: 1.0, dialRatioMax: 3.0,
+    abandonSoft: 0.025, safeHarborUrl: null,
   };
   if (!campaignId) return fallback;
   const hit = _campAmdCache.get(campaignId);
@@ -287,6 +295,12 @@ async function campaignAmd(campaignId) {
     vmConsent: !!row.vm_drop_consent,
     silencePolicy: row.silence_policy === 'machine' ? 'machine' : 'human',
     gatedBridge: !!(row.amd_config && typeof row.amd_config === 'object' && row.amd_config.gated_bridge),
+    pacingMode: row.pacing_mode === 'predictive' ? 'predictive' : 'power',
+    dialRatio: num(row.dial_ratio, 2.0),
+    dialRatioMin: num(row.dial_ratio_min, 1.0),
+    dialRatioMax: num(row.dial_ratio_max, 3.0),
+    abandonSoft: num(row.abandon_soft_threshold, 0.025),
+    safeHarborUrl: row.safe_harbor_url || null,
   } : fallback;
   _campAmdCache.set(campaignId, { at: Date.now(), cfg });
   return cfg;
@@ -323,7 +337,7 @@ async function amdNightlyCrossCheck() {
   try {
     const since = new Date(Date.now() - 24 * 3600e3).toISOString();
     const calls = await sbSelect('calls',
-      `answered_at=gte.${encodeURIComponent(since)}&select=telnyx_call_control_id,campaign_id,amd_mode,amd_result,abandoned&limit=200000`).catch(() => []);
+      `answered_at=gte.${encodeURIComponent(since)}&select=telnyx_call_control_id,campaign_id,amd_mode,amd_result,amd_latency_ms,abandoned&limit=200000`).catch(() => []);
     if (!calls || !calls.length) return;
     const ccids = calls.filter(c => c.telnyx_call_control_id).map(c => `"${c.telnyx_call_control_id}"`);
     const disps = ccids.length
@@ -332,11 +346,18 @@ async function amdNightlyCrossCheck() {
     const dispBy = {};
     for (const d of disps || []) if (d.telnyx_call_control_id) dispBy[d.telnyx_call_control_id] = d.code;
     const LIVE = new Set(['SALE', 'APPT', 'APPOINTMENT', 'LEAD', 'CB', 'CALLBACK', 'NI', 'NOT_INTERESTED', 'DNC', 'XFER', 'TRANSFER']);
-    const VM   = new Set(['VM', 'VOICEMAIL', 'MACHINE', 'AMD_MISS']);
+    const VM   = new Set(['VM', 'VOICEMAIL', 'MACHINE', 'AMD_MISS', 'AUTO_ANSWERING_MACHINE']);
+    const pctl = (xs, q) => { if (!xs.length) return null; const s = xs.slice().sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(q * (s.length - 1)))]; };
     const agg = {};   // campaign_id -> counts
     for (const c of calls) {
-      const a = agg[c.campaign_id] || (agg[c.campaign_id] = { answered: 0, fp: 0, fn: 0, abandoned: 0 });
+      const a = agg[c.campaign_id] || (agg[c.campaign_id] = { answered: 0, fp: 0, fn: 0, abandoned: 0, machine: 0, human: 0, lat: [] });
       a.answered++; if (c.abandoned) a.abandoned++;
+      if (c.amd_result) {
+        const cls = amdClass(c.amd_result);
+        if (cls === 'machine') a.machine++;
+        if (cls === 'human') a.human++;
+      }
+      if (Number.isFinite(c.amd_latency_ms)) a.lat.push(c.amd_latency_ms);
       const code = c.telnyx_call_control_id ? dispBy[c.telnyx_call_control_id] : null;
       if (code && c.amd_result) {
         const cls = amdClass(c.amd_result);
@@ -346,9 +367,21 @@ async function amdNightlyCrossCheck() {
     }
     for (const [cid, a] of Object.entries(agg)) {
       const rate = a.answered ? a.abandoned / a.answered : 0;
-      console.log(`[amd-nightly] campaign ${String(cid).slice(0, 8)} 24h: answered=${a.answered} false_pos=${a.fp} false_neg=${a.fn} abandoned=${a.abandoned} (${(rate * 100).toFixed(2)}%)`);
+      const machineKillRate = a.answered ? a.machine / a.answered : 0;
+      const fnRate = a.human ? a.fn / a.human : 0;   // false negatives per confirmed-human detection
+      const p50 = pctl(a.lat, 0.5), p95 = pctl(a.lat, 0.95);
+      // Latest auto-adjusted dial_ratio for this campaign (pacing history).
+      let dialRatio = null;
+      try {
+        const [pe] = await sbSelect('pacing_events', `campaign_id=eq.${cid}&order=created_at.desc&select=dial_ratio&limit=1`).catch(() => []);
+        if (pe && Number.isFinite(pe.dial_ratio)) dialRatio = pe.dial_ratio;
+      } catch { /* best effort */ }
+      console.log(`[amd-nightly] campaign ${String(cid).slice(0, 8)} 24h: answered=${a.answered} machine_kill=${(machineKillRate * 100).toFixed(1)}% false_pos=${a.fp} false_neg=${a.fn} (${(fnRate * 100).toFixed(1)}%) abandoned=${a.abandoned} (${(rate * 100).toFixed(2)}%) lat_p50=${p50 ?? '-'}ms lat_p95=${p95 ?? '-'}ms ratio=${dialRatio ?? '-'}`);
       audit(null, 'amd_cross_check', { target_type: 'campaign', target_id: cid,
         meta: { window: '24h', answered: a.answered, false_positive: a.fp, false_negative: a.fn,
+          false_negative_rate: Math.round(fnRate * 1000) / 1000,
+          machine_kills: a.machine, machine_kill_rate: Math.round(machineKillRate * 1000) / 1000,
+          amd_latency_p50_ms: p50, amd_latency_p95_ms: p95, dial_ratio: dialRatio,
           abandoned: a.abandoned, abandoned_rate: Math.round(rate * 1000) / 1000, over_cap: rate > AMD_ABANDON_CAP } });
     }
   } catch (e) { console.error('[amd-nightly]', e.message); }
@@ -1121,6 +1154,12 @@ app.patch('/api/admin/campaigns/:id', auth, adminOnly, async (req, res) => {
   if (b.vm_drop_url != null) patch.vm_drop_url = String(b.vm_drop_url).trim() || null;
   if (b.vm_drop_consent != null) patch.vm_drop_consent = !!b.vm_drop_consent;
   if (b.silence_policy != null && ['human', 'machine'].includes(b.silence_policy)) patch.silence_policy = b.silence_policy;
+  // ── Predictive (background-AMD) pacing config ──────────────────────────────
+  if (b.pacing_mode != null && ['power', 'predictive'].includes(b.pacing_mode)) patch.pacing_mode = b.pacing_mode;
+  if (b.dial_ratio_min != null) patch.dial_ratio_min = Math.max(1, Math.min(4, Number(b.dial_ratio_min) || 1));
+  if (b.dial_ratio_max != null) patch.dial_ratio_max = Math.max(1, Math.min(6, Number(b.dial_ratio_max) || 3));
+  if (b.abandon_soft_threshold != null) patch.abandon_soft_threshold = Math.max(0, Math.min(0.03, Number(b.abandon_soft_threshold) || 0.025));
+  if (b.safe_harbor_url != null) patch.safe_harbor_url = String(b.safe_harbor_url).trim() || null;
   // amd_config: keep only the documented Telnyx sub-fields + our gated_bridge flag.
   if (b.amd_config != null) {
     if (b.amd_config === false || b.amd_config === '') { patch.amd_config = null; }
@@ -2806,9 +2845,12 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
     const cfg = await campaignConfig(lead.campaign_id);
     const disp = (cfg.dispositions || DEFAULT_DISPOSITIONS).find(d => d.code === code) || { code, outcome: 'DONE' };
 
-    // Record the disposition row.
+    // Record the disposition row. Correlate to the exact call leg (rt.leadLeg)
+    // so the AMD false-negative meter can match "Voicemail reached me" back to the
+    // AMD verdict Telnyx returned for this same leg.
     sbWrite('POST', 'dispositions', { lead_id: leadId, agent_id: req.user.id, campaign_id: lead.campaign_id,
-      code, notes: notes || null, callback_at: callback_at || null }, 'return=minimal', 'dispositions');
+      code, notes: notes || null, callback_at: callback_at || null,
+      telnyx_call_control_id: (st && st.leadLeg) || null }, 'return=minimal', 'dispositions');
 
     // Decide the lead's next status + DNC policy (see the rules block near the top).
     const patch = { last_outcome: code };
@@ -3334,6 +3376,267 @@ async function aiPacingTick() {
   finally { aiPacingBusy = false; }
 }
 
+// ══ PREDICTIVE (BACKGROUND AMD) DIALER ENGINE ════════════════════════════════════
+// A campaign whose pacing_mode='predictive' is dialed by this background engine
+// instead of the per-agent power pacer. Calls are placed as standalone UNBRIDGED
+// legs (role='dialer'); agents never hear ringing, dialing, or detected machines.
+// The webhook state machine below holds each answered leg in a DETECTING phase and
+// only bridges it to a reserved agent once premium AMD confirms a human. Machines
+// are hung up (or voicemail-dropped) before any agent is involved.
+//
+// dialerRt[ccid] = {campaignId, leadId, cid, phase, from, to, at, answeredAt,
+//                   reservedAgentId} — the single source of truth for an in-flight
+// predictive call. Keyed by Telnyx call_control_id so every webhook can O(1) it.
+const dialerRt = {};
+// Inbound legs sent to the voicemail box when no agent was free (spec §4). Keyed
+// by call_control_id: {campaignId, from, to, at} — used by the recording/transcription
+// webhooks to file the message into public.voicemails for the callback queue.
+const vmboxRt = {};
+const DIALER_MAX_CALL_MS = 5 * 60 * 1000;   // reclaim a slot whose webhooks vanished
+// Live per-campaign human-answer-rate estimate (EWMA), for pacing adjustment.
+const _humanRate = new Map();   // campaignId -> rate 0..1
+function noteAnswer(campaignId, isHuman) {
+  if (!campaignId) return;
+  const prev = _humanRate.has(campaignId) ? _humanRate.get(campaignId) : 0.3;
+  const a = 0.1;   // EWMA weight
+  _humanRate.set(campaignId, prev * (1 - a) + (isHuman ? 1 : 0) * a);
+}
+function campaignInFlight(campaignId) {
+  let n = 0;
+  for (const cc in dialerRt) if (dialerRt[cc].campaignId === campaignId) n++;
+  return n;
+}
+// AVAILABLE, in-conference agents who work this campaign, sorted LONGEST-IDLE
+// first (stateStart is when they entered AVAILABLE). RESERVED/ON_CALL excluded.
+async function availableAgentsFor(campaignId) {
+  const ids = await agentIdsForCampaign(campaignId);
+  const free = ids.filter(id => {
+    const st = rt[id];
+    return st && st.state === 'AVAILABLE' && st.conferenceId && !st.leadLeg;
+  });
+  free.sort((a, b) => (rt[a].stateStart || 0) - (rt[b].stateStart || 0));
+  return free;
+}
+// Atomically reserve the longest-idle AVAILABLE agent for an about-to-bridge
+// human. Returns the agentId or null. RESERVED gates the pacer AND inbound.
+async function reserveLongestIdleAgent(campaignId) {
+  const free = await availableAgentsFor(campaignId);
+  for (const id of free) {
+    const st = rt[id];
+    if (st && st.state === 'AVAILABLE' && st.conferenceId && !st.leadLeg) {
+      st.state = 'RESERVED'; st.reservedAt = Date.now();
+      await setAgentState(id, 'RESERVED');
+      return id;
+    }
+  }
+  return null;
+}
+// Resolve the set of agentIds attached to a campaign (via playlists or legacy
+// campaign_agents), cached briefly since the engine runs hot.
+const _campAgentsCache = new Map();
+async function agentIdsForCampaign(campaignId) {
+  const hit = _campAgentsCache.get(campaignId);
+  if (hit && Date.now() - hit.at < 10000) return hit.ids;
+  const set = new Set();
+  try {
+    const pcs = await sbSelect('playlist_campaigns', `campaign_id=eq.${campaignId}&select=playlist_id`);
+    const plIds = [...new Set((pcs || []).map(x => x.playlist_id))];
+    if (plIds.length) {
+      const pas = await sbSelect('playlist_agents',
+        `playlist_id=in.(${plIds.map(p => `"${p}"`).join(',')})&select=agent_id`);
+      for (const x of pas || []) set.add(x.agent_id);
+    }
+    const cas = await sbSelect('campaign_agents', `campaign_id=eq.${campaignId}&select=agent_id`);
+    for (const x of cas || []) set.add(x.agent_id);
+  } catch { /* fall through with whatever we have */ }
+  const ids = [...set];
+  _campAgentsCache.set(campaignId, { at: Date.now(), ids });
+  return ids;
+}
+
+// Place ONE unbridged predictive leg for `lead`. No agent, no conference. The
+// DNC + calling-window checks already ran in nextDialableLead; we re-check DNC
+// here (cheap, authoritative) so a just-added number can never slip through.
+async function dialEngineLead(lead, acfg) {
+  const nowIso = new Date().toISOString();
+  try {
+    const hit = await sbSelect('dnc_list',
+      `phone=eq.${encodeURIComponent(lead.phone)}&or=(expires_at.is.null,expires_at.gt.${nowIso})&select=phone&limit=1`);
+    if (hit && hit.length) {
+      await sbUpdate('leads', `id=eq.${lead.id}`, { dnc: true, status: 'DNC' }).catch(() => {});
+      return;
+    }
+  } catch (e) { console.error('[engine:dnc]', e.message); }
+  const from = pickCallerId(areaCodeOf(lead.phone));
+  const amdParam = AMD_MODE === 'disabled' ? 'disabled' : acfg.mode;
+  const amdConf = amdConfigParam(acfg.config);
+  const cid = crypto.randomUUID();
+  const dialBody = {
+    connection_id: CONNECTION_ID,
+    to: lead.phone,
+    from,
+    timeout_secs: DIALER.ring_secs,
+    answering_machine_detection: amdParam,
+    record: 'record-from-answer', record_channels: 'dual', record_format: 'mp3',
+    client_state: enc({ role: 'dialer', cid, campaignId: lead.campaign_id, leadId: lead.id, amd: amdParam }),
+  };
+  if (amdParam !== 'disabled' && amdConf) dialBody.answering_machine_detection_config = amdConf;
+  // Mark IN_PROGRESS BEFORE dialing so the next pick can't re-select this lead.
+  await sbUpdate('leads', `id=eq.${lead.id}`,
+    { status: 'IN_PROGRESS', attempts: (lead.attempts || 0) + 1, last_attempt_at: nowIso }).catch(() => {});
+  markFirstDial(lead.phone);
+  const result = await telnyx('POST', '/calls', dialBody);
+  const ccid = result.data && result.data.call_control_id;
+  if (!ccid) return;
+  dialerRt[ccid] = { ccid, campaignId: lead.campaign_id, leadId: lead.id, cid, phase: 'DIALING',
+    amdMode: amdParam, from, to: lead.phone, at: Date.now(), answeredAt: null, reservedAgentId: null };
+  saveCall({ id: cid, lead_id: lead.id, campaign_id: lead.campaign_id, telnyx_call_control_id: ccid,
+    from_number: from, to_number: lead.phone, direction: 'outbound' }, 'engine-open');
+  saveCall({ telnyx_call_control_id: ccid, amd_mode: amdParam, call_phase: 'DIALING' }, 'engine-phase');
+  console.log(`[engine] ${String(lead.campaign_id).slice(0, 8)} dial ${lead.phone} from ${from} cc=...${ccid.slice(-8)}`);
+}
+
+// Auto-adjust a campaign's dial_ratio toward safety/efficiency, then persist it.
+// Shrinks toward the floor as human-answer-rate rises or the 30-day abandon rate
+// nears the soft threshold; grows slowly when agents sit idle. Hard-clamped to
+// [dialRatioMin, dialRatioMax]; forced to the floor at/above the soft threshold.
+async function adjustDialRatio(campaignId, acfg, ctx) {
+  let ratio = acfg.dialRatio;
+  let reason = 'steady';
+  const abandon = await campaignAbandonRate(campaignId).catch(() => 0);
+  const human = _humanRate.has(campaignId) ? _humanRate.get(campaignId) : 0.3;
+  if (abandon >= acfg.abandonSoft) {
+    if (ratio > acfg.dialRatioMin) {
+      ratio = acfg.dialRatioMin; reason = 'abandon-clamp';
+      console.warn(`[engine] ALERT campaign ${String(campaignId).slice(0, 8)} abandon=${(abandon * 100).toFixed(2)}% >= soft ${(acfg.abandonSoft * 100).toFixed(2)}% — dial_ratio clamped to floor ${ratio}`);
+    }
+  } else if (human > 0.5 && ratio > acfg.dialRatioMin) {
+    ratio = Math.max(acfg.dialRatioMin, Math.round((ratio - 0.1) * 100) / 100); reason = 'high-human-rate';
+  } else if (ctx.idlePct > 0.4 && ratio < acfg.dialRatioMax) {
+    ratio = Math.min(acfg.dialRatioMax, Math.round((ratio + 0.1) * 100) / 100); reason = 'agents-idle';
+  }
+  if (ratio !== acfg.dialRatio) {
+    acfg.dialRatio = ratio;   // update the cached cfg so the change applies this tick
+    sbUpdate('campaigns', `id=eq.${campaignId}`, { dial_ratio: ratio }).catch(() => {});
+    _campAmdCache.delete(campaignId);   // force a re-read next TTL so we don't fight the DB value
+  }
+  sbLog('pacing_events', { campaign_id: campaignId, dial_ratio: ratio, available: ctx.available,
+    in_flight: ctx.inFlight, placed: ctx.placed, human_rate: Math.round(human * 1000) / 1000,
+    abandon_rate: Math.round(abandon * 1000) / 1000, idle_pct: Math.round(ctx.idlePct * 1000) / 1000, reason });
+  return ratio;
+}
+
+// Hand a confirmed-human predictive leg to a RESERVED agent by joining it into
+// that agent's standing conference (same mechanism the power lane uses, so live
+// monitor / whisper keep working). On success the leg leaves dialerRt and is
+// owned by rt[agentId] — later hangups resolve via findAgentByLeg into the
+// normal agent WRAP_UP path. Returns true on success, false on any failure.
+async function engineBridgeToAgent(agentId, ccid, info) {
+  const st = rt[agentId];
+  const conf = st && st.conferenceId;
+  if (!st || !conf) return false;
+  try {
+    await telnyx('POST', `/conferences/${conf}/actions/join`,
+      { call_control_id: ccid, start_conference_on_enter: true, mute: false });
+    st.leadLeg = ccid;
+    st.leadId = info.leadId || null;
+    st.leadNumber = info.to || null;
+    st.fromNumber = info.from || null;
+    st.onCallSince = Date.now();
+    st.state = 'ON_CALL';
+    await setAgentState(agentId, 'ON_CALL');
+    info.phase = 'BRIDGED';
+    delete dialerRt[ccid];   // ownership transferred to the agent lane
+    saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString(),
+      call_phase: 'BRIDGED', reserved_agent_id: agentId, agent_id: agentId }, 'engine-bridged');
+    if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`, { status: 'CONTACTED' }).catch(() => {});
+    console.log(`[engine] bridged human ...${ccid.slice(-8)} -> agent ${agentId.slice(0, 8)} (idle->ON_CALL)`);
+    return true;
+  } catch (e) {
+    console.error('[engine:bridge]', e.message);
+    return false;
+  }
+}
+
+// Write an agent-less disposition for an auto-handled predictive leg (machine
+// kills, etc.). Correlated to the exact call leg via telnyx_call_control_id so
+// the nightly AMD accuracy cross-check can meter false negatives.
+function autoDisposition(info, code) {
+  if (!info || !info.leadId) return;
+  sbWrite('POST', 'dispositions', {
+    lead_id: info.leadId, agent_id: null, campaign_id: info.campaignId || null,
+    code, telnyx_call_control_id: info.ccid || null,
+  }, 'return=minimal', 'auto-disposition');
+}
+
+// Revert any agent stuck in RESERVED without a landed leg. reserveLongestIdleAgent
+// flips an agent to RESERVED the instant AMD says "human"; the bridge normally
+// lands within a second. If the bridge fails silently (or the human hung up in
+// the gap), the agent could otherwise sit RESERVED forever, starving the pacer.
+const RESERVE_MAX_MS = 8000;
+async function reserveReaper() {
+  const now = Date.now();
+  // Drop voicemail-box correlation entries once their message can't still be
+  // filing (recording + transcription both land well within 10 minutes).
+  for (const cc of Object.keys(vmboxRt)) {
+    if (now - (vmboxRt[cc].at || 0) > 10 * 60 * 1000) delete vmboxRt[cc];
+  }
+  for (const id of Object.keys(rt)) {
+    const st = rt[id];
+    if (st && st.state === 'RESERVED' && !st.leadLeg && (now - (st.reservedAt || 0) > RESERVE_MAX_MS)) {
+      st.state = 'AVAILABLE'; st.reservedAt = null;
+      await setAgentState(id, 'AVAILABLE').catch(() => {});
+      console.warn(`[engine] reserve-reaper freed agent ${id.slice(0, 8)} (RESERVED >${RESERVE_MAX_MS}ms, no bridge)`);
+    }
+  }
+}
+
+let enginePacingBusy = false;
+async function enginePacingTick() {
+  if (enginePacingBusy || !SB_HOST || !CONNECTION_ID) return;
+  enginePacingBusy = true;
+  try {
+    // Reclaim leaked predictive slots (missed hangup webhook) before pacing.
+    for (const cc of Object.keys(dialerRt)) {
+      if (Date.now() - (dialerRt[cc].at || 0) > DIALER_MAX_CALL_MS) {
+        const info = dialerRt[cc]; delete dialerRt[cc];
+        telnyx('POST', `/calls/${cc}/actions/hangup`, {}).catch(() => {});
+        if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
+          { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+        console.log(`[engine] reclaimed stale slot ...${cc.slice(-8)}`);
+      }
+    }
+    const running = await sbSelect('campaigns', `status=eq.RUNNING&pacing_mode=eq.predictive&select=id`).catch(() => []);
+    if (!running || !running.length) return;
+    const nowIso = new Date().toISOString();
+    for (const { id: campaignId } of running) {
+      const acfg = await campaignAmd(campaignId);
+      const agents = await agentIdsForCampaign(campaignId);
+      // Engine runs only while >=1 agent is AVAILABLE or ON_CALL (spec §2).
+      const onFloor = agents.filter(a => { const s = rt[a]; return s && (s.state === 'AVAILABLE' || s.state === 'ON_CALL' || s.state === 'RESERVED' || s.state === 'WRAP_UP'); });
+      const available = agents.filter(a => { const s = rt[a]; return s && s.state === 'AVAILABLE' && s.conferenceId && !s.leadLeg; }).length;
+      if (!onFloor.length) continue;
+      const inFlight = campaignInFlight(campaignId);
+      const idlePct = onFloor.length ? available / onFloor.length : 0;
+      const ratio = await adjustDialRatio(campaignId, acfg, { available, inFlight, placed: 0, idlePct });
+      // Pacing math (spec §2): ceil(available × ratio) − unresolved_in_flight.
+      let toPlace = Math.ceil(available * ratio) - inFlight;
+      if (toPlace <= 0) continue;
+      // Never place more than a sane per-tick burst.
+      toPlace = Math.min(toPlace, Math.max(1, Math.ceil(available * ratio)));
+      let placed = 0;
+      while (placed < toPlace) {
+        const lead = await nextDialableLead([campaignId], [], nowIso);   // DNC + calling window enforced here
+        if (!lead) break;
+        try { await dialEngineLead(lead, acfg); placed++; }
+        catch (e) { console.error('[engine:dial]', e.message); break; }
+      }
+      if (placed) console.log(`[engine] campaign ${String(campaignId).slice(0, 8)} placed ${placed} (avail=${available} ratio=${ratio} inflight=${inFlight})`);
+    }
+  } catch (e) { console.error('[enginePacing]', e.message); }
+  finally { enginePacingBusy = false; }
+}
+
 // Pick a random AVAILABLE, in-conference agent who works `campaignId` (via any
 // playlist that contains it). Returns an agentId or null.
 async function pickInboundAgent(campaignId) {
@@ -3456,6 +3759,22 @@ app.post('/webhooks/telnyx', async (req, res) => {
           .then(r => console.log(`[rec-archive] ${ccid.slice(-8)} -> ${recId} (${r.bytes}B)`))
           .catch(e => console.error(`[rec-archive] ${ccid.slice(-8)}: ${e.message}`));
       }
+      // Voicemail-box recording → file it into the callback queue (spec §4).
+      if (ccid && vmboxRt[ccid]) {
+        const vm = vmboxRt[ccid];
+        sbWrite('POST', 'voicemails', { campaign_id: vm.campaignId || null, call_id: ccid,
+          from_number: vm.from || null, to_number: vm.to || null, recording_url: url }, 'return=minimal', 'voicemail-insert');
+        console.log(`[vmbox] filed voicemail from ${vm.from || '?'} (campaign ${String(vm.campaignId || '').slice(0, 8)})`);
+      }
+      return;
+    }
+
+    // Voicemail-box transcription → attach the transcript to the queued message.
+    if (event === 'call.transcription' && ccid && vmboxRt[ccid]) {
+      const td = payload.transcription_data || {};
+      const text = td.transcript || td.text || null;
+      if (text) sbWrite('PATCH', `voicemails?call_id=eq.${encodeURIComponent(ccid)}`,
+        { transcription: text }, 'return=minimal', 'voicemail-transcript');
       return;
     }
 
@@ -3547,6 +3866,116 @@ app.post('/webhooks/telnyx', async (req, res) => {
       return;   // ignore other AI-lane events (call.initiated, ai_assistant.*, etc.)
     }
 
+    // ── PREDICTIVE DIALER LANE (role='dialer') ─────────────────────────────────
+    // Background AMD state machine. The leg is UNBRIDGED and owned by dialerRt
+    // until AMD confirms a human, at which point we reserve an agent and hand the
+    // leg to the standard agent lane (removing it from dialerRt). All transitions
+    // are idempotent: once a ccid leaves dialerRt, later webhooks fall through.
+    if (role === 'dialer' && dialerRt[ccid]) {
+      const info = dialerRt[ccid];
+
+      // DIALING → DETECTING. Do NOT bridge; wait for the AMD verdict.
+      if (event === 'call.answered') {
+        info.phase = 'DETECTING'; info.answeredAt = Date.now();
+        saveCall({ telnyx_call_control_id: ccid, answered_at: new Date().toISOString(), call_phase: 'DETECTING' }, 'engine-detecting');
+        return;
+      }
+
+      // DETECTING → route on the AMD result (premium OR standard).
+      if (AMD_DETECTION_EVENTS.has(event)) {
+        const r = payload.result || '';
+        const cls = amdClass(r);
+        const acfg = await campaignAmd(info.campaignId).catch(() => null);
+        const silencePolicy = (acfg && acfg.silencePolicy) || 'human';
+        const treatAs = cls === 'ambiguous' ? silencePolicy : cls;   // never default-hangup on ambiguity
+        const latency = info.answeredAt ? Math.max(0, Date.now() - info.answeredAt) : null;
+        saveCall({ telnyx_call_control_id: ccid, amd_result: r, amd_ended_at: new Date().toISOString(), amd_latency_ms: latency }, 'engine-amd');
+        amdEvent({ call_id: info.cid, campaign_id: info.campaignId, amd_mode: info.amdMode || (cs && cs.amd) || null,
+          event_type: event, result: r, latency_ms: latency, raw: payload });
+        noteAnswer(info.campaignId, treatAs === 'human');
+
+        if (treatAs === 'machine') {
+          const wantVm = acfg && acfg.vmDrop && acfg.vmConsent && acfg.vmUrl;
+          if (wantVm) { info.phase = 'WAIT_BEEP'; return; }   // hold for greeting.ended beep
+          info.phase = 'MACHINE'; delete dialerRt[ccid];
+          telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+          saveCall({ telnyx_call_control_id: ccid, call_phase: 'MACHINE', ended_at: new Date().toISOString() }, 'engine-machine');
+          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`, { status: 'MACHINE', last_outcome: 'auto_answering_machine' }).catch(() => {});
+          autoDisposition(info, 'AUTO_ANSWERING_MACHINE');
+          console.log(`[engine] machine ...${ccid.slice(-8)} (${r}) — leg killed, slot freed`);
+          return;
+        }
+
+        // Human (or ambiguous→human): reserve an agent and bridge < 500ms.
+        const agentId2 = await reserveLongestIdleAgent(info.campaignId);
+        if (!agentId2) {
+          // ABANDONED_HUMAN: no agent free. Play the FCC safe-harbor message
+          // (company + callback, no solicitation), hang up, count the abandon.
+          info.phase = 'ABANDONED'; delete dialerRt[ccid];
+          if (acfg && acfg.safeHarborUrl) {
+            telnyx('POST', `/calls/${ccid}/actions/playback_start`, { audio_url: acfg.safeHarborUrl }).catch(() => {});
+            setTimeout(() => { telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {}); }, 15000);
+          } else {
+            telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+          }
+          saveCall({ telnyx_call_control_id: ccid, abandoned: true, call_phase: 'ABANDONED', ended_at: new Date().toISOString() }, 'engine-abandoned');
+          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`,
+            { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 20 * 60e3).toISOString(), last_outcome: 'abandoned' }).catch(() => {});
+          _abandonCache.delete(info.campaignId);   // force fresh abandon-rate next read
+          console.warn(`[engine] ABANDONED_HUMAN ...${ccid.slice(-8)} — no agent available (safe-harbor ${acfg && acfg.safeHarborUrl ? 'played' : 'MISSING'})`);
+          return;
+        }
+        // Bridge: hand the human leg to the reserved agent's conference.
+        const ok = await engineBridgeToAgent(agentId2, ccid, info);
+        if (!ok) {
+          // Bridge failed — release the agent and drop the leg rather than hang.
+          const s = rt[agentId2]; if (s && s.state === 'RESERVED') { s.state = 'AVAILABLE'; await setAgentState(agentId2, 'AVAILABLE'); }
+          info.phase = 'ENDED'; delete dialerRt[ccid];
+          telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+        }
+        return;
+      }
+
+      // WAIT_BEEP → voicemail drop on the premium/standard greeting beep event.
+      if (AMD_GREETING_EVENTS.has(event)) {
+        const r = payload.result || '';
+        const acfg = await campaignAmd(info.campaignId).catch(() => null);
+        saveCall({ telnyx_call_control_id: ccid, amd_greeting: r }, 'engine-greeting');
+        amdEvent({ call_id: info.cid, campaign_id: info.campaignId, amd_mode: info.amdMode || null,
+          event_type: event, result: r, latency_ms: null, raw: payload });
+        const wantVm = acfg && acfg.vmDrop && acfg.vmConsent && acfg.vmUrl;
+        if (wantVm && r === 'beep_detected') {
+          info.phase = 'VOICEMAIL'; delete dialerRt[ccid];
+          telnyx('POST', `/calls/${ccid}/actions/playback_start`, { audio_url: acfg.vmUrl }).catch(() => {});
+          saveCall({ telnyx_call_control_id: ccid, vm_dropped: true, call_phase: 'VOICEMAIL' }, 'engine-vm');
+          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`, { status: 'VOICEMAIL', last_outcome: 'voicemail' }).catch(() => {});
+          setTimeout(() => { telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {}); }, 32000);
+        } else if (r !== 'beep_detected' && r !== 'no_beep_detected') {
+          // ended/prompt_ended without a beep — nothing to drop into; hang up.
+          info.phase = 'MACHINE'; delete dialerRt[ccid];
+          telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`, { status: 'MACHINE', last_outcome: 'auto_answering_machine' }).catch(() => {});
+        }
+        return;
+      }
+
+      // Terminal / failure in any pre-bridge phase → free the slot, disposition.
+      if (event === 'call.hangup') {
+        delete dialerRt[ccid];
+        const cause = payload.hangup_cause || null;
+        saveCall({ telnyx_call_control_id: ccid, ended_at: new Date().toISOString(), hangup_cause: cause,
+          call_phase: 'ENDED' }, 'engine-hangup');
+        // Only mark NO_ANSWER if we never got past DETECTING (i.e. no human/machine
+        // verdict was recorded). MACHINE/ABANDONED/VOICEMAIL already dispositioned.
+        if (info.phase === 'DIALING' || info.phase === 'DETECTING') {
+          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
+            { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+        }
+        return;
+      }
+      return;   // ignore other dialer-lane events while unbridged
+    }
+
     // ── Inbound call on one of our DIDs ────────────────────────────────────────
     // A caller dials a DID assigned to a campaign; ring a random available agent
     // working that campaign and bridge them into that agent's conference.
@@ -3561,8 +3990,15 @@ app.post('/webhooks/telnyx', async (req, res) => {
       }
       const chosen = await pickInboundAgent(did.campaign_id);
       if (!chosen) {
-        console.log(`[inbound] ${toNum} campaign ${did.campaign_id.slice(0, 8)} — no available agent, rejecting`);
-        await telnyx('POST', `/calls/${ccid}/actions/reject`, { cause: 'USER_BUSY' }).catch(() => {});
+        // No agent free → voicemail box (spec §4). Answer, greet, record + transcribe;
+        // the recording/transcription webhooks file it into the callback queue.
+        console.log(`[inbound] ${toNum} campaign ${did.campaign_id.slice(0, 8)} — no agent, sending to voicemail`);
+        vmboxRt[ccid] = { campaignId: did.campaign_id, from: fromNum, to: toNum, at: Date.now() };
+        saveCall({ campaign_id: did.campaign_id, telnyx_call_control_id: ccid,
+          from_number: fromNum, to_number: toNum, direction: 'inbound' }, 'call-open-vmbox');
+        await telnyx('POST', `/calls/${ccid}/actions/answer`, {
+          client_state: enc({ role: 'vmbox', campaignId: did.campaign_id, from: fromNum, to: toNum }),
+        }).catch(() => {});
         return;
       }
       const st = rt[chosen];
@@ -3589,6 +4025,24 @@ app.post('/webhooks/telnyx', async (req, res) => {
         saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString() }, 'call-bridged-inbound');
         console.log(`[inbound] agent ${agentId.slice(0, 8)} ON_CALL (bridged inbound)`);
       }
+      return;
+    }
+
+    // ── Voicemail box: inbound call answered with no free agent (spec §4) ───────
+    // Greet the caller, then record + transcribe. call.recording.saved and
+    // call.transcription file the message into public.voicemails (callback queue).
+    if (event === 'call.answered' && role === 'vmbox') {
+      const greet = 'Thank you for calling. We are unable to take your call right now. '
+        + 'Please leave your name, number, and a brief message after the tone, and we will call you back.';
+      try {
+        await telnyx('POST', `/calls/${ccid}/actions/speak`,
+          { payload: greet, voice: 'female', language: 'en-US' });
+        await telnyx('POST', `/calls/${ccid}/actions/record_start`,
+          { format: 'mp3', channels: 'single', transcription: true, transcription_engine: 'B' });
+        console.log(`[vmbox] recording started ...${ccid.slice(-8)}`);
+      } catch (e) { console.error('[vmbox:start]', e.message); }
+      // Auto-hangup as a safety net so a silent line can't hold the leg open.
+      setTimeout(() => { telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {}); }, 120000);
       return;
     }
 
@@ -4036,6 +4490,8 @@ server.listen(PORT, async () => {
   console.log(`[boot] ai caller: ${AI.enabled ? 'ENABLED' : 'off'}, concurrency ${AI.concurrency}, ${AI.campaign_ids.length} campaign(s), assistant ${AI.assistant_id || '(none)'}`);
   setInterval(pacingTick, PACING_MS);
   setInterval(aiPacingTick, PACING_MS);   // AI Cold Caller lane (independent of human agents)
+  setInterval(enginePacingTick, PACING_MS);   // predictive (background AMD) lane, per campaign pacing_mode='predictive'
+  setInterval(reserveReaper, 5 * 1000);       // revert agents stuck in RESERVED (bridge that never landed)
   setInterval(flushOutbox, 5 * 1000);     // drain any Supabase writes that failed, at-least-once
   setInterval(reaperTick, 30 * 1000);
   setInterval(refreshCallerPool, 5 * 60 * 1000);
