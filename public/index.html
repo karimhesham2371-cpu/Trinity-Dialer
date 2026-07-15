@@ -760,8 +760,10 @@ function applyState(s, snap){
   else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
   else { $('bannerState').textContent=u.txt; }
 
-  // AUX countdowns: WRAP_UP is server-timed (display only — the server flips it
-  // back to Ready); BREAK is client-timed and auto-returns to Ready at 15 min.
+  // AUX timers: WRAP_UP is server-timed (display only — the server flips it
+  // back to Ready); BREAK counts UP and never auto-returns — only the agent
+  // clicking Ready ends a break.
+  if(s!=='BREAK') breakSince=0;
   if(s==='WRAP_UP') ensureWrapTimer(serverWrapUntil);
   else if(s==='BREAK') ensureBreakTimer();
   else if(isWaitState(s)) ensureWaitTimer();
@@ -885,7 +887,7 @@ function agLeftTab(which){
   $('ltScript').classList.toggle('active',isScript); $('ltProd').classList.toggle('active',!isScript);
   $('scriptBody').classList.toggle('hidden',!isScript); $('prodBody').classList.toggle('hidden',isScript);
   if(isScript){ if(prodPollT){ clearInterval(prodPollT); prodPollT=null; } }
-  else { loadProductivity(); if(!prodPollT) prodPollT=setInterval(()=>{ const p=$('prodBody'); if(!p||p.classList.contains('hidden')||$('viewAgent').classList.contains('hidden')){ clearInterval(prodPollT); prodPollT=null; return; } loadProductivity(true); },15000); }
+  else { loadProductivity(); if(!prodPollT) prodPollT=setInterval(()=>{ const p=$('prodBody'); if(!p||p.classList.contains('hidden')||$('viewAgent').classList.contains('hidden')){ clearInterval(prodPollT); prodPollT=null; return; } loadProductivity(true); },5000); }
 }
 async function loadProductivity(quiet){
   const el=$('prodBody'); if(!el) return;
@@ -1000,20 +1002,18 @@ $('notesSave').onclick=async()=>{
 
 // ── AUX status dropdown (Ready / Break) ─────────────────────────────────────
 // Ready → AVAILABLE, receives calls immediately.
-// Break → paused, max 15 min, auto-returns to Ready (client-timed).
+// Break → paused until the agent MANUALLY returns to Ready. Never auto-return:
+// an agent away from the desk must not be flipped back into taking calls.
 // Wrap-up is NOT in this menu — it's automated by the server after every call
 // (3s default; 3 min for appointment/sale/lead) and just displays a countdown.
-const BREAK_MAX = 15*60;
-let auxTimerInt=null, auxKind=null, auxDeadline=0;
+let auxTimerInt=null, auxKind=null, auxDeadline=0, breakSince=0;
 function clearAuxTimer(){ if(auxTimerInt){clearInterval(auxTimerInt);auxTimerInt=null;} auxKind=null; auxDeadline=0; }
-// BREAK: client-driven auto-return to Ready at 15 min.
+// BREAK: count-up display only — stays on break until the agent clicks Ready.
 function ensureBreakTimer(){
   if(auxKind==='BREAK' && auxTimerInt) return;
-  clearAuxTimer(); auxKind='BREAK'; auxDeadline=Date.now()+BREAK_MAX*1000;
-  auxTimerInt=setInterval(()=>{
-    if(Date.now()>=auxDeadline){ clearAuxTimer(); setAux('READY'); return; }
-    renderAuxBtn(serverState);
-  },500);
+  clearAuxTimer(); auxKind='BREAK';
+  if(!breakSince) breakSince=Date.now();
+  auxTimerInt=setInterval(()=>{ renderAuxBtn(serverState); },500);
 }
 // AVAILABLE: count-up of how long the agent has been waiting for the next call,
 // shown under "Ready" on the aux button (display only).
@@ -1043,7 +1043,7 @@ function renderAuxBtn(s){
   if(s==='CONNECTING'){ b.textContent='Connecting…'; b.className='btn btn-sm'; return; }
   if(s==='ON_CALL'){ b.textContent='On call'; b.className='btn btn-sm'; return; }
   if(s==='WRAP_UP'){ b.textContent='Wrap up '+fmtMS(auxRemainMs()); b.className='btn btn-sm btn-warn'; return; }
-  if(s==='BREAK'){ b.textContent='Break '+fmtMS(auxRemainMs()); b.className='btn btn-sm btn-warn'; return; }
+  if(s==='BREAK'){ b.textContent='Break '+fmtMS(Math.max(0,Date.now()-(breakSince||Date.now()))); b.className='btn btn-sm btn-warn'; return; }
   // Waiting between calls (AVAILABLE, or background DIALING/CLAIMING) — show a
   // live count-up of how long the agent has been waiting for the next call.
   const waitTxt='<span style="display:block;font-size:10px;line-height:1.1;opacity:.65;font-variant-numeric:tabular-nums">'+fmtMS(Math.max(0,Date.now()-(waitSince||Date.now())))+'</span>';

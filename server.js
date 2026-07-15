@@ -2844,8 +2844,10 @@ async function productivityWindow(agentId, fromMs, toMs) {
       `agent_id=eq.${agentId}&started_at=lte.${encodeURIComponent(toIso)}` +
       `&or=(ended_at.is.null,ended_at.gte.${encodeURIComponent(fromIso)})` +
       `&select=state,started_at,ended_at&limit=100000`),
+    // Only calls that actually reached the agent (bridged) count as handled —
+    // background dials that never connected (no-answer, machine) don't.
     sbSelect('calls',
-      `agent_id=eq.${agentId}&created_at=gte.${encodeURIComponent(fromIso)}` +
+      `agent_id=eq.${agentId}&bridged_at=not.is.null&created_at=gte.${encodeURIComponent(fromIso)}` +
       `&created_at=lte.${encodeURIComponent(toIso)}&select=id&limit=100000`),
   ]);
   const out = { logged_in: 0, break: 0, wrap: 0, wait: 0, calls: (calls || []).length };
