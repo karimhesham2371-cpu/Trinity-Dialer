@@ -505,6 +505,7 @@
       <button class="navtab" data-lt="fields" onclick="leadTab('fields')">Custom fields</button>
       <button class="navtab" data-lt="dnc" onclick="leadTab('dnc')">DNC list</button>
       <button class="navtab" data-lt="window" onclick="leadTab('window')">Calling window</button>
+      <button class="navtab" data-lt="stats" onclick="leadTab('stats')">Live stats</button>
     </div>
     <div id="ldBody"></div>
   </div>
@@ -1870,10 +1871,11 @@ async function initLeads(){
 }
 function leadTab(t){
   ldCurTab=t;
+  stopPlaylistStats();   // leaving any tab tears down the live-stats poller
   $('ldSub').querySelectorAll('[data-lt]').forEach(b=>b.classList.toggle('active', b.dataset.lt===t));
   const body=$('ldBody'); body.innerHTML='<p class="dim">Loading…</p>';
   if(!ldCampId && ['import','script','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
-  ({import:renderImport,script:renderScript,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow}[t]||(()=>{}))();
+  ({import:renderImport,script:renderScript,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow,stats:renderPlaylistStats}[t]||(()=>{}))();
 }
 
 // ── Global lead search ──
@@ -2725,6 +2727,69 @@ async function renderWindow(){
       $('cpMsg').innerHTML=`<b style="color:var(--ok)">Saved “${esc(d.label)}” — recycle ${j.policy.recycle_window_days}d · ${j.policy.neg_strike_limit} strikes → DNC · redial every ${j.policy.neg_redial_hours}h</b>`; }
     catch(e){ $('cpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
+}
+
+// ── Live per-playlist call stats (ReadyMode-style) ──
+let plStatsT=null;
+function stopPlaylistStats(){ if(plStatsT){ clearInterval(plStatsT); plStatsT=null; } }
+async function renderPlaylistStats(){
+  stopPlaylistStats();
+  $('ldBody').innerHTML=`<div class="card" style="max-width:900px">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2 style="margin:0">Live call stats <span class="dim" style="font-size:12px;font-weight:400">— by playlist</span></h2>
+      <div class="row" style="gap:10px;align-items:center">
+        <span id="plsSince" class="dim" style="font-size:12px"></span>
+        <button class="btn" id="plsReset" style="flex:0 0 auto">Reset counters</button>
+      </div>
+    </div>
+    <p class="dim" style="font-size:13px;margin-top:6px"><b>CPA</b> lines/agent · <b>Calls</b> dialed · <b>Ans</b> answered by an agent · <b>MD</b> machine-detected · <b>Drop</b> answered with no free agent (abandoned) · <b>Abd%</b> = Drop ÷ Ans · <b>Dial</b> ringing now. Counters accumulate since the reset time; watch <b>Abd%</b> — if it climbs, lower the playlist CPA. Auto-refresh 3s.</p>
+    <div id="plsMsg" class="dim mt3" style="font-size:12px"></div>
+    <div class="tblwrap mt3"><div id="plsRoot"><p class="dim">Loading…</p></div></div></div>`;
+  const abdColor=(p)=> p>=10?'var(--danger)':(p>=5?'var(--warn)':'var(--ok)');
+  const render=(j)=>{
+    const root=$('plsRoot'); if(!root) return;
+    const rows=j.rows||[];
+    if(!rows.length){ root.innerHTML='<p class="dim">No calls dialed yet since the last reset. Start a running campaign with logged-in agents to see live numbers.</p>';
+      if($('plsSince')) $('plsSince').textContent='since '+new Date(j.since).toLocaleTimeString([],{hour12:false}); return; }
+    const body=rows.map(r=>`<tr>
+      <td>${esc(r.name)}${r.active?'':' <span class="dim" style="font-size:11px">(paused)</span>'}</td>
+      <td style="text-align:right">${r.cpa}</td>
+      <td style="text-align:right">${r.calls}</td>
+      <td style="text-align:right">${r.ans}</td>
+      <td style="text-align:right">${r.md}</td>
+      <td style="text-align:right">${r.drop}</td>
+      <td style="text-align:right;color:${abdColor(r.abd_pct)};font-weight:600">${r.abd_pct.toFixed(1)}%</td>
+      <td style="text-align:right">${r.dial?`<b>${r.dial}</b>`:'0'}</td></tr>`).join('');
+    const t=j.totals||{};
+    const totRow=`<tr style="border-top:2px solid var(--border-strong);font-weight:700">
+      <td>Total</td><td></td>
+      <td style="text-align:right">${t.calls||0}</td>
+      <td style="text-align:right">${t.ans||0}</td>
+      <td style="text-align:right">${t.md||0}</td>
+      <td style="text-align:right">${t.drop||0}</td>
+      <td style="text-align:right;color:${abdColor(t.abd_pct||0)}">${(t.abd_pct||0).toFixed(1)}%</td>
+      <td style="text-align:right">${t.dial||0}</td></tr>`;
+    root.innerHTML=`<table class="wbtbl"><thead><tr>
+      <th>Playlist</th><th style="text-align:right">CPA</th><th style="text-align:right">Calls</th>
+      <th style="text-align:right">Ans</th><th style="text-align:right">MD</th><th style="text-align:right">Drop</th>
+      <th style="text-align:right">Abd%</th><th style="text-align:right">Dial</th></tr></thead>
+      <tbody>${body}${totRow}</tbody></table>`;
+    if($('plsSince')) $('plsSince').textContent='since '+new Date(j.since).toLocaleTimeString([],{hour12:false});
+  };
+  const tick=async()=>{
+    if(!$('plsRoot')){ stopPlaylistStats(); return; }   // navigated away
+    let j; try{ j=await apiJson('/api/admin/reports/playlists'); }
+    catch(e){ if($('plsRoot')) $('plsRoot').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
+    render(j);
+  };
+  $('plsReset').onclick=async()=>{
+    try{ await apiJson('/api/admin/reports/playlists/reset','POST',{});
+      $('plsMsg').innerHTML='<b style="color:var(--ok)">Counters reset.</b>'; await tick();
+      setTimeout(()=>{ if($('plsMsg')) $('plsMsg').innerHTML=''; },2500); }
+    catch(e){ $('plsMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  };
+  await tick();
+  plStatsT=setInterval(tick,3000);
 }
 
 route();

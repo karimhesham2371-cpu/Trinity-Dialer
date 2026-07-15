@@ -112,6 +112,19 @@ const dispPolicy = (code) => (POLICY.dispositions && POLICY.dispositions[code]) 
 // { state, sip, agentLeg, conferenceId, leadLeg, leadId, leadNumber, fromNumber }
 const rt = {};
 
+// Live per-playlist call stats (ReadyMode-style wallboard). Accumulated since
+// process start (or last manual reset). Keyed by playlist id; the pseudo-key
+// '__direct__' collects legacy campaign_agents dials that have no playlist.
+//   calls = dials initiated · ans = bridged to a human · md = machine-detected
+//   drop  = answered-but-no-free-agent (abandoned). Live "Dial" is derived from
+//   rt[*].pending at request time, not stored here.
+let PLAYLIST_STATS = {};
+let PLAYLIST_STATS_SINCE = Date.now();
+function plStat(pid) {
+  const k = pid || '__direct__';
+  return PLAYLIST_STATS[k] || (PLAYLIST_STATS[k] = { calls: 0, ans: 0, md: 0, drop: 0 });
+}
+
 // Discovered outbound caller-ID pool (refreshed from Telnyx).
 let CALLER_POOL = CALLER_IDS_ENV.slice();
 
@@ -2184,6 +2197,57 @@ app.get('/api/admin/reports/wallboard', auth, adminOnly, async (_req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Live per-playlist call stats (ReadyMode-style). Columns: CPA (configured
+// calls-per-agent), Calls (dials initiated), Ans (bridged to a human), MD
+// (machine-detected), Drop (answered but no free agent = abandoned), Abd% (Drop/
+// Ans), Dial (legs ringing right now). Counters are in-memory since boot/last
+// reset; Dial is derived live from rt[*].pending.
+app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
+  try {
+    const playlists = await sbSelect('playlists', 'select=id,name,priority,lines_per_agent,active') || [];
+    const byId = Object.fromEntries(playlists.map(p => [p.id, p]));
+    // Live in-flight dials, grouped by the playlist that launched each leg.
+    const liveDial = {};
+    for (const id in rt) {
+      const st = rt[id]; if (!st || !st.pending) continue;
+      for (const cc in st.pending) {
+        const k = st.pending[cc].playlistId || '__direct__';
+        liveDial[k] = (liveDial[k] || 0) + 1;
+      }
+    }
+    const cpaOf = (pl) => { const n = pl && pl.lines_per_agent; return (n >= 1 && n <= 5) ? n : DIALER.lines_per_agent; };
+    const keys = new Set([...Object.keys(PLAYLIST_STATS), ...Object.keys(liveDial)]);
+    const rows = [];
+    for (const k of keys) {
+      const s = PLAYLIST_STATS[k] || { calls: 0, ans: 0, md: 0, drop: 0 };
+      const pl = k === '__direct__' ? null : byId[k];
+      const dial = liveDial[k] || 0;
+      // Skip fully-empty rows for playlists that were deleted and never dialed.
+      if (!pl && k !== '__direct__' && s.calls === 0 && dial === 0) continue;
+      rows.push({
+        playlist_id: k === '__direct__' ? null : k,
+        name: pl ? pl.name : (k === '__direct__' ? 'Direct (no playlist)' : '(deleted playlist)'),
+        active: pl ? pl.active !== false : false,
+        cpa: cpaOf(pl), calls: s.calls, ans: s.ans, md: s.md, drop: s.drop,
+        abd_pct: s.ans > 0 ? Math.round((s.drop / s.ans) * 1000) / 10 : 0,
+        dial,
+      });
+    }
+    rows.sort((a, b) => (b.calls - a.calls) || (b.dial - a.dial));
+    const tot = rows.reduce((t, r) => {
+      t.calls += r.calls; t.ans += r.ans; t.md += r.md; t.drop += r.drop; t.dial += r.dial; return t;
+    }, { calls: 0, ans: 0, md: 0, drop: 0, dial: 0 });
+    tot.abd_pct = tot.ans > 0 ? Math.round((tot.drop / tot.ans) * 1000) / 10 : 0;
+    res.json({ ts: Date.now(), since: new Date(PLAYLIST_STATS_SINCE).toISOString(), rows, totals: tot });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Reset the live per-playlist counters (Dial is live and unaffected).
+app.post('/api/admin/reports/playlists/reset', auth, adminOnly, (req, res) => {
+  PLAYLIST_STATS = {}; PLAYLIST_STATS_SINCE = Date.now();
+  audit(req.user, 'RESET_PLAYLIST_STATS', { target_type: 'settings' });
+  res.json({ ok: true, since: new Date(PLAYLIST_STATS_SINCE).toISOString() });
+});
+
 // Recording access — returns the URL and audits the listen/download.
 app.get('/api/admin/reports/recording/:id', auth, adminOnly, async (req, res) => {
   try {
@@ -2617,7 +2681,7 @@ app.post('/api/agent/call-lead', auth, async (req, res) => {
 });
 
 // ══ PACING ENGINE ════════════════════════════════════════════════════════════════
-async function dialLead(agentId, lead) {
+async function dialLead(agentId, lead, playlistId) {
   const st = rt[agentId];
   if (!st) return;
   // ReadyMode power-dialer invariant: ONE live line per agent. Never launch a
@@ -2660,7 +2724,8 @@ async function dialLead(agentId, lead) {
   // for the ONE leg that actually connects to a human; the extras get dropped the
   // moment one connects (see connectLeadLeg).
   st.pending = st.pending || {};
-  st.pending[ccid] = { leadId: lead.id, leadNumber: lead.phone, fromNumber: from, campaignId: lead.campaign_id, at: Date.now() };
+  st.pending[ccid] = { leadId: lead.id, leadNumber: lead.phone, fromNumber: from, campaignId: lead.campaign_id, playlistId: playlistId || null, at: Date.now() };
+  plStat(playlistId).calls++;
   if (st.state !== 'ON_CALL') st.state = 'DIALING';
   st.onCallSince = null;
   await persistRt(agentId);
@@ -2687,6 +2752,8 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
   // Already talking to someone → this is a second simultaneous answer. Drop it
   // and requeue the lead shortly so it isn't lost (this is the "abandoned call").
   if (st.leadLeg && st.leadLeg !== ccid) {
+    const dp = (st.pending && st.pending[ccid] && st.pending[ccid].playlistId) || null;
+    plStat(dp).drop++;   // ReadyMode "Drop": answered but no free agent to take it
     if (st.pending) delete st.pending[ccid];
     telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
     const lid = (cs && cs.leadId);
@@ -2701,10 +2768,12 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
   st.leadId = info.leadId || (cs && cs.leadId) || null;
   st.leadNumber = info.leadNumber || null;
   st.fromNumber = info.fromNumber || null;
+  st.leadPlaylistId = info.playlistId || null;   // remembered for MD/wrap stats after pending is cleared
   st.onCallSince = Date.now();
   st.state = 'ON_CALL';
   await telnyx('POST', `/conferences/${conf}/actions/join`, { call_control_id: ccid, start_conference_on_enter: true, mute: false });
   await setAgentState(agentId, 'ON_CALL');
+  plStat(st.leadPlaylistId).ans++;
   saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString(), amd_result: amd || null }, 'call-bridged');
   if (st.leadId) sbUpdate('leads', `id=eq.${st.leadId}`, { status: 'CONTACTED' }).catch(() => {});
   // Drop the sibling dials and requeue their leads so nothing is wasted.
@@ -2817,7 +2886,7 @@ async function pacingTick() {
       if (!first.lead) continue;                          // no dialable lead for this agent
       const cpa = cpaOf(first.playlist);
       if (inFlight >= cpa) continue;                       // already at this playlist's CPA
-      try { await dialLead(agentId, first.lead); }
+      try { await dialLead(agentId, first.lead, first.playlist && first.playlist.id); }
       catch (e) { console.error('[pacing:dial]', e.message); continue; }
       // Top up to the playlist's CPA with additional simultaneous legs.
       let need = cpa - inFlight - 1;
@@ -2825,7 +2894,7 @@ async function pacingTick() {
         if (st.leadLeg || st.inbound) break;              // connected mid-loop → stop dialing
         const nxt = await pickLead(agentId);
         if (!nxt.lead) break;                              // no more leads for this agent
-        try { await dialLead(agentId, nxt.lead); }
+        try { await dialLead(agentId, nxt.lead, nxt.playlist && nxt.playlist.id); }
         catch (e) { console.error('[pacing:dial]', e.message); break; }
       }
     }
@@ -3261,26 +3330,41 @@ app.post('/webhooks/telnyx', async (req, res) => {
       return;
     }
 
-    // AMD-disabled: a lead simply answering IS the connect signal.
-    if (event === 'call.answered' && role === 'lead' && agentId && AMD_MODE === 'disabled') {
-      await connectLeadLeg(agentId, ccid, cs, null);
+    // Lead answered -> bridge to the agent IMMEDIATELY, regardless of AMD mode.
+    // Waiting for premium AMD to confirm a human before joining leaves several
+    // seconds of dead air on every live call (and total silence if the premium
+    // AMD event never fires because it isn't enabled on the connection) — which
+    // is exactly the "calls come in silent" symptom. Premium AMD still runs in
+    // parallel and drops the leg below if it turns out to be a machine.
+    if (event === 'call.answered' && role === 'lead' && agentId) {
+      await connectLeadLeg(agentId, ccid, cs, null);   // AMD result (if any) is filled in by detection.ended below
       return;
     }
 
-    // Lead premium AMD -> bridge human, drop machine
+    // Lead premium AMD result. The leg is already bridged (we connect on answer),
+    // so a human needs no action; a machine is torn down and the agent freed.
     if (event === 'call.machine.premium.detection.ended' && role === 'lead' && agentId) {
       const r = payload.result || '';
-      const isHuman = r.startsWith('human') || r === 'silence' || r === 'not_sure';   // TCPA-safe: connect ambiguous
+      const isHuman = r.startsWith('human') || r === 'silence' || r === 'not_sure';   // TCPA-safe: keep ambiguous
       const st = rt[agentId];
       if (isHuman) {
-        await connectLeadLeg(agentId, ccid, cs, r);
-      } else {
-        if (st && st.pending) delete st.pending[ccid];
-        await telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
-        if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'MACHINE' }).catch(() => {});
-        console.log(`[bridge] dropped machine leg agent ${agentId.slice(0, 8)} (result=${r})`);
-        // agent freed to redial by the ensuing call.hangup handler
+        // Already talking. Record the classification for history; leave the call up.
+        if (ccid) saveCall({ telnyx_call_control_id: ccid, amd_result: r }, 'call-amd-human');
+        return;
       }
+      // Machine: hang up this leg whether it was bridged or still ringing, mark the
+      // lead, and return the agent straight to AVAILABLE (no wrap-up for a machine).
+      const pid = (st && st.pending && st.pending[ccid] && st.pending[ccid].playlistId)
+        || (st && st.leadLeg === ccid ? st.leadPlaylistId : null);
+      plStat(pid).md++;
+      const wasConnected = st && st.leadLeg === ccid;
+      if (st && st.pending) delete st.pending[ccid];
+      if (wasConnected) { st.leadLeg = null; st.leadId = null; st.leadNumber = null; st.fromNumber = null; st.leadPlaylistId = null; st.onCallSince = null; }
+      await telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+      if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
+      if (ccid) saveCall({ telnyx_call_control_id: ccid, amd_result: r }, 'call-amd-machine');
+      if (wasConnected && st && st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
+      console.log(`[bridge] machine leg dropped agent ${agentId.slice(0, 8)} (result=${r})`);
       return;
     }
 
