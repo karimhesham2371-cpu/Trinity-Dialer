@@ -190,6 +190,14 @@
   .kv{display:grid;grid-template-columns:96px 1fr;gap:8px 12px;font-size:13.5px}
   .kv .k{color:var(--text-dim)}
   .kv .mono{font-size:13px}
+  .ciPanel{border:1px solid var(--border-strong);border-radius:8px;overflow:hidden;background:var(--surface)}
+  .ciHead{padding:8px 12px;background:var(--surface-2);border-bottom:1px solid var(--border-strong);font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--text-dim)}
+  .ciGrid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border)}
+  .ciCell{padding:8px 12px;min-width:0;background:var(--surface)}
+  .ciCell .cl{display:block;font-size:11px;color:var(--text-dim);margin-bottom:2px}
+  .ciCell .cv{display:block;font-size:13.5px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ciCell--wide{grid-column:1/-1}
+  .ciGrid::after{content:'';background:var(--surface)}
   .hist .h{display:flex;gap:10px;padding:12px 0;border-top:1px solid var(--border)}
   .hist .h:first-child{border-top:0;padding-top:0}
   .hbadge{font:600 11px var(--font-ui);text-transform:uppercase;letter-spacing:.04em;padding:2px 8px;border-radius:999px;height:fit-content;white-space:nowrap}
@@ -564,7 +572,9 @@ let USER  = JSON.parse(localStorage.getItem('trinity_user') || 'null');
 let client=null, ws=null, serverState='OFFLINE', usersCache=[];
 let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null, serverWrapUntil=0;
 let dispositions=[], curCampaign=null, pendingCb=null;
-let waitSince=0;   // when the agent last became AVAILABLE (drives the Ready wait counter)
+let waitSince=0;   // when the agent last entered a waiting state (drives the wait counter)
+// "Waiting between calls" = available OR the engine is dialing in the background.
+function isWaitState(s){ return s==='AVAILABLE'||s==='DIALING'||s==='CLAIMING'; }
 
 // ── RBAC ──────────────────────────────────────────────────────────────────────
 // Admins have implicit full access; support users hold an explicit permission
@@ -639,7 +649,9 @@ async function apiJson(path, method='GET', body){
 // A supervisor kicked this agent off the dialer: drop the softphone, force the UI
 // to OFFLINE, and tell them plainly. They can Go Available again when ready.
 function handleKicked(m){
-  try{ if(client) client.disconnect(); }catch{}
+  if(typeof sipReconnT!=='undefined'&&sipReconnT){ clearTimeout(sipReconnT); sipReconnT=null; }
+  const _c=client; client=null;   // detach so socket.close doesn't trigger auto-reconnect
+  try{ if(_c) _c.disconnect(); }catch{}
   try{ applyState('OFFLINE',{state:'OFFLINE'}); }catch{}
   const by=(m&&m.by)||'a supervisor';
   toast('You were taken off the dialer by '+by,'err');
@@ -648,7 +660,8 @@ function handleKicked(m){
 }
 function show(view){ ['Login','Agent','Admin'].forEach(v=>$('view'+v).classList.toggle('hidden', v.toLowerCase()!==view)); }
 function logout(){ localStorage.removeItem('trinity_token'); localStorage.removeItem('trinity_user'); TOKEN=''; USER=null;
-  if(ws){try{ws.close();}catch{}} if(client){try{client.disconnect();}catch{}} if(timerInt)clearInterval(timerInt);
+  if(typeof sipReconnT!=='undefined'&&sipReconnT){ clearTimeout(sipReconnT); sipReconnT=null; }
+  if(ws){try{ws.close();}catch{}} const _c=client; client=null; if(_c){try{_c.disconnect();}catch{}} if(timerInt)clearInterval(timerInt);
   if(typeof stopLiveListen==='function') stopLiveListen(); if(typeof stopMonitor==='function') stopMonitor(); show('login'); }
 
 // ── Login ──
@@ -732,9 +745,9 @@ function applyState(s, snap){
   // Background dialing (ReadyMode-style): the lead is dialed silently and the
   // agent keeps a "waiting" screen — no contact details are revealed until the
   // lead actually answers and the call goes live (ON_CALL).
-  else if(s==='DIALING'||s==='CLAIMING'){ $('bannerState').textContent='Waiting for next call…'; $('bannerSub').textContent='Dialing in the background.'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL'||curLeadId) clearLead(); }
+  else if(s==='DIALING'||s==='CLAIMING'){ if(!isWaitState(prev)) waitSince=Date.now(); $('bannerState').textContent='Waiting for next call…'; $('bannerSub').textContent='Dialing in the background.'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL'||curLeadId) clearLead(); }
   else if(s==='WRAP_UP'){ $('bannerState').textContent='Wrap-up'; $('bannerSub').textContent='Auto-returns to Ready when the timer ends.'; stopTimer(); $('dispReq').classList.toggle('hidden', !curLeadId); }
-  else if(s==='AVAILABLE'){ if(prev!=='AVAILABLE') waitSince=Date.now(); $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
+  else if(s==='AVAILABLE'){ if(!isWaitState(prev)) waitSince=Date.now(); $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
   else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
   else { $('bannerState').textContent=u.txt; }
 
@@ -742,7 +755,7 @@ function applyState(s, snap){
   // back to Ready); BREAK is client-timed and auto-returns to Ready at 15 min.
   if(s==='WRAP_UP') ensureWrapTimer(serverWrapUntil);
   else if(s==='BREAK') ensureBreakTimer();
-  else if(s==='AVAILABLE') ensureWaitTimer();
+  else if(isWaitState(s)) ensureWaitTimer();
   else clearAuxTimer();
   renderAuxBtn(s);
 }
@@ -752,9 +765,20 @@ function startTimer(){ if(timerInt) clearInterval(timerInt); $('timer').classLis
     $('timer').textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); },500); }
 function stopTimer(){ if(timerInt){clearInterval(timerInt);timerInt=null;} $('timer').classList.add('hidden'); $('timer').textContent='00:00'; $('timer').style.color='var(--text)'; }
 
+// Softphone reconnect: capped exponential backoff (2s, 4s, 8s… max 30s).
+let sipRetries=0, sipReconnT=null;
+function scheduleSipReconnect(){
+  if(sipReconnT) return;
+  const delay=Math.min(30000, 2000*Math.pow(2, sipRetries++));
+  log('softphone dropped — reconnecting in '+Math.round(delay/1000)+'s');
+  toast('Softphone disconnected — reconnecting…','warn');
+  sipReconnT=setTimeout(()=>{ sipReconnT=null; if(TOKEN) startAgent(); }, delay);
+}
 async function startAgent(){
-  try{ if(client) client.disconnect(); }catch(e){}
-  client=null; agentCall=null;
+  if(sipReconnT){ clearTimeout(sipReconnT); sipReconnT=null; }
+  const old=client; client=null;   // detach BEFORE disconnect so its socket.close is ignored
+  try{ if(old) old.disconnect(); }catch(e){}
+  agentCall=null;
   applyState('CONNECTING');
   openWs();
   const TelnyxRTC = getTelnyxRTC();
@@ -763,15 +787,25 @@ async function startAgent(){
     log('fetching softphone token…');
     const j = await apiJson('/api/agent/token');
     log('got token for '+j.name+', connecting…');
-    client = new TelnyxRTC({ login_token: j.login_token });
+    const c = new TelnyxRTC({ login_token: j.login_token });
+    client = c;
     client.remoteElement = 'remoteAudio';
     client.on('telnyx.ready', async () => {
+      if(client!==c) return;
+      sipRetries=0;
       $('agConn').className='pill pill--ok'; $('agConn').innerHTML='<span class="dot dot--ok"></span> Softphone';
       log('registered ✓ — going available');
       try { await apiJson('/api/agent/available','POST',{}); } catch(e){ log('available error: '+e.message); }
     });
     client.on('telnyx.error', e => log('telnyx.error: '+(e&&e.error&&e.error.message||JSON.stringify(e))));
-    client.on('telnyx.socket.close', () => { $('agConn').className='pill pill--faint'; $('agConn').textContent='Softphone —'; });
+    client.on('telnyx.socket.close', () => {
+      $('agConn').className='pill pill--faint'; $('agConn').textContent='Softphone —';
+      // Random mid-shift drop (network blip, Telnyx socket died): reconnect
+      // automatically instead of leaving the agent with a dead softphone.
+      // Skipped when this client was intentionally replaced/killed (client!==c).
+      if(client!==c) return;
+      scheduleSipReconnect();
+    });
     client.on('telnyx.notification', n => {
       if(n.type==='callUpdate' && n.call){
         const st=n.call.state;
@@ -799,25 +833,29 @@ async function loadContext(){
 function renderLead(l, callerId){
   const name=[l.first_name,l.last_name].filter(Boolean).join(' ')||'Unknown contact';
   const custom=l.custom||{};
-  const extra=Object.keys(custom).filter(k=>custom[k]!=null&&custom[k]!=='').map(k=>`<div class="k">${esc(k)}</div><div>${esc(custom[k])}</div>`).join('');
-  // Always render the core contact fields (dash when missing) so the agent can
-  // see exactly what the lead file provided.
-  const row=(k,v)=>`<div class="k">${esc(k)}</div><div>${v!=null&&v!==''?esc(v):'<span class="faint">—</span>'}</div>`;
+  const cell=(k,v,wide)=>`<div class="ciCell${wide?' ciCell--wide':''}"><span class="cl">${esc(k)}</span><span class="cv" title="${v!=null&&v!==''?esc(v):''}">${v!=null&&v!==''?esc(v):'<span class="faint">—</span>'}</span></div>`;
+  const emailKey=Object.keys(custom).find(k=>/^e-?mail(_?address)?$/i.test(k)&&custom[k]);
+  const email=l.email||(emailKey?custom[emailKey]:'');
+  const extra=Object.keys(custom).filter(k=>k!==emailKey&&custom[k]!=null&&custom[k]!=='').map(k=>cell(k,custom[k])).join('');
   $('leadCard').classList.remove('empty');
   $('leadCard').innerHTML=`
     <h3 class="leadName">${esc(name)}</h3>
     <div class="leadPhone mt2">${esc(l.phone||'')}</div>
-    <div class="kv mt">
-      ${row('First name',l.first_name)}
-      ${row('Last name',l.last_name)}
-      ${row('Phone',l.phone)}
-      ${row('Address',l.address)}
-      ${row('City',l.city)}
-      ${row('State',l.state)}
-      ${row('Zip code',l.zip)}
-      <div class="k">Attempts</div><div class="mono">${l.attempts||0}</div>
-      ${callerId?`<div class="k">Caller ID</div><div class="mono">${esc(callerId)}</div>`:''}
-      ${extra}
+    <div class="ciPanel mt">
+      <div class="ciHead">Contact Information</div>
+      <div class="ciGrid">
+        ${cell('First Name',l.first_name)}
+        ${cell('Last Name',l.last_name)}
+        ${cell('Phone Number',l.phone)}
+        ${cell('Email',email)}
+        ${cell('Address',l.address,true)}
+        ${cell('City',l.city)}
+        ${cell('State',l.state)}
+        ${cell('Zip Code',l.zip)}
+        ${cell('Attempts',String(l.attempts||0))}
+        ${callerId?cell('Caller ID',callerId,true):''}
+        ${extra}
+      </div>
     </div>`;
   $('notes').value='';
 }
@@ -846,6 +884,8 @@ async function loadProductivity(quiet){
     <div class="prodStat"><span class="pl">Hours logged in</span><span class="pv">${prodDur(d.logged_in)}</span></div>
     <div class="prodStat"><span class="pl">Break duration</span><span class="pv">${prodDur(d.break)}</span></div>
     <div class="prodStat"><span class="pl">Wrap-up duration</span><span class="pv">${prodDur(d.wrap)}</span></div>
+    <div class="prodStat"><span class="pl">Wait duration</span><span class="pv">${prodDur(d.wait)}</span></div>
+    <div class="prodStat"><span class="pl">Avg wait between calls</span><span class="pv">${prodDur(d.calls?(d.wait||0)/d.calls:0)}</span></div>
     <div class="prodStat"><span class="pl">Calls handled</span><span class="pv">${d.calls||0}</span></div></div>`;
   el.innerHTML=grp('Today','',j.today||{})+grp('Overall','Resets at the start of each month',j.month||{});
 }
@@ -990,12 +1030,13 @@ function renderAuxBtn(s){
   if(s==='OFFLINE'){ b.textContent='Offline'; b.className='btn btn-sm btn-primary'; return; }
   if(s==='CONNECTING'){ b.textContent='Connecting…'; b.className='btn btn-sm'; return; }
   if(s==='ON_CALL'){ b.textContent='On call'; b.className='btn btn-sm'; return; }
-  if(s==='DIALING'||s==='CLAIMING'){ b.textContent='Waiting…'; b.className='btn btn-sm'; return; }
   if(s==='WRAP_UP'){ b.textContent='Wrap up '+fmtMS(auxRemainMs()); b.className='btn btn-sm btn-warn'; return; }
   if(s==='BREAK'){ b.textContent='Break '+fmtMS(auxRemainMs()); b.className='btn btn-sm btn-warn'; return; }
-  // AVAILABLE — show how long the agent has been waiting for the next call.
+  // Waiting between calls (AVAILABLE, or background DIALING/CLAIMING) — show a
+  // live count-up of how long the agent has been waiting for the next call.
+  const waitTxt='<span style="display:block;font-size:10px;line-height:1.1;opacity:.65;font-variant-numeric:tabular-nums">'+fmtMS(Math.max(0,Date.now()-(waitSince||Date.now())))+'</span>';
   b.className='btn btn-sm';
-  b.innerHTML='Ready<span style="display:block;font-size:10px;line-height:1.1;opacity:.65;font-variant-numeric:tabular-nums">'+fmtMS(Math.max(0,Date.now()-(waitSince||Date.now())))+'</span>';
+  b.innerHTML=(s==='DIALING'||s==='CLAIMING'?'Waiting…':'Ready')+waitTxt;
 }
 async function setAux(target){
   $('auxMenu').classList.add('hidden');
@@ -1703,7 +1744,7 @@ function openAdminWs(){
   const proto=location.protocol==='https:'?'wss':'ws';
   adminWs=new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
   adminWs.onmessage=(ev)=>{ let m; try{ m=JSON.parse(ev.data); }catch{ return; }
-    if(m.type==='floor.agent'){ const a=floorAgents.find(x=>x.id===m.agentId); if(a){ a.state=m.state; updateSeatState(a.id,m.state); } } };
+    if(m.type==='floor.agent'){ const a=floorAgents.find(x=>x.id===m.agentId); if(a){ a.state=m.state; a.stateSince=m.stateSince||Date.now(); updateSeatState(a.id,m.state); } } };
   adminWs.onclose=()=>{ adminWs=null; };
 }
 function closeAdminWs(){ if(adminWs){ try{ adminWs.close(); }catch{} adminWs=null; } }
@@ -1713,11 +1754,13 @@ async function renderMap(){
   $('repBody').innerHTML=`<p class="dim" style="font-size:12px;margin:0 0 12px">Drag an agent onto the floor to place their desk; drag off to unseat. Positions are saved.</p>
     <div class="floorwrap" id="floor"></div>
     <div class="lbl mt3">Unseated agents</div><div class="benchwrap" id="bench"></div>`;
-  drawFloor(); openAdminWs();
+  drawFloor(); openAdminWs(); ensureFloorTimer();
 }
+function stateLabel(s){ return ({AVAILABLE:'Waiting',DIALING:'Waiting',CLAIMING:'Waiting',ON_CALL:'On call',WRAP_UP:'Wrap up',BREAK:'Break',CONNECTING:'Connecting',OFFLINE:'Offline'})[s]||s; }
+function seatTimerTxt(a){ if(!a||!a.stateSince||a.state==='OFFLINE') return ''; return fmtMS(Math.max(0,Date.now()-a.stateSince)); }
 function seatEl(a){ const dc=stateDot(a.state); const el=document.createElement('div');
   el.className='seat seat--'+dc; el.dataset.aid=a.id;
-  el.innerHTML=`<b>${esc(a.name)}</b><div class="seatstate"><span class="dot dot--${dc}"></span><span data-st>${esc(a.state)}</span></div>`;
+  el.innerHTML=`<b>${esc(a.name)}</b><div class="seatstate"><span class="dot dot--${dc}"></span><span data-st>${esc(stateLabel(a.state))}</span><span data-tm class="mono" style="margin-left:auto;font-size:10px;opacity:.7;font-variant-numeric:tabular-nums">${seatTimerTxt(a)}</span></div>`;
   return el; }
 function drawFloor(){
   const floor=$('floor'), bench=$('bench'); floor.innerHTML=''; bench.innerHTML='';
@@ -1730,8 +1773,19 @@ function drawFloor(){
 function updateSeatState(aid,state){
   const floor=$('floor'); if(!floor) return; const el=floor.querySelector('.seat[data-aid="'+aid+'"]'); if(!el) return;
   const dc=stateDot(state); el.className='seat seat--'+dc+(el.classList.contains('drag')?' drag':'');
-  const st=el.querySelector('[data-st]'); if(st) st.textContent=state;
+  const st=el.querySelector('[data-st]'); if(st) st.textContent=stateLabel(state);
   const dot=el.querySelector('.dot'); if(dot) dot.className='dot dot--'+dc;
+  const a=floorAgents.find(x=>x.id===aid); const tm=el.querySelector('[data-tm]'); if(tm) tm.textContent=seatTimerTxt(a);
+}
+let floorTimerInt=null;
+function ensureFloorTimer(){
+  if(floorTimerInt) return;
+  floorTimerInt=setInterval(()=>{
+    const floor=$('floor');
+    if(!floor||!document.body.contains(floor)){ clearInterval(floorTimerInt); floorTimerInt=null; return; }
+    floorAgents.forEach(a=>{ const el=floor.querySelector('.seat[data-aid="'+a.id+'"]'); if(!el) return;
+      const tm=el.querySelector('[data-tm]'); if(tm) tm.textContent=seatTimerTxt(a); });
+  },1000);
 }
 function makeDraggable(el, agentId){
   el.addEventListener('mousedown',(e)=>{

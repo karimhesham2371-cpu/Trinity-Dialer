@@ -903,7 +903,7 @@ async function rehydrateRt() {
         state: a.state, sip: a.sip_username,
         agentLeg: a.agent_leg, leadLeg: a.lead_leg, leadId: a.lead_id,
         leadNumber: a.lead_number, fromNumber: a.from_number, conferenceId: a.conference_id,
-        rtUpdatedAt: Date.now(),
+        rtUpdatedAt: Date.now(), stateStart: Date.now(), loggedState: a.state,
       };
       // The wrap auto-return setTimeout died with the old process; re-arm it so a
       // restored WRAP_UP agent doesn't sit in wrap-up forever after a redeploy.
@@ -958,7 +958,8 @@ function wsToAgent(id, obj) { for (const c of wsClients) if (c.userId === id) ws
 function agentSnapshot(id) {
   const st = rt[id] || { state: 'OFFLINE' };
   return { agentId: id, state: st.state, leadId: st.leadId || null, leadNumber: st.leadNumber || null,
-           fromNumber: st.fromNumber || null, onCallSince: st.onCallSince || null, wrapUntil: st.wrapUntil || null };
+           fromNumber: st.fromNumber || null, onCallSince: st.onCallSince || null, wrapUntil: st.wrapUntil || null,
+           stateSince: st.stateStart || null };
 }
 // Push one agent's state to that agent and to every admin (floor view).
 function wsAgentSnapshot(id) {
@@ -2611,7 +2612,8 @@ app.get('/api/admin/reports/recording/:id/stream', auth, adminOnly, async (req, 
 app.get('/api/admin/floor', auth, adminOnly, async (_req, res) => {
   try {
     const rows = await sbSelect('agents', 'active=eq.true&select=id,name,role,seat_x,seat_y&order=name.asc');
-    res.json({ agents: rows.map(a => ({ ...a, state: (rt[a.id] && rt[a.id].state) || 'OFFLINE' })) });
+    res.json({ agents: rows.map(a => ({ ...a, state: (rt[a.id] && rt[a.id].state) || 'OFFLINE',
+      stateSince: (rt[a.id] && rt[a.id].stateStart) || null })) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/api/admin/floor/seat', auth, adminOnly, async (req, res) => {
@@ -2779,7 +2781,7 @@ async function productivityWindow(agentId, fromMs, toMs) {
       `agent_id=eq.${agentId}&created_at=gte.${encodeURIComponent(fromIso)}` +
       `&created_at=lte.${encodeURIComponent(toIso)}&select=id&limit=100000`),
   ]);
-  const out = { logged_in: 0, break: 0, wrap: 0, calls: (calls || []).length };
+  const out = { logged_in: 0, break: 0, wrap: 0, wait: 0, calls: (calls || []).length };
   for (const s of spans || []) {
     const start = new Date(s.started_at).getTime();
     const end = s.ended_at ? new Date(s.ended_at).getTime() : Date.now();
@@ -2788,8 +2790,10 @@ async function productivityWindow(agentId, fromMs, toMs) {
     if (PROD_LOGGED.has(s.state)) out.logged_in += dur;
     if (s.state === 'BREAK') out.break += dur;
     else if (s.state === 'WRAP_UP') out.wrap += dur;
+    // Waiting between calls: available + background dialing (agent hears nothing yet).
+    else if (s.state === 'AVAILABLE' || s.state === 'DIALING' || s.state === 'CLAIMING') out.wait += dur;
   }
-  for (const k of ['logged_in', 'break', 'wrap']) out[k] = Math.round(out[k]);
+  for (const k of ['logged_in', 'break', 'wrap', 'wait']) out[k] = Math.round(out[k]);
   return out;
 }
 app.get('/api/agent/productivity', auth, async (req, res) => {
