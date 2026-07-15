@@ -2826,18 +2826,46 @@ app.get('/api/agent/productivity', auth, async (req, res) => {
 });
 
 // Load a campaign's config, filling in defaults for unset dialer fields.
+const _campCfgCache = new Map();   // 30s TTL — keeps instant lead-context pushes off the DB
 async function campaignConfig(id) {
   if (!id) return null;
+  const hit = _campCfgCache.get(id);
+  if (hit && Date.now() - hit.at < 30000) return hit.cfg;
   const rows = await sbSelect('campaigns', `id=eq.${id}&select=*`).catch(() => []);
   const c = rows[0];
   if (!c) return null;
-  return {
+  const cfg = {
     ...c,
     dispositions: Array.isArray(c.dispositions) && c.dispositions.length ? c.dispositions : DEFAULT_DISPOSITIONS,
     recycle_rules: c.recycle_rules && Object.keys(c.recycle_rules).length ? c.recycle_rules : DEFAULT_RECYCLE,
     wrap_seconds: c.wrap_seconds != null ? c.wrap_seconds : 5,
     script: c.script || '',
   };
+  _campCfgCache.set(id, { cfg, at: Date.now() });
+  return cfg;
+}
+
+// Push the full lead profile to the agent over WS the moment a call bridges,
+// using the lead row cached at dial time — no DB round trips, so the card is
+// on screen instantly. History still arrives via the client's loadContext.
+async function pushLeadContext(agentId, leadRow) {
+  try {
+    const st = rt[agentId];
+    if (!st) return;
+    const lead = leadRow ||
+      (st.leadId ? (await sbSelect('leads', `id=eq.${st.leadId}&select=*`))[0] : null);
+    if (!lead) return;
+    const cfg = await campaignConfig(lead.campaign_id);
+    wsToAgent(agentId, {
+      type: 'lead.context',
+      lead: { ...lead, custom: lead.custom || {} },
+      caller_id: st.fromNumber || null,
+      onCallSince: st.onCallSince || null,
+      campaign: cfg ? { id: cfg.id, name: cfg.name, wrap_seconds: cfg.wrap_seconds,
+        dispositions: (cfg.dispositions || []).filter(d => !d.system && !AGENT_HIDDEN_DISPOSITIONS.has(d.code)),
+        script: cfg.script, script_merged: mergeScript(cfg.script, lead) } : null,
+    });
+  } catch (e) { console.error('[pushLeadContext]', e.message); }
 }
 function mergeScript(script, lead) {
   if (!script) return '';
@@ -2852,12 +2880,14 @@ app.get('/api/agent/context', auth, async (req, res) => {
   const st = rt[req.user.id];
   if (!st || !st.leadId) return res.json({ state: st ? st.state : 'OFFLINE', lead: null });
   try {
-    const leadRows = await sbSelect('leads', `id=eq.${st.leadId}&select=*`);
+    const [leadRows, history] = await Promise.all([
+      sbSelect('leads', `id=eq.${st.leadId}&select=*`),
+      sbSelect('dispositions',
+        `lead_id=eq.${st.leadId}&select=code,notes,callback_at,created_at&order=created_at.desc&limit=20`).catch(() => []),
+    ]);
     const lead = leadRows[0];
     if (!lead) return res.json({ state: st.state, lead: null });
     const cfg = await campaignConfig(lead.campaign_id);
-    const history = await sbSelect('dispositions',
-      `lead_id=eq.${st.leadId}&select=code,notes,callback_at,created_at&order=created_at.desc&limit=20`).catch(() => []);
     res.json({
       state: st.state, onCallSince: st.onCallSince || null,
       lead: { ...lead, custom: lead.custom || {} },
@@ -3068,7 +3098,7 @@ async function dialLead(agentId, lead, playlistId) {
   // moment one connects (see connectLeadLeg).
   st.pending = st.pending || {};
   st.pending[ccid] = { leadId: lead.id, leadNumber: lead.phone, fromNumber: from, campaignId: lead.campaign_id, playlistId: playlistId || null, at: Date.now(),
-    cid, amdMode: amdParam, gatedBridge: acfg.gatedBridge, silencePolicy: acfg.silencePolicy, answeredAt: null };
+    cid, amdMode: amdParam, gatedBridge: acfg.gatedBridge, silencePolicy: acfg.silencePolicy, answeredAt: null, lead };
   plStat(playlistId).calls++;
   if (st.state !== 'ON_CALL') st.state = 'DIALING';
   st.onCallSince = null;
@@ -3137,6 +3167,7 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
   st.leadPlaylistId = info.playlistId || null;   // remembered for MD/wrap stats after pending is cleared
   st.onCallSince = Date.now();
   st.state = 'ON_CALL';
+  pushLeadContext(agentId, info.lead || null);   // fire-and-forget: card renders before the join lands
   await telnyx('POST', `/conferences/${conf}/actions/join`, { call_control_id: ccid, start_conference_on_enter: true, mute: false });
   await setAgentState(agentId, 'ON_CALL');
   plStat(st.leadPlaylistId).ans++;
@@ -3566,7 +3597,7 @@ async function dialEngineLead(lead, acfg) {
   const ccid = result.data && result.data.call_control_id;
   if (!ccid) return;
   dialerRt[ccid] = { ccid, campaignId: lead.campaign_id, leadId: lead.id, cid, phase: 'DIALING',
-    amdMode: amdParam, from, to: lead.phone, at: Date.now(), answeredAt: null, reservedAgentId: null };
+    amdMode: amdParam, from, to: lead.phone, at: Date.now(), answeredAt: null, reservedAgentId: null, lead };
   saveCall({ id: cid, lead_id: lead.id, campaign_id: lead.campaign_id, telnyx_call_control_id: ccid,
     from_number: from, to_number: lead.phone, direction: 'outbound' }, 'engine-open');
   saveCall({ telnyx_call_control_id: ccid, amd_mode: amdParam, call_phase: 'DIALING' }, 'engine-phase');
@@ -3621,6 +3652,7 @@ async function engineBridgeToAgent(agentId, ccid, info) {
     st.fromNumber = info.from || null;
     st.onCallSince = Date.now();
     st.state = 'ON_CALL';
+    pushLeadContext(agentId, info.lead || null);
     await setAgentState(agentId, 'ON_CALL');
     info.phase = 'BRIDGED';
     delete dialerRt[ccid];   // ownership transferred to the agent lane

@@ -703,6 +703,15 @@ function openWs(){
   sock.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); log('ws open ✓'); };
   sock.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
     if(m.type==='agent.state'){ applyState(m.state, m); }
+    else if(m.type==='lead.context'){
+      // Server pushes the full lead profile at bridge time — render instantly
+      // instead of waiting for the loadContext HTTP round trip (which still
+      // runs on ON_CALL and fills in call history).
+      if(m.lead){ curLeadId=m.lead.id; curCampaign=m.campaign;
+        renderLead(m.lead, m.caller_id);
+        renderScript(m.campaign);
+        renderDispositions(m.campaign&&m.campaign.dispositions||[]); }
+    }
     else if(m.type==='kicked'){ handleKicked(m); } };
   sock.onerror = ()=>{ log('ws error'); };
   sock.onclose = (ev)=>{
@@ -830,6 +839,7 @@ async function loadContext(){
   }catch(e){ /* transient */ }
 }
 
+let renderedLeadId=null;
 function renderLead(l, callerId){
   const name=[l.first_name,l.last_name].filter(Boolean).join(' ')||'Unknown contact';
   const custom=l.custom||{};
@@ -857,7 +867,10 @@ function renderLead(l, callerId){
         ${extra}
       </div>
     </div>`;
-  $('notes').value='';
+  // Only clear notes when a NEW lead lands — the instant WS push and the
+  // loadContext refresh both render the same lead, and the second render must
+  // not wipe what the agent already typed.
+  if(renderedLeadId!==l.id){ $('notes').value=''; renderedLeadId=l.id; }
 }
 function renderScript(c){
   if(!c||!c.script){ $('scriptBody').className='empty'; $('scriptBody').textContent='No script set for this campaign.'; return; }
@@ -956,7 +969,7 @@ function beep(){
 }
 
 function clearLead(){
-  curLeadId=null; $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
+  curLeadId=null; renderedLeadId=null; $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
   $('scriptBody').className='empty'; $('scriptBody').textContent='No active call.';
   $('history').className='empty'; $('history').textContent='No previous contact.';
   $('dispGrid').innerHTML=''; $('notes').value=''; $('cbWrap').classList.add('hidden');
