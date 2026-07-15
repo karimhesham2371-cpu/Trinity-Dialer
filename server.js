@@ -65,6 +65,10 @@ const DEFAULT_DISPOSITIONS = [
   { code: 'VOICEMAIL',      label: 'Left Voicemail', color: '#a371f7', hotkey: '5', recycle: 'no_answer' },
   { code: 'WRONG_NUMBER',   label: 'Wrong Number',   color: '#f0883e', hotkey: '6', outcome: 'BAD_NUMBER' },
   { code: 'DNC',            label: 'Do Not Call',    color: '#da3633', hotkey: '7', is_dnc: true },
+  // AMD-accuracy ground truth: the agent bridged in, but it was actually a
+  // machine/voicemail AMD failed to catch (a false negative). Recorded so the
+  // amd-stats disagreement report can score real-world miss rate against labels.
+  { code: 'AMD_MISS',       label: 'Voicemail reached me (AMD miss)', color: '#6e40c9', hotkey: '8', recycle: 'no_answer' },
 ];
 const DEFAULT_RECYCLE = { no_answer: { hours: 4, max: 5 }, busy: { minutes: 20, max: 8 } };
 
@@ -220,6 +224,134 @@ async function loadDialerConfig() {
       };
     }
   } catch (e) { console.error('[dialerConfig]', e.message); }
+}
+
+// ── Answering Machine Detection (AMD) ────────────────────────────────────────
+// Every event_type string, parameter name and result value below is taken
+// VERBATIM from the Telnyx Call Control v2 docs (voice/answering-machine-
+// detection). Classification keys off those exact strings — never invent new
+// result values.
+//   answering_machine_detection : premium | detect | detect_beep | disabled
+//   answering_machine_detection_config :
+//       { total_analysis_time_millis, greeting_duration_millis, prompt_end_timeout_millis }
+//   call.machine.premium.detection.ended  result:
+//       human_residence | human_business | machine | silence | fax_detected | not_sure
+//   call.machine.detection.ended (standard) result: human | machine | not_sure
+//   call.machine.premium.greeting.ended  result: beep_detected | no_beep_detected | prompt_ended
+//   call.machine.greeting.ended (standard) result: ended | beep_detected | not_sure
+const AMD_MODES            = ['premium', 'detect', 'detect_beep', 'disabled'];
+const AMD_DETECTION_EVENTS = new Set(['call.machine.premium.detection.ended', 'call.machine.detection.ended']);
+const AMD_GREETING_EVENTS  = new Set(['call.machine.premium.greeting.ended', 'call.machine.greeting.ended']);
+const AMD_HUMAN_RESULTS    = new Set(['human', 'human_residence', 'human_business']);
+const AMD_MACHINE_RESULTS  = new Set(['machine', 'fax_detected']);
+// silence / not_sure (and anything unrecognised) are AMBIGUOUS — routed by the
+// campaign's silence_policy, which defaults to 'human' so we never hang up on a
+// real person by default.
+function amdClass(result) {
+  if (AMD_HUMAN_RESULTS.has(result)) return 'human';
+  if (AMD_MACHINE_RESULTS.has(result)) return 'machine';
+  return 'ambiguous';
+}
+// Only the config sub-fields Telnyx documents; drop anything else so a bad
+// campaign config can't inject unknown params into the Dial command.
+function amdConfigParam(config) {
+  if (!config || typeof config !== 'object') return null;
+  const out = {};
+  const n = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : undefined);
+  if (config.total_analysis_time_millis != null) out.total_analysis_time_millis = n(config.total_analysis_time_millis);
+  if (config.greeting_duration_millis   != null) out.greeting_duration_millis   = n(config.greeting_duration_millis);
+  if (config.prompt_end_timeout_millis  != null) out.prompt_end_timeout_millis  = n(config.prompt_end_timeout_millis);
+  return Object.keys(out).length ? out : null;
+}
+// Per-campaign AMD config, short-TTL cached (dialLead runs hot). select=* keeps
+// this working before AND after scripts/amd_schema.sql is applied.
+const _campAmdCache = new Map();   // campaignId -> { at, cfg }
+const CAMP_AMD_TTL_MS = 15000;
+async function campaignAmd(campaignId) {
+  const fallback = {
+    mode: AMD_MODE === 'disabled' ? 'disabled' : 'premium',
+    config: null, vmDrop: false, vmUrl: null, vmConsent: false,
+    silencePolicy: 'human', gatedBridge: false,
+  };
+  if (!campaignId) return fallback;
+  const hit = _campAmdCache.get(campaignId);
+  if (hit && Date.now() - hit.at < CAMP_AMD_TTL_MS) return hit.cfg;
+  let row = null;
+  try { const rows = await sbSelect('campaigns', `id=eq.${campaignId}&select=*`); row = rows && rows[0]; }
+  catch { /* keep defaults */ }
+  const cfg = row ? {
+    mode: AMD_MODES.includes(row.amd_mode) ? row.amd_mode : 'premium',
+    config: (row.amd_config && typeof row.amd_config === 'object') ? row.amd_config : null,
+    vmDrop: !!row.vm_drop_enabled,
+    vmUrl: row.vm_drop_url || null,
+    vmConsent: !!row.vm_drop_consent,
+    silencePolicy: row.silence_policy === 'machine' ? 'machine' : 'human',
+    gatedBridge: !!(row.amd_config && typeof row.amd_config === 'object' && row.amd_config.gated_bridge),
+  } : fallback;
+  _campAmdCache.set(campaignId, { at: Date.now(), cfg });
+  return cfg;
+}
+// One row per AMD webhook. Best-effort (table ships in scripts/amd_schema.sql);
+// never retried so a missing table can't spam the durable outbox.
+function amdEvent(row) { sbReq('POST', 'amd_events', row, 'return=minimal').catch(() => {}); }
+// Rolling per-campaign abandoned-rate guardrail (FCC: <=3% per campaign per 30
+// days). Recomputed lazily from the calls table and cached; pacing reads it to
+// throttle the dial ratio before the cap is hit.
+const AMD_ABANDON_CAP = 0.03, AMD_ABANDON_THROTTLE = 0.025;
+const _abandonCache = new Map();   // campaignId -> { at, rate }
+const ABANDON_TTL_MS = 5 * 60 * 1000;
+async function campaignAbandonRate(campaignId) {
+  if (!campaignId) return 0;
+  const hit = _abandonCache.get(campaignId);
+  if (hit && Date.now() - hit.at < ABANDON_TTL_MS) return hit.rate;
+  let rate = 0;
+  try {
+    const since = new Date(Date.now() - 30 * 864e5).toISOString();
+    const answered  = await sbCount('calls', `campaign_id=eq.${campaignId}&answered_at=gte.${since}`);
+    const abandoned = await sbCount('calls', `campaign_id=eq.${campaignId}&abandoned=is.true&created_at=gte.${since}`);
+    rate = answered > 0 ? abandoned / answered : 0;
+  } catch { rate = 0; }
+  _abandonCache.set(campaignId, { at: Date.now(), rate });
+  return rate;
+}
+// Nightly AMD cross-check: over the last 24h, compare AMD's verbatim result to
+// the agent's own disposition (ground truth) and log a per-campaign miss report.
+// Writes a compact audit_log row so the accuracy trend is queryable over time.
+// Runs from the boot scheduler; best-effort and never throws into the loop.
+async function amdNightlyCrossCheck() {
+  if (!SB_HOST) return;
+  try {
+    const since = new Date(Date.now() - 24 * 3600e3).toISOString();
+    const calls = await sbSelect('calls',
+      `answered_at=gte.${encodeURIComponent(since)}&select=telnyx_call_control_id,campaign_id,amd_mode,amd_result,abandoned&limit=200000`).catch(() => []);
+    if (!calls || !calls.length) return;
+    const ccids = calls.filter(c => c.telnyx_call_control_id).map(c => `"${c.telnyx_call_control_id}"`);
+    const disps = ccids.length
+      ? await sbSelect('dispositions', `telnyx_call_control_id=in.(${ccids.join(',')})&select=telnyx_call_control_id,code&limit=200000`).catch(() => [])
+      : [];
+    const dispBy = {};
+    for (const d of disps || []) if (d.telnyx_call_control_id) dispBy[d.telnyx_call_control_id] = d.code;
+    const LIVE = new Set(['SALE', 'APPT', 'APPOINTMENT', 'LEAD', 'CB', 'CALLBACK', 'NI', 'NOT_INTERESTED', 'DNC', 'XFER', 'TRANSFER']);
+    const VM   = new Set(['VM', 'VOICEMAIL', 'MACHINE', 'AMD_MISS']);
+    const agg = {};   // campaign_id -> counts
+    for (const c of calls) {
+      const a = agg[c.campaign_id] || (agg[c.campaign_id] = { answered: 0, fp: 0, fn: 0, abandoned: 0 });
+      a.answered++; if (c.abandoned) a.abandoned++;
+      const code = c.telnyx_call_control_id ? dispBy[c.telnyx_call_control_id] : null;
+      if (code && c.amd_result) {
+        const cls = amdClass(c.amd_result);
+        if (cls === 'machine' && LIVE.has(code)) a.fp++;
+        if (cls === 'human'   && VM.has(code))   a.fn++;
+      }
+    }
+    for (const [cid, a] of Object.entries(agg)) {
+      const rate = a.answered ? a.abandoned / a.answered : 0;
+      console.log(`[amd-nightly] campaign ${String(cid).slice(0, 8)} 24h: answered=${a.answered} false_pos=${a.fp} false_neg=${a.fn} abandoned=${a.abandoned} (${(rate * 100).toFixed(2)}%)`);
+      audit(null, 'amd_cross_check', { target_type: 'campaign', target_id: cid,
+        meta: { window: '24h', answered: a.answered, false_positive: a.fp, false_negative: a.fn,
+          abandoned: a.abandoned, abandoned_rate: Math.round(rate * 1000) / 1000, over_cap: rate > AMD_ABANDON_CAP } });
+    }
+  } catch (e) { console.error('[amd-nightly]', e.message); }
 }
 
 // ── AI Cold Caller config (admin-editable, cached from app_settings key "ai") ──
@@ -982,11 +1114,22 @@ app.patch('/api/admin/campaigns/:id', auth, adminOnly, async (req, res) => {
   if (b.script != null) patch.script = String(b.script);
   if (b.wrap_seconds != null) patch.wrap_seconds = Math.max(0, Math.min(60, parseInt(b.wrap_seconds, 10) || 0));
   if (b.dial_ratio != null) patch.dial_ratio = Math.max(1, Math.min(4, Number(b.dial_ratio) || 1));
-  if (b.amd_mode != null && ['premium', 'detect', 'disabled'].includes(b.amd_mode)) patch.amd_mode = b.amd_mode;
+  if (b.amd_mode != null && AMD_MODES.includes(b.amd_mode)) patch.amd_mode = b.amd_mode;
   if (b.record_calls != null) patch.record_calls = !!b.record_calls;
   if (b.local_presence != null) patch.local_presence = !!b.local_presence;
   if (b.vm_drop_enabled != null) patch.vm_drop_enabled = !!b.vm_drop_enabled;
   if (b.vm_drop_url != null) patch.vm_drop_url = String(b.vm_drop_url).trim() || null;
+  if (b.vm_drop_consent != null) patch.vm_drop_consent = !!b.vm_drop_consent;
+  if (b.silence_policy != null && ['human', 'machine'].includes(b.silence_policy)) patch.silence_policy = b.silence_policy;
+  // amd_config: keep only the documented Telnyx sub-fields + our gated_bridge flag.
+  if (b.amd_config != null) {
+    if (b.amd_config === false || b.amd_config === '') { patch.amd_config = null; }
+    else if (typeof b.amd_config === 'object') {
+      const cfg = amdConfigParam(b.amd_config) || {};
+      if (b.amd_config.gated_bridge != null) cfg.gated_bridge = !!b.amd_config.gated_bridge;
+      patch.amd_config = Object.keys(cfg).length ? cfg : null;
+    }
+  }
   if (!Object.keys(patch).length) return res.status(400).json({ error: 'nothing to update' });
   try {
     await sbUpdate('campaigns', `id=eq.${req.params.id}`, patch);
@@ -2149,6 +2292,97 @@ app.get('/api/admin/analytics', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── AMD accuracy / effectiveness stats ────────────────────────────────────────
+// Answers "is AMD actually working?" for a campaign+range from the always-on
+// instrumentation columns (no test harness needed to read production accuracy):
+//   • result distribution (verbatim payload.result counts + %)
+//   • detection latency p50 / p95 / mean (ms, from amd_latency_ms)
+//   • AMD-vs-disposition disagreement: calls AMD flagged machine but the AGENT
+//     dispositioned as a live contact (false positive), and calls AMD called
+//     human but the agent marked voicemail/no-answer (false negative / miss)
+//   • abandoned rate vs the FCC 3% cap
+// Reads the calls + dispositions tables directly; degrades to zeros pre-migration.
+app.get('/api/admin/amd-stats', auth, adminOnly, async (req, res) => {
+  const now = Date.now();
+  const from = req.query.from ? new Date(req.query.from).getTime() : (now - 7 * 864e5);
+  const to   = req.query.to   ? new Date(req.query.to).getTime()   : now;
+  const fromIso = new Date(from).toISOString(), toIso = new Date(to).toISOString();
+  const wantId = req.query.campaign_id && req.query.campaign_id !== 'all' ? String(req.query.campaign_id) : null;
+  const pct = (n, d) => (d ? Math.round((n / d) * 1000) / 10 : 0);
+  const quantile = (sorted, q) => {
+    if (!sorted.length) return null;
+    const idx = Math.min(sorted.length - 1, Math.floor(q * (sorted.length - 1)));
+    return sorted[idx];
+  };
+  // Agent dispositions that mean "I actually spoke to a live person".
+  const LIVE_CODES = new Set(['SALE', 'APPT', 'APPOINTMENT', 'LEAD', 'CB', 'CALLBACK', 'NI', 'NOT_INTERESTED', 'DNC', 'XFER', 'TRANSFER']);
+  const VM_CODES   = new Set(['VM', 'VOICEMAIL', 'MACHINE', 'AMD_MISS']);
+  try {
+    const filt = wantId ? `campaign_id=eq.${wantId}` : '';
+    const range = `created_at=gte.${encodeURIComponent(fromIso)}&created_at=lte.${encodeURIComponent(toIso)}`;
+    const where = [filt, range].filter(Boolean).join('&');
+    const [calls, disps] = await Promise.all([
+      sbSelect('calls', `${where}&select=id,telnyx_call_control_id,campaign_id,amd_mode,amd_result,amd_latency_ms,amd_greeting,answered_at,abandoned,vm_dropped&limit=200000`).catch(() => []),
+      sbSelect('dispositions', `${where}&select=telnyx_call_control_id,code&limit=200000`).catch(() => []),
+    ]);
+    const dispByCall = {};
+    for (const d of disps || []) if (d.telnyx_call_control_id) dispByCall[d.telnyx_call_control_id] = d.code;
+
+    const byMode = {};   // amd_mode -> aggregates
+    const mode = (m) => byMode[m] || (byMode[m] = {
+      amd_mode: m, calls: 0, answered: 0, results: {}, latencies: [],
+      false_positive: 0, false_negative: 0, vm_dropped: 0, abandoned: 0,
+    });
+    let totalAnswered = 0, totalAbandoned = 0;
+    for (const c of calls || []) {
+      const m = mode(c.amd_mode || 'unknown');
+      m.calls++;
+      if (c.answered_at) { m.answered++; totalAnswered++; }
+      if (c.abandoned) { m.abandoned++; totalAbandoned++; }
+      if (c.vm_dropped) m.vm_dropped++;
+      if (c.amd_result) m.results[c.amd_result] = (m.results[c.amd_result] || 0) + 1;
+      if (Number.isFinite(c.amd_latency_ms)) m.latencies.push(c.amd_latency_ms);
+      // Disagreement vs the agent's own disposition (ground truth).
+      const code = c.telnyx_call_control_id ? dispByCall[c.telnyx_call_control_id] : null;
+      if (code && c.amd_result) {
+        const cls = amdClass(c.amd_result);
+        if (cls === 'machine' && LIVE_CODES.has(code)) m.false_positive++;   // AMD said machine, agent talked to a human
+        if (cls === 'human'   && VM_CODES.has(code))   m.false_negative++;   // AMD said human, agent got a machine/VM
+      }
+    }
+    const modes = Object.values(byMode).map(m => {
+      const lat = m.latencies.sort((a, b) => a - b);
+      const dist = Object.entries(m.results)
+        .map(([result, count]) => ({ result, count, pct: pct(count, m.answered) }))
+        .sort((a, b) => b.count - a.count);
+      return {
+        amd_mode: m.amd_mode, calls: m.calls, answered: m.answered,
+        result_distribution: dist,
+        latency_ms: {
+          p50: quantile(lat, 0.5), p95: quantile(lat, 0.95),
+          mean: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null,
+          n: lat.length,
+        },
+        disagreement: {
+          false_positive: m.false_positive, false_positive_pct: pct(m.false_positive, m.answered),
+          false_negative: m.false_negative, false_negative_pct: pct(m.false_negative, m.answered),
+        },
+        vm_dropped: m.vm_dropped, abandoned: m.abandoned,
+      };
+    }).sort((a, b) => b.calls - a.calls);
+
+    res.json({
+      from: fromIso, to: toIso, campaign_id: wantId || 'all',
+      totals: {
+        calls: (calls || []).length, answered: totalAnswered,
+        abandoned: totalAbandoned, abandoned_rate_pct: pct(totalAbandoned, totalAnswered),
+        fcc_cap_pct: AMD_ABANDON_CAP * 100, over_cap: pct(totalAbandoned, totalAnswered) > AMD_ABANDON_CAP * 100,
+      },
+      modes,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Real-time wallboard ───────────────────────────────────────────────────────
 // Live team snapshot for a wall-mounted / always-open view: today's dials,
 // contact rate, sales, plus per-agent live state and a disposition breakdown.
@@ -2709,22 +2943,31 @@ async function dialLead(agentId, lead, playlistId) {
     }
   } catch (e) { console.error('[dialLead:dnc]', e.message); }
   const from = pickCallerId(areaCodeOf(lead.phone));
-  const result = await telnyx('POST', '/calls', {
+  // Per-campaign AMD config (mode + optional analysis-time overrides). Falls back
+  // to premium; a campaign set to 'disabled' opts out entirely.
+  const acfg = await campaignAmd(lead.campaign_id);
+  const amdParam = AMD_MODE === 'disabled' ? 'disabled' : acfg.mode;
+  const amdConf  = amdConfigParam(acfg.config);
+  const cid = crypto.randomUUID();   // our internal call id — correlates every webhook back to this dial
+  const dialBody = {
     connection_id: CONNECTION_ID,
     to: lead.phone,
     from,
     timeout_secs: DIALER.ring_secs,   // hard ring cap — no dead air on no-answers
-    answering_machine_detection: AMD_MODE === 'disabled' ? 'disabled' : 'premium',
+    answering_machine_detection: amdParam,
     // Unconditional recording (per Karim). Recording is saved on call.recording.saved.
     record: 'record-from-answer', record_channels: 'dual', record_format: 'mp3',
-    client_state: enc({ role: 'lead', agentId, conf: st.conferenceId, leadId: lead.id, campaignId: lead.campaign_id }),
-  });
+    client_state: enc({ role: 'lead', agentId, conf: st.conferenceId, leadId: lead.id, campaignId: lead.campaign_id, cid, amd: amdParam }),
+  };
+  if (amdParam !== 'disabled' && amdConf) dialBody.answering_machine_detection_config = amdConf;
+  const result = await telnyx('POST', '/calls', dialBody);
   const ccid = result.data && result.data.call_control_id;
   // Ratio dialing: track every in-flight (unbridged) leg. st.leadLeg is reserved
   // for the ONE leg that actually connects to a human; the extras get dropped the
   // moment one connects (see connectLeadLeg).
   st.pending = st.pending || {};
-  st.pending[ccid] = { leadId: lead.id, leadNumber: lead.phone, fromNumber: from, campaignId: lead.campaign_id, playlistId: playlistId || null, at: Date.now() };
+  st.pending[ccid] = { leadId: lead.id, leadNumber: lead.phone, fromNumber: from, campaignId: lead.campaign_id, playlistId: playlistId || null, at: Date.now(),
+    cid, amdMode: amdParam, gatedBridge: acfg.gatedBridge, silencePolicy: acfg.silencePolicy, answeredAt: null };
   plStat(playlistId).calls++;
   if (st.state !== 'ON_CALL') st.state = 'DIALING';
   st.onCallSince = null;
@@ -2736,8 +2979,12 @@ async function dialLead(agentId, lead, playlistId) {
     .catch(e => console.error('[dialLead:update]', e.message));
   markFirstDial(lead.phone);   // stamps first_dial_at once — anchors the 10-day recycle window
   // Open a calls row for history/recording linkage (durable upsert by ccid).
-  saveCall({ lead_id: lead.id, agent_id: agentId, campaign_id: lead.campaign_id,
+  // id = cid ties amd_events.call_id back to calls.id for the accuracy harness.
+  saveCall({ id: cid, lead_id: lead.id, agent_id: agentId, campaign_id: lead.campaign_id,
     telnyx_call_control_id: ccid, from_number: from, to_number: lead.phone, direction: 'outbound' }, 'call-open-outbound');
+  // Separate best-effort write so the amd_mode column (added by amd_schema.sql)
+  // failing pre-migration can't roll back the core calls-open row above.
+  saveCall({ telnyx_call_control_id: ccid, amd_mode: amdParam }, 'call-amd-mode');
   console.log(`[pacing] agent ${agentId.slice(0, 8)} -> ${lead.phone} from ${from} (${Object.keys(st.pending).length} in flight)`);
 }
 
@@ -2756,10 +3003,15 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
     plStat(dp).drop++;   // ReadyMode "Drop": answered but no free agent to take it
     if (st.pending) delete st.pending[ccid];
     telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+    // FCC "abandoned call": a live answer we couldn't connect to an agent within
+    // the 2-second window. Flag it so campaignAbandonRate can hold the campaign
+    // under the 3%-per-30-days cap and the pacer can throttle before we hit it.
+    if (ccid) saveCall({ telnyx_call_control_id: ccid, abandoned: true,
+      ended_at: new Date().toISOString() }, 'call-abandoned');
     const lid = (cs && cs.leadId);
     if (lid) sbUpdate('leads', `id=eq.${lid}`,
       { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 10 * 60e3).toISOString() }).catch(() => {});
-    console.log(`[bridge] extra answer dropped for agent ${agentId.slice(0, 8)} (already on a call)`);
+    console.log(`[bridge] extra answer dropped for agent ${agentId.slice(0, 8)} (already on a call) — ABANDONED`);
     return;
   }
   const info = (st.pending && st.pending[ccid]) || {};
@@ -2899,7 +3151,17 @@ async function pacingTick() {
       // next pick, so we never ring the same number twice.
       const first = await pickLead(agentId);
       if (!first.lead) continue;                          // no dialable lead for this agent
-      const cpa = cpaOf(first.playlist);
+      let cpa = cpaOf(first.playlist);
+      // FCC guardrail: if this campaign's rolling abandoned rate is nearing the 3%
+      // cap, clamp to pure power-dialing (CPA=1) so we ring one number per free
+      // agent and can never abandon a live answer. Rate is cached (5-min TTL).
+      if (cpa > 1) {
+        const arate = await campaignAbandonRate(first.lead.campaign_id).catch(() => 0);
+        if (arate >= AMD_ABANDON_THROTTLE) {
+          cpa = 1;
+          console.log(`[pacing] campaign ${String(first.lead.campaign_id).slice(0, 8)} abandoned=${(arate * 100).toFixed(2)}% >= throttle — CPA clamped to 1`);
+        }
+      }
       if (inFlight >= cpa) continue;                       // already at this playlist's CPA
       try { await dialLead(agentId, first.lead, first.playlist && first.playlist.id); }
       catch (e) { console.error('[pacing:dial]', e.message); continue; }
@@ -3352,29 +3614,129 @@ app.post('/webhooks/telnyx', async (req, res) => {
     // is exactly the "calls come in silent" symptom. Premium AMD still runs in
     // parallel and drops the leg below if it turns out to be a machine.
     if (event === 'call.answered' && role === 'lead' && agentId) {
+      // Instrumentation: stamp the answer time so detection.ended can compute AMD
+      // latency, and so the FCC abandoned-rate denominator has an answered_at.
+      const nowIso = new Date().toISOString();
+      const st0 = rt[agentId];
+      if (st0 && st0.pending && st0.pending[ccid]) st0.pending[ccid].answeredAt = Date.now();
+      saveCall({ telnyx_call_control_id: ccid, answered_at: nowIso }, 'call-answered-at');
       await connectLeadLeg(agentId, ccid, cs, null);   // AMD result (if any) is filled in by detection.ended below
       return;
     }
 
-    // Lead premium AMD result. The leg is already bridged (we connect on answer).
-    // Auto hang-up on machine detection is DISABLED by request: premium AMD is
-    // unreliable here — it drops live humans (false positives) while missing real
-    // voicemails (false negatives), which made the agent's connect pool look
-    // machine-heavy. We therefore NEVER tear the leg down automatically. Every
-    // answered call stays bridged and the agent decides what to do with it. We
-    // only record the classification for history/labels and count MD for the Live
-    // stats tab's visibility.
-    if (event === 'call.machine.premium.detection.ended' && role === 'lead' && agentId) {
+    // Lead AMD detection result (premium OR standard). The leg is already bridged
+    // (we connect on answer). Two behaviors, selected per-campaign:
+    //   • DEFAULT (gated_bridge=false): auto hang-up is DISABLED. Premium AMD is
+    //     unreliable — it drops live humans (false positives) while missing real
+    //     voicemails (false negatives). We NEVER tear the leg down automatically;
+    //     the agent decides. We only record the classification + latency and count
+    //     MD for the Live stats tab's visibility.
+    //   • gated_bridge=true (opt-in, verify accuracy first): a machine result hangs
+    //     up the leg (no agent time wasted); ambiguous is routed by silence_policy.
+    // Instrumentation (amd_result/amd_ended_at/amd_latency_ms + amd_events row) is
+    // ALWAYS recorded so scripts/amd_test.py can measure real-world accuracy.
+    if (AMD_DETECTION_EVENTS.has(event) && role === 'lead' && agentId) {
       const r = payload.result || '';
-      const isHuman = r.startsWith('human') || r === 'silence' || r === 'not_sure';   // TCPA-safe: keep ambiguous
+      const cls = amdClass(r);   // 'human' | 'machine' | 'ambiguous'
       const st = rt[agentId];
-      if (!isHuman) {
-        const pid = (st && st.pending && st.pending[ccid] && st.pending[ccid].playlistId)
-          || (st && st.leadLeg === ccid ? st.leadPlaylistId : null);
-        plStat(pid).md++;   // informational only — no teardown, agent stays on the call
+      const info = (st && st.pending && st.pending[ccid]) || null;
+      const answeredAt = info && info.answeredAt;
+      const endedAtMs = Date.now();
+      const latency = answeredAt ? Math.max(0, endedAtMs - answeredAt) : null;
+      const silencePolicy = (info && info.silencePolicy) || 'human';
+      const gated = !!(info && info.gatedBridge);
+      // Effective routing class: ambiguous follows the campaign's silence_policy.
+      const treatAs = cls === 'ambiguous' ? silencePolicy : cls;
+      const endedIso = new Date(endedAtMs).toISOString();
+      // Always: persist verbatim result + latency, emit an amd_events audit row.
+      if (ccid) saveCall({ telnyx_call_control_id: ccid, amd_result: r,
+        amd_ended_at: endedIso, amd_latency_ms: latency }, treatAs === 'human' ? 'call-amd-human' : 'call-amd-machine');
+      amdEvent({ call_id: (info && info.cid) || null, campaign_id: (info && info.campaignId) || (cs && cs.campaignId) || null,
+        amd_mode: (info && info.amdMode) || (cs && cs.amd) || null, event_type: event, result: r, latency_ms: latency, raw: payload });
+      if (treatAs !== 'human') {
+        const pid = (info && info.playlistId) || (st && st.leadLeg === ccid ? st.leadPlaylistId : null);
+        plStat(pid).md++;
       }
-      if (ccid) saveCall({ telnyx_call_control_id: ccid, amd_result: r },
-        isHuman ? 'call-amd-human' : 'call-amd-machine');
+      // Gated-bridge routing only. Default mode keeps the leg for the agent.
+      if (gated && treatAs === 'machine') {
+        // A machine on a bridged leg: if the campaign has consented VM drop we hold
+        // for the greeting/beep (handled below); otherwise hang up now. Either way
+        // the agent shouldn't stay tied to a machine.
+        const acfg = await campaignAmd(info && info.campaignId).catch(() => null);
+        const wantVm = acfg && acfg.vmDrop && acfg.vmConsent && acfg.vmUrl;
+        if (!wantVm) {
+          if (st && st.leadLeg === ccid) { st.leadLeg = null; st.onCallSince = null; }
+          telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+          if (info && info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
+            { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
+        }
+        // wantVm: leave the leg up; call.machine.*.greeting.ended handles the drop.
+      }
+      return;
+    }
+
+    // Lead AMD greeting result (premium OR standard). Only actionable when the
+    // campaign opted into gated_bridge WITH consented voicemail drop. On a detected
+    // beep we play the pre-recorded drop then hang up; otherwise we hang up the
+    // machine leg. In default mode this is purely informational (amd_greeting).
+    if (AMD_GREETING_EVENTS.has(event) && role === 'lead' && agentId) {
+      const r = payload.result || '';
+      const st = rt[agentId];
+      const info = (st && st.pending && st.pending[ccid]) || null;
+      if (ccid) saveCall({ telnyx_call_control_id: ccid, amd_greeting: r }, 'call-amd-greeting');
+      amdEvent({ call_id: (info && info.cid) || null, campaign_id: (info && info.campaignId) || (cs && cs.campaignId) || null,
+        amd_mode: (info && info.amdMode) || (cs && cs.amd) || null, event_type: event, result: r, latency_ms: null, raw: payload });
+      const gated = !!(info && info.gatedBridge);
+      if (!gated) return;   // default mode: record only, agent still owns the call
+      const acfg = await campaignAmd(info && info.campaignId).catch(() => null);
+      const wantVm = acfg && acfg.vmDrop && acfg.vmConsent && acfg.vmUrl;
+      const beep = r === 'beep_detected';
+      if (wantVm && beep) {
+        // Voicemail drop: compliance gates already cleared at dial time (DNC filtered
+        // by nextDialableLead; calling window by callableNow). Play then hang up.
+        telnyx('POST', `/calls/${ccid}/actions/playback_start`, { audio_url: acfg.vmUrl }).catch(() => {});
+        if (ccid) saveCall({ telnyx_call_control_id: ccid, vm_dropped: true }, 'call-vm-dropped');
+        if (info && info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
+          { status: 'VOICEMAIL', last_outcome: 'voicemail' }).catch(() => {});
+        // Give the drop room to play; playback.ended would be cleaner but a timed
+        // hangup is robust to a missed webhook.
+        setTimeout(() => { telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {}); }, 32000);
+      } else {
+        // No beep / no consent path in gated mode: don't leave the agent on a machine.
+        if (st && st.leadLeg === ccid) { st.leadLeg = null; st.onCallSince = null; }
+        telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+        if (info && info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
+          { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
+      }
+      return;
+    }
+
+    // ── AMD accuracy harness lane (role='amdtest') ─────────────────────────────
+    // scripts/amd_test.py dials numbers with a known expected label, no agent and
+    // no conference. We record the verbatim result + latency to amd_events/calls
+    // and hang up immediately so the harness can score accuracy offline.
+    if (role === 'amdtest') {
+      if (event === 'call.answered') {
+        saveCall({ telnyx_call_control_id: ccid, answered_at: new Date().toISOString() }, 'amdtest-answered');
+        if (cs) cs._answeredAt = Date.now();
+        return;
+      }
+      if (AMD_DETECTION_EVENTS.has(event)) {
+        const r = payload.result || '';
+        saveCall({ telnyx_call_control_id: ccid, amd_result: r, amd_ended_at: new Date().toISOString() }, 'amdtest-result');
+        amdEvent({ call_id: (cs && cs.cid) || null, campaign_id: (cs && cs.campaignId) || null,
+          amd_mode: (cs && cs.amd) || null, event_type: event, result: r, latency_ms: null, raw: payload });
+        telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+        return;
+      }
+      if (AMD_GREETING_EVENTS.has(event)) {
+        const r = payload.result || '';
+        saveCall({ telnyx_call_control_id: ccid, amd_greeting: r }, 'amdtest-greeting');
+        amdEvent({ call_id: (cs && cs.cid) || null, campaign_id: (cs && cs.campaignId) || null,
+          amd_mode: (cs && cs.amd) || null, event_type: event, result: r, latency_ms: null, raw: payload });
+        return;
+      }
+      if (event === 'call.hangup') return;
       return;
     }
 
@@ -3685,4 +4047,6 @@ server.listen(PORT, async () => {
   setInterval(sweepExpiredDnc, 10 * 60 * 1000);   // auto-remove expired (e.g. 90-day) DNC entries
   reconcileRecordings();                          // archive any recordings that slipped through
   setInterval(reconcileRecordings, 3 * 60 * 1000);
+  setTimeout(amdNightlyCrossCheck, 60 * 1000);    // first pass a minute after boot
+  setInterval(amdNightlyCrossCheck, 24 * 3600 * 1000);   // AMD accuracy vs disposition, daily
 });
