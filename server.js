@@ -320,10 +320,14 @@ async function campaignAbandonRate(campaignId) {
   if (hit && Date.now() - hit.at < ABANDON_TTL_MS) return hit.rate;
   let rate = 0;
   try {
+    // FCC formula: abandoned ÷ (abandoned + answered by a LIVE person). bridged_at
+    // is only set when an agent was actually connected, so machines/voicemails are
+    // excluded from the denominator — they'd otherwise dilute the rate and let the
+    // pacer keep dialing past the real cap.
     const since = new Date(Date.now() - 30 * 864e5).toISOString();
-    const answered  = await sbCount('calls', `campaign_id=eq.${campaignId}&answered_at=gte.${since}`);
+    const bridged   = await sbCount('calls', `campaign_id=eq.${campaignId}&bridged_at=not.is.null&created_at=gte.${since}`);
     const abandoned = await sbCount('calls', `campaign_id=eq.${campaignId}&abandoned=is.true&created_at=gte.${since}`);
-    rate = answered > 0 ? abandoned / answered : 0;
+    rate = (abandoned + bridged) > 0 ? abandoned / (abandoned + bridged) : 0;
   } catch { rate = 0; }
   _abandonCache.set(campaignId, { at: Date.now(), rate });
   return rate;
@@ -3132,13 +3136,15 @@ async function pacingTick() {
 
     // Snapshot the routing model once per tick.
     const [runningCamps, playlists, plCamps, plAgents, legacyAssigns] = await Promise.all([
-      sbSelect('campaigns', 'status=eq.RUNNING&select=id'),
+      sbSelect('campaigns', 'status=eq.RUNNING&select=*'),   // select=* keeps this working pre-predictive_schema.sql
       sbSelect('playlists', 'active=eq.true&select=id,priority,filters,lines_per_agent'),
       sbSelect('playlist_campaigns', 'select=playlist_id,campaign_id'),
       sbSelect('playlist_agents', 'select=playlist_id,agent_id'),
       sbSelect('campaign_agents', 'select=campaign_id,agent_id'),
     ]);
-    const runningSet = new Set((runningCamps || []).map(c => c.id));
+    // Predictive campaigns belong EXCLUSIVELY to enginePacingTick — excluding them
+    // here is what prevents the two engines from double-dialing the same leads.
+    const runningSet = new Set((runningCamps || []).filter(c => c.pacing_mode !== 'predictive').map(c => c.id));
     const plById = Object.fromEntries((playlists || []).map(p => [p.id, p]));
     // playlist_id -> [campaignIds that are RUNNING]
     const campsByPlaylist = {};
@@ -3468,7 +3474,10 @@ async function dialEngineLead(lead, acfg) {
     }
   } catch (e) { console.error('[engine:dnc]', e.message); }
   const from = pickCallerId(areaCodeOf(lead.phone));
-  const amdParam = AMD_MODE === 'disabled' ? 'disabled' : acfg.mode;
+  // The engine is USELESS without AMD (the whole state machine keys off the
+  // detection webhook), so predictive dials always force premium — overriding
+  // both the campaign's amd_mode and the global AMD_MODE env (spec §2).
+  const amdParam = 'premium';
   const amdConf = amdConfigParam(acfg.config);
   const cid = crypto.randomUUID();
   const dialBody = {
@@ -3594,6 +3603,7 @@ async function reserveReaper() {
 let enginePacingBusy = false;
 async function enginePacingTick() {
   if (enginePacingBusy || !SB_HOST || !CONNECTION_ID) return;
+  if (AMD_MODE === 'disabled') return;   // predictive REQUIRES AMD; honor the global kill-switch by not dialing at all
   enginePacingBusy = true;
   try {
     // Reclaim leaked predictive slots (missed hangup webhook) before pacing.
@@ -3770,9 +3780,10 @@ app.post('/webhooks/telnyx', async (req, res) => {
     }
 
     // Voicemail-box transcription → attach the transcript to the queued message.
-    if (event === 'call.transcription' && ccid && vmboxRt[ccid]) {
-      const td = payload.transcription_data || {};
-      const text = td.transcript || td.text || null;
+    // Post-recording transcription arrives as call.recording.transcription.saved
+    // with the text in payload.transcription_text (per the Telnyx callback docs).
+    if (event === 'call.recording.transcription.saved' && ccid && vmboxRt[ccid]) {
+      const text = payload.transcription_text || null;
       if (text) sbWrite('PATCH', `voicemails?call_id=eq.${encodeURIComponent(ccid)}`,
         { transcription: text }, 'return=minimal', 'voicemail-transcript');
       return;
@@ -3970,10 +3981,37 @@ app.post('/webhooks/telnyx', async (req, res) => {
         if (info.phase === 'DIALING' || info.phase === 'DETECTING') {
           if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
             { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+        } else if (info.phase === 'WAIT_BEEP') {
+          // Machine hung up before the beep: it WAS a machine — record it so the
+          // lead doesn't stay stuck IN_PROGRESS and the kill is still countable.
+          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
+            { status: 'MACHINE', last_outcome: 'auto_answering_machine' }).catch(() => {});
+          autoDisposition(info, 'AUTO_ANSWERING_MACHINE');
         }
         return;
       }
       return;   // ignore other dialer-lane events while unbridged
+    }
+
+    // Orphaned predictive leg: role='dialer', no dialerRt entry, and NOT owned by
+    // any agent (a bridged leg resolves via findAgentByLeg and must fall through
+    // to the normal agent hangup/WRAP_UP path below). This means the server
+    // restarted (Render redeploy) while the call was in flight — we can no longer
+    // pace, detect, or bridge it, so kill it rather than leave a human in dead air.
+    if (role === 'dialer' && !dialerRt[ccid] && !agentId) {
+      if (event === 'call.answered' || AMD_DETECTION_EVENTS.has(event)) {
+        telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+        console.warn(`[engine] orphaned leg ...${ccid.slice(-8)} (${event}) — hung up (state lost, likely redeploy)`);
+      }
+      if (event === 'call.hangup' && cs && cs.leadId) {
+        // No call_phase here: a deliberately-killed MACHINE/ABANDONED leg also
+        // lands in this branch and must keep its recorded phase.
+        saveCall({ telnyx_call_control_id: ccid, ended_at: new Date().toISOString(),
+          hangup_cause: payload.hangup_cause || null }, 'engine-orphan-hangup');
+        sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.IN_PROGRESS`,
+          { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+      }
+      return;
     }
 
     // ── Inbound call on one of our DIDs ────────────────────────────────────────
