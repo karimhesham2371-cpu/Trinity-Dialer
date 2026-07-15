@@ -2642,19 +2642,32 @@ function toggleAiDet(id){ const el=$(id); if(!el) return; el.classList.toggle('h
 
 // ── Calling window (global compliance setting) ──
 async function renderWindow(){
-  let w={start_hour:10,end_hour:21}; try{ w=await apiJson('/api/admin/settings/calling-window'); }catch(e){}
-  const hrs=(sel)=>Array.from({length:24},(_,h)=>`<option value="${h}"${h===sel?' selected':''}>${String(h).padStart(2,'0')}:00</option>`).join('');
+  let w={default:{start:600,end:1260},states:[]}; try{ w=await apiJson('/api/admin/settings/calling-window'); }catch(e){}
+  const m2t=(m)=> m==null?'':`${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
+  const t2m=(t)=>{ if(!t)return null; const p=String(t).split(':'); const h=+p[0],mm=+p[1]; if(!Number.isFinite(h)||!Number.isFinite(mm))return null; return h*60+mm; };
+  const stRows=(w.states||[]).map(s=>`<tr data-abbr="${s.abbr}">
+      <td>${esc(s.name)}</td>
+      <td class="dim mono" style="font-size:12px">${esc(s.label)}</td>
+      <td><select class="field cwEnabled"><option value="true"${s.enabled!==false?' selected':''}>Yes — Allow</option><option value="false"${s.enabled===false?' selected':''}>No</option></select></td>
+      <td><label class="row" style="gap:6px;align-items:center;margin:0"><input type="checkbox" class="cwSc"${s.start!=null?' checked':''}><input type="time" class="field cwSt" value="${m2t(s.start)}"${s.start==null?' disabled':''} style="width:110px" title="Queue Default when unchecked"></label></td>
+      <td><label class="row" style="gap:6px;align-items:center;margin:0"><input type="checkbox" class="cwEc"${s.end!=null?' checked':''}><input type="time" class="field cwEt" value="${m2t(s.end)}"${s.end==null?' disabled':''} style="width:110px" title="Queue Default when unchecked"></label></td>
+    </tr>`).join('');
   let d={lines_per_agent:1,ring_secs:25}; try{ d=await apiJson('/api/admin/settings/dialer'); }catch(e){}
   const lpaOpts=(sel)=>Array.from({length:5},(_,i)=>i+1).map(n=>`<option value="${n}"${n===sel?' selected':''}>${n} line${n>1?'s':''} / agent${n===1?' (power — no abandons)':''}</option>`).join('');
   let cp={dispositions:[],defaults:{recycle_window_days:10,neg_strike_limit:4,neg_redial_hours:24}}; try{ cp=await apiJson('/api/admin/settings/call-policy'); }catch(e){}
   const cpOpts=(cp.dispositions||[]).map((dsp,i)=>`<option value="${i}">${esc(dsp.label)} (${esc(dsp.code)})</option>`).join('');
-  $('ldBody').innerHTML=`<div class="card" style="max-width:520px"><h2>Calling window</h2>
-    <p class="dim" style="font-size:13px">Hard rule: no lead is dialed before or after this window in <b>their own local time</b> (derived from area code). Applies to the pacer and manual click-to-call.</p>
+  $('ldBody').innerHTML=`<div class="card" style="max-width:760px"><h2>Calling window (by state)</h2>
+    <p class="dim" style="font-size:13px">Hard rule: no lead is dialed outside its window in <b>that state's own local time</b> (state derived from area code). Disable a state to never call it. Leave a Start/End unchecked to inherit the <b>Queue Default</b> below. Applies to the pacer and manual click-to-call.</p>
     <div class="row mt3" style="gap:12px;align-items:flex-end">
-      <div class="fw"><span class="lbl">Start</span><select id="cwStart" class="field">${hrs(w.start_hour)}</select></div>
-      <div class="fw"><span class="lbl">End</span><select id="cwEnd" class="field">${hrs(w.end_hour)}</select></div>
-      <button class="btn btn-primary" id="cwSave" style="flex:0 0 auto">Save</button>
-    </div><div id="cwMsg" class="dim mt3" style="font-size:12px"></div></div>
+      <div class="fw"><span class="lbl">Queue Default — Start</span><input id="cwDefStart" class="field" type="time" value="${m2t(w.default&&w.default.start)}" style="width:130px"></div>
+      <div class="fw"><span class="lbl">Queue Default — End</span><input id="cwDefEnd" class="field" type="time" value="${m2t(w.default&&w.default.end)}" style="width:130px"></div>
+      <button class="btn btn-primary" id="cwSave" style="flex:0 0 auto">Save all</button>
+    </div>
+    <div id="cwMsg" class="dim mt3" style="font-size:12px"></div>
+    <div class="tblwrap mt3" style="max-height:440px;overflow:auto">
+      <table id="cwTable" class="wbtbl"><thead><tr><th>State / Region</th><th>TZ</th><th>Enabled</th><th>Start</th><th>End</th></tr></thead>
+      <tbody>${stRows}</tbody></table>
+    </div></div>
     <div class="card mt3" style="max-width:520px"><h2>Dialer pacing (CPA)</h2>
     <p class="dim" style="font-size:13px"><b>Calls per agent</b> = how many lines are dialed simultaneously for each free agent. <b>1</b> = pure power dialing (one call at a time, zero abandoned calls). Higher values cut wait time between calls but drop unanswered extra legs when a human answers first — raise gradually. <b>Ring time</b> is how long a number rings before it's given up as no-answer.</p>
     <div class="row mt3" style="gap:12px;align-items:flex-end">
@@ -2674,9 +2687,24 @@ async function renderWindow(){
       <button class="btn btn-primary" id="cpSave" style="flex:0 0 auto">Save</button>
     </div><div id="cpMsg" class="dim mt3" style="font-size:12px"></div></div>`;
   enhanceAll($('ldBody'));
+  // Enable/disable each time input as its "custom" checkbox toggles.
+  $('cwTable').addEventListener('change',(ev)=>{
+    const cb=ev.target;
+    if(cb.classList&&cb.classList.contains('cwSc')){ const t=cb.parentElement.querySelector('.cwSt'); t.disabled=!cb.checked; }
+    if(cb.classList&&cb.classList.contains('cwEc')){ const t=cb.parentElement.querySelector('.cwEt'); t.disabled=!cb.checked; }
+  });
   $('cwSave').onclick=async()=>{
-    try{ const j=await apiJson('/api/admin/settings/calling-window','PUT',{start_hour:+$('cwStart').value,end_hour:+$('cwEnd').value});
-      $('cwMsg').innerHTML=`<b style="color:var(--ok)">Saved — ${String(j.start_hour).padStart(2,'0')}:00 to ${String(j.end_hour).padStart(2,'0')}:00 lead-local</b>`; }
+    const states={};
+    $('cwTable').querySelectorAll('tbody tr[data-abbr]').forEach(tr=>{
+      const abbr=tr.getAttribute('data-abbr');
+      const enabled=tr.querySelector('.cwEnabled').value==='true';
+      const start=tr.querySelector('.cwSc').checked ? t2m(tr.querySelector('.cwSt').value) : null;
+      const end=tr.querySelector('.cwEc').checked ? t2m(tr.querySelector('.cwEt').value) : null;
+      states[abbr]={enabled,start,end};
+    });
+    const payload={default:{start:t2m($('cwDefStart').value),end:t2m($('cwDefEnd').value)},states};
+    try{ const j=await apiJson('/api/admin/settings/calling-window','PUT',payload);
+      $('cwMsg').innerHTML=`<b style="color:var(--ok)">Saved — default ${m2t(j.default.start)}–${m2t(j.default.end)} lead-local, per-state windows applied</b>`; }
     catch(e){ $('cwMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
   $('dlSave').onclick=async()=>{

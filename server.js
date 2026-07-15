@@ -19,7 +19,7 @@ const crypto  = require('crypto');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const { WebSocketServer } = require('ws');
-const { deriveFromAreaCode, inCallingWindow } = require('./lib/areacodes');
+const { deriveFromAreaCode } = require('./lib/areacodes');
 
 const app = express();
 app.use(express.json({ limit: '32mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
@@ -115,17 +115,77 @@ const rt = {};
 // Discovered outbound caller-ID pool (refreshed from Telnyx).
 let CALLER_POOL = CALLER_IDS_ENV.slice();
 
-// Global lead-local calling window (compliance rule). Cached from app_settings.
-let CALLING_WINDOW = { start_hour: 10, end_hour: 21 };
+// Per-state lead-local calling window (ReadyMode-style compliance). Each US state
+// maps to its own timezone; the admin can disable a state entirely or override its
+// start/end time, else it inherits the queue-default window. Cached from
+// app_settings key "calling_window". In-memory shape:
+//   { default:{start,end}, states:{ AB:{enabled,start,end}, ... } }
+// where start/end are minutes-since-local-midnight (0..1439); a null state
+// start/end inherits the default. Evaluated in each state's own tz via localMinutes.
+const { STATES, STATE_BY_ABBR, DEFAULT_WINDOW, FALLBACK_TZ: CW_FALLBACK_TZ, localMinutes, toMinutes } = require('./lib/callingwindow');
+let CALLING = { default: { ...DEFAULT_WINDOW }, states: {} };
 async function loadCallingWindow() {
   if (!SB_HOST) return;
   try {
     const rows = await sbSelect('app_settings', `key=eq.calling_window&select=value`);
-    if (rows && rows[0] && rows[0].value) {
-      const v = rows[0].value;
-      CALLING_WINDOW = { start_hour: v.start_hour ?? 10, end_hour: v.end_hour ?? 21 };
-    }
+    CALLING = normalizeCallingCfg(rows && rows[0] && rows[0].value);
   } catch (e) { console.error('[callingWindow]', e.message); }
+}
+// Build the in-memory config from stored JSON, tolerating the legacy
+// {start_hour,end_hour} global shape and any missing/partial data.
+function normalizeCallingCfg(v) {
+  const cfg = { default: { ...DEFAULT_WINDOW }, states: {} };
+  if (v && typeof v === 'object') {
+    // Legacy global shape → default window (hours → minutes).
+    if (v.start_hour != null || v.end_hour != null) {
+      const s = toMinutes((v.start_hour ?? 10) * 60);
+      const e = toMinutes(Math.min(1439, (v.end_hour ?? 21) * 60));
+      if (s != null) cfg.default.start = s;
+      if (e != null) cfg.default.end = e;
+    }
+    if (v.default && typeof v.default === 'object') {
+      const s = toMinutes(v.default.start), e = toMinutes(v.default.end);
+      if (s != null) cfg.default.start = s;
+      if (e != null) cfg.default.end = e;
+    }
+    if (v.states && typeof v.states === 'object') {
+      for (const st of STATES) {
+        const row = v.states[st.abbr];
+        if (!row || typeof row !== 'object') continue;
+        cfg.states[st.abbr] = {
+          enabled: row.enabled !== false,   // default enabled
+          start: toMinutes(row.start),       // null = inherit default
+          end: toMinutes(row.end),
+        };
+      }
+    }
+  }
+  return cfg;
+}
+// Which US state (2-letter) governs this lead's calling window? Prefer the
+// area-code-derived state (matches import logic); fall back to an explicit
+// 2-letter lead.state; else null (unknown → default window in the fallback tz).
+function stateOfLead(lead) {
+  const d = deriveFromAreaCode(areaCodeOf(lead && lead.phone));
+  if (d && d.state && STATE_BY_ABBR[d.state]) return d.state;
+  const raw = String((lead && lead.state) || '').trim().toUpperCase();
+  if (STATE_BY_ABBR[raw]) return raw;
+  return null;
+}
+// May we dial this lead RIGHT NOW? Evaluated in the lead's state timezone.
+// A disabled state is never dialable. Fail-open only when Intl can't resolve the
+// zone (localMinutes null), matching the old inCallingWindow behaviour.
+function callableNow(lead) {
+  const abbr = stateOfLead(lead);
+  const meta = abbr ? STATE_BY_ABBR[abbr] : null;
+  const cfg = abbr ? CALLING.states[abbr] : null;
+  if (cfg && cfg.enabled === false) return false;
+  const start = (cfg && cfg.start != null) ? cfg.start : CALLING.default.start;
+  const end   = (cfg && cfg.end   != null) ? cfg.end   : CALLING.default.end;
+  const tz = meta ? meta.tz : (((lead && lead.timezone)) || CW_FALLBACK_TZ);
+  const m = localMinutes(tz);
+  if (m == null) return true;
+  return m >= start && m < end;
 }
 
 // Dialer pacing config (admin-editable, cached from app_settings key "dialer").
@@ -1608,20 +1668,48 @@ app.delete('/api/admin/dnc/:phone', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Calling-window global setting (admin-editable) ────────────────────────────
+// ── Per-state calling-window setting (ReadyMode-style, admin-editable) ─────────
+// GET returns the default window plus a fully-merged row for every state (so the
+// UI always has all 51 rows even for states with no stored override).
 app.get('/api/admin/settings/calling-window', auth, adminOnly, async (_req, res) => {
-  res.json({ ...CALLING_WINDOW });
+  const states = STATES.map(s => {
+    const cfg = CALLING.states[s.abbr] || {};
+    return {
+      abbr: s.abbr, name: s.name, tz: s.tz, label: s.label,
+      enabled: cfg.enabled !== false,
+      start: cfg.start != null ? cfg.start : null,   // null = inherit default
+      end: cfg.end != null ? cfg.end : null,
+    };
+  });
+  res.json({ default: { ...CALLING.default }, states });
 });
+// PUT accepts { default:{start,end}, states:{ ABBR:{enabled,start,end}, ... } }.
+// start/end are minutes-since-midnight (0..1439) or null to inherit the default.
 app.put('/api/admin/settings/calling-window', auth, adminOnly, async (req, res) => {
-  const sh = parseInt(req.body && req.body.start_hour, 10);
-  const eh = parseInt(req.body && req.body.end_hour, 10);
-  if (!(sh >= 0 && sh <= 23) || !(eh >= 1 && eh <= 24) || eh <= sh)
-    return res.status(400).json({ error: 'invalid window' });
+  const b = req.body || {};
+  const dStart = toMinutes(b.default && b.default.start);
+  const dEnd = toMinutes(b.default && b.default.end);
+  if (dStart == null || dEnd == null || dEnd <= dStart)
+    return res.status(400).json({ error: 'invalid default window' });
+  const states = {};
+  if (b.states && typeof b.states === 'object') {
+    for (const st of STATES) {
+      const row = b.states[st.abbr];
+      if (!row || typeof row !== 'object') continue;
+      const s = toMinutes(row.start), e = toMinutes(row.end);
+      if (s != null && e != null && e <= s)
+        return res.status(400).json({ error: `invalid window for ${st.abbr}` });
+      states[st.abbr] = { enabled: row.enabled !== false, start: s, end: e };
+    }
+  }
+  const value = { default: { start: dStart, end: dEnd }, states };
   try {
-    await sbUpdate('app_settings', `key=eq.calling_window`, { value: { start_hour: sh, end_hour: eh }, updated_at: new Date().toISOString() });
-    CALLING_WINDOW = { start_hour: sh, end_hour: eh };
-    audit(req.user, 'EDIT_CALLING_WINDOW', { target_type: 'settings', meta: CALLING_WINDOW });
-    res.json({ ok: true, ...CALLING_WINDOW });
+    await sbReq('POST', 'app_settings?on_conflict=key',
+      { key: 'calling_window', value, updated_at: new Date().toISOString() },
+      'resolution=merge-duplicates,return=minimal');
+    CALLING = normalizeCallingCfg(value);
+    audit(req.user, 'EDIT_CALLING_WINDOW', { target_type: 'settings', meta: { default: value.default, states: Object.keys(states).length } });
+    res.json({ ok: true, default: { ...CALLING.default } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2519,7 +2607,7 @@ app.post('/api/agent/call-lead', auth, async (req, res) => {
   try {
     const [lead] = await sbSelect('leads', `id=eq.${leadId}&select=*&limit=1`);
     if (!lead) return res.status(404).json({ error: 'lead not found' });
-    if (!inCallingWindow(leadTz(lead), CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour))
+    if (!callableNow(lead))
       return res.status(409).json({ error: 'outside calling window for this lead' });
     st.state = 'CLAIMING';
     await dialLead(id, lead);   // does the DNC check + state transitions
@@ -2633,19 +2721,9 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
 }
 
 let pacingBusy = false;
-// Effective calling-window timezone for a lead. Prefer the stored timezone, but
-// fall back to deriving it from the phone's area code when it's missing (legacy
-// leads imported before timezone derivation existed had null timezone, which made
-// inCallingWindow treat them all as westernmost/Pacific — so nothing dialed until
-// 10AM Pacific). Deriving from the area code is the same logic used at import and
-// is still TCPA-safe (unknown codes fall back to Pacific inside deriveFromAreaCode).
-function leadTz(lead) {
-  if (lead && lead.timezone) return lead.timezone;
-  const d = deriveFromAreaCode(areaCodeOf(lead && lead.phone));
-  return d.tz;
-}
 // Pull the next dialable, in-window lead across a set of campaigns (applying an
-// optional playlist filter set). Returns a lead row or null.
+// optional playlist filter set). Returns a lead row or null. The per-state
+// calling window is enforced by callableNow (evaluated in each lead's own tz).
 async function nextDialableLead(campaignIds, filters, nowIso) {
   if (!campaignIds.length) return null;
   const inList = campaignIds.map(c => `"${c}"`).join(',');
@@ -2655,9 +2733,8 @@ async function nextDialableLead(campaignIds, filters, nowIso) {
     (frag ? `&${frag}` : '') +
     `&or=(next_callback_at.is.null,next_callback_at.lte.${nowIso})` +
     `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=15&select=*`);
-  // Compliance: hard lead-local calling window.
-  return (leads || []).find(l =>
-    inCallingWindow(leadTz(l), CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour)) || null;
+  // Compliance: hard per-state lead-local calling window.
+  return (leads || []).find(callableNow) || null;
 }
 async function pacingTick() {
   if (pacingBusy || !SB_HOST || !CONNECTION_ID) return;
@@ -2774,8 +2851,7 @@ async function nextAiLead(nowIso) {
     `campaign_id=in.(${inList})&dnc=eq.false&status=in.(NEW,CALLBACK)` +
     `&or=(next_callback_at.is.null,next_callback_at.lte.${nowIso})` +
     `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=15&select=*`);
-  return (leads || []).find(l =>
-    inCallingWindow(l.timezone, CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour)) || null;
+  return (leads || []).find(callableNow) || null;
 }
 
 // Place one outbound AI call. Marks the lead IN_PROGRESS immediately (same as the
@@ -3494,7 +3570,12 @@ server.listen(PORT, async () => {
   await loadCallPolicy();
   await loadAiConfig();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
-  console.log(`[boot] calling window: ${CALLING_WINDOW.start_hour}:00–${CALLING_WINDOW.end_hour}:00 lead-local`);
+  {
+    const hhmm = (m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+    const overrides = Object.keys(CALLING.states).length;
+    const disabled = Object.values(CALLING.states).filter(s => s.enabled === false).length;
+    console.log(`[boot] calling window: default ${hhmm(CALLING.default.start)}–${hhmm(CALLING.default.end)} per-state lead-local (${overrides} override(s), ${disabled} disabled)`);
+  }
   console.log(`[boot] dialer: ${DIALER.lines_per_agent} line(s)/agent, ${DIALER.ring_secs}s ring`);
   console.log(`[boot] ai caller: ${AI.enabled ? 'ENABLED' : 'off'}, concurrency ${AI.concurrency}, ${AI.campaign_ids.length} campaign(s), assistant ${AI.assistant_id || '(none)'}`);
   setInterval(pacingTick, PACING_MS);
