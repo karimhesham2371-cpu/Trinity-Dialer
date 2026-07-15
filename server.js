@@ -2519,7 +2519,7 @@ app.post('/api/agent/call-lead', auth, async (req, res) => {
   try {
     const [lead] = await sbSelect('leads', `id=eq.${leadId}&select=*&limit=1`);
     if (!lead) return res.status(404).json({ error: 'lead not found' });
-    if (!inCallingWindow(lead.timezone, CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour))
+    if (!inCallingWindow(leadTz(lead), CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour))
       return res.status(409).json({ error: 'outside calling window for this lead' });
     st.state = 'CLAIMING';
     await dialLead(id, lead);   // does the DNC check + state transitions
@@ -2633,6 +2633,17 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
 }
 
 let pacingBusy = false;
+// Effective calling-window timezone for a lead. Prefer the stored timezone, but
+// fall back to deriving it from the phone's area code when it's missing (legacy
+// leads imported before timezone derivation existed had null timezone, which made
+// inCallingWindow treat them all as westernmost/Pacific — so nothing dialed until
+// 10AM Pacific). Deriving from the area code is the same logic used at import and
+// is still TCPA-safe (unknown codes fall back to Pacific inside deriveFromAreaCode).
+function leadTz(lead) {
+  if (lead && lead.timezone) return lead.timezone;
+  const d = deriveFromAreaCode(areaCodeOf(lead && lead.phone));
+  return d.tz;
+}
 // Pull the next dialable, in-window lead across a set of campaigns (applying an
 // optional playlist filter set). Returns a lead row or null.
 async function nextDialableLead(campaignIds, filters, nowIso) {
@@ -2646,7 +2657,7 @@ async function nextDialableLead(campaignIds, filters, nowIso) {
     `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=15&select=*`);
   // Compliance: hard lead-local calling window.
   return (leads || []).find(l =>
-    inCallingWindow(l.timezone, CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour)) || null;
+    inCallingWindow(leadTz(l), CALLING_WINDOW.start_hour, CALLING_WINDOW.end_hour)) || null;
 }
 async function pacingTick() {
   if (pacingBusy || !SB_HOST || !CONNECTION_ID) return;
