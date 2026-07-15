@@ -768,7 +768,7 @@ async function startAgent(){
     client.on('telnyx.notification', n => {
       if(n.type==='callUpdate' && n.call){
         const st=n.call.state;
-        if(st==='ringing' && n.call.direction==='inbound'){ log('auto-answering agent leg'); agentCall=n.call; n.call.answer(); }
+        if(st==='ringing' && n.call.direction==='inbound' && n.call!==agentCall){ log('auto-answering agent leg'); agentCall=n.call; n.call.answer(); }
         if(st==='active' && n.call.direction==='inbound'){ agentCall=n.call; }
         if(st==='hangup' && n.call===agentCall){ agentCall=null; }
       }

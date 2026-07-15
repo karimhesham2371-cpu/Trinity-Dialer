@@ -2797,13 +2797,28 @@ async function nextDialableLead(campaignIds, filters, nowIso) {
   if (!campaignIds.length) return null;
   const inList = campaignIds.map(c => `"${c}"`).join(',');
   const frag = playlistFragment(filters || []);
-  const leads = await sbSelect('leads',
+  const base =
     `campaign_id=in.(${inList})&dnc=eq.false&status=in.(NEW,CALLBACK)` +
     (frag ? `&${frag}` : '') +
     `&or=(next_callback_at.is.null,next_callback_at.lte.${nowIso})` +
-    `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=15&select=*`);
-  // Compliance: hard per-state lead-local calling window.
-  return (leads || []).find(callableNow) || null;
+    `&order=next_callback_at.asc.nullsfirst,created_at.asc&select=*`;
+  // Compliance: hard per-state lead-local calling window. callableNow is
+  // evaluated in JS (each lead's own timezone), so it can't be pushed into the
+  // SQL WHERE clause. We therefore page through candidates IN PRIORITY ORDER
+  // and return the first one that's dialable right now — instead of limiting to
+  // a tiny pre-filtered slice. A small slice stalls the pacer completely
+  // whenever its leading rows are all out-of-window (e.g. the oldest leads are
+  // all West-Coast and it's before 10am PT), even though thousands of other
+  // in-window leads are waiting behind them.
+  const PAGE = 100, MAX = 1000;
+  for (let offset = 0; offset < MAX; offset += PAGE) {
+    const leads = await sbSelect('leads', `${base}&limit=${PAGE}&offset=${offset}`);
+    if (!leads || !leads.length) return null;
+    const hit = leads.find(callableNow);
+    if (hit) return hit;
+    if (leads.length < PAGE) return null;   // last (partial) page — nothing dialable now
+  }
+  return null;
 }
 async function pacingTick() {
   if (pacingBusy || !SB_HOST || !CONNECTION_ID) return;
