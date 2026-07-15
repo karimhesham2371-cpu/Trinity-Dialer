@@ -387,6 +387,9 @@
       <div class="card">
         <p class="panelTitle">Notes</p>
         <textarea id="notes" class="field" placeholder="Type notes for this contact…"></textarea>
+        <div class="mt2" style="display:flex;justify-content:flex-end">
+          <button id="notesSave" class="btn btn-sm">Save</button>
+        </div>
       </div>
 
       <div class="card">
@@ -561,6 +564,7 @@ let USER  = JSON.parse(localStorage.getItem('trinity_user') || 'null');
 let client=null, ws=null, serverState='OFFLINE', usersCache=[];
 let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null, serverWrapUntil=0;
 let dispositions=[], curCampaign=null, pendingCb=null;
+let waitSince=0;   // when the agent last became AVAILABLE (drives the Ready wait counter)
 
 // ── RBAC ──────────────────────────────────────────────────────────────────────
 // Admins have implicit full access; support users hold an explicit permission
@@ -730,7 +734,7 @@ function applyState(s, snap){
   // lead actually answers and the call goes live (ON_CALL).
   else if(s==='DIALING'||s==='CLAIMING'){ $('bannerState').textContent='Waiting for next call…'; $('bannerSub').textContent='Dialing in the background.'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL'||curLeadId) clearLead(); }
   else if(s==='WRAP_UP'){ $('bannerState').textContent='Wrap-up'; $('bannerSub').textContent='Auto-returns to Ready when the timer ends.'; stopTimer(); $('dispReq').classList.toggle('hidden', !curLeadId); }
-  else if(s==='AVAILABLE'){ $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
+  else if(s==='AVAILABLE'){ if(prev!=='AVAILABLE') waitSince=Date.now(); $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
   else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
   else { $('bannerState').textContent=u.txt; }
 
@@ -738,6 +742,7 @@ function applyState(s, snap){
   // back to Ready); BREAK is client-timed and auto-returns to Ready at 15 min.
   if(s==='WRAP_UP') ensureWrapTimer(serverWrapUntil);
   else if(s==='BREAK') ensureBreakTimer();
+  else if(s==='AVAILABLE') ensureWaitTimer();
   else clearAuxTimer();
   renderAuxBtn(s);
 }
@@ -748,6 +753,8 @@ function startTimer(){ if(timerInt) clearInterval(timerInt); $('timer').classLis
 function stopTimer(){ if(timerInt){clearInterval(timerInt);timerInt=null;} $('timer').classList.add('hidden'); $('timer').textContent='00:00'; $('timer').style.color='var(--text)'; }
 
 async function startAgent(){
+  try{ if(client) client.disconnect(); }catch(e){}
+  client=null; agentCall=null;
   applyState('CONNECTING');
   openWs();
   const TelnyxRTC = getTelnyxRTC();
@@ -793,13 +800,21 @@ function renderLead(l, callerId){
   const name=[l.first_name,l.last_name].filter(Boolean).join(' ')||'Unknown contact';
   const custom=l.custom||{};
   const extra=Object.keys(custom).filter(k=>custom[k]!=null&&custom[k]!=='').map(k=>`<div class="k">${esc(k)}</div><div>${esc(custom[k])}</div>`).join('');
+  // Always render the core contact fields (dash when missing) so the agent can
+  // see exactly what the lead file provided.
+  const row=(k,v)=>`<div class="k">${esc(k)}</div><div>${v!=null&&v!==''?esc(v):'<span class="faint">—</span>'}</div>`;
   $('leadCard').classList.remove('empty');
   $('leadCard').innerHTML=`
     <h3 class="leadName">${esc(name)}</h3>
     <div class="leadPhone mt2">${esc(l.phone||'')}</div>
     <div class="kv mt">
-      ${l.address?`<div class="k">Address</div><div>${esc(l.address)}</div>`:''}
-      ${l.state?`<div class="k">State</div><div>${esc(l.state)}</div>`:''}
+      ${row('First name',l.first_name)}
+      ${row('Last name',l.last_name)}
+      ${row('Phone',l.phone)}
+      ${row('Address',l.address)}
+      ${row('City',l.city)}
+      ${row('State',l.state)}
+      ${row('Zip code',l.zip)}
       <div class="k">Attempts</div><div class="mono">${l.attempts||0}</div>
       ${callerId?`<div class="k">Caller ID</div><div class="mono">${esc(callerId)}</div>`:''}
       ${extra}
@@ -839,7 +854,8 @@ function renderHistory(h){
   $('history').className='hist';
   $('history').innerHTML=h.map(x=>{
     const d=dispositions.find(d=>d.code===x.code); const color=d?d.color:'var(--text-dim)';
-    return `<div class="h"><span class="hbadge" style="background:${color}22;color:${color}">${esc(x.code)}</span>
+    const label=d?(d.label||d.code):(x.code==='NOTE'?'Note':x.code);
+    return `<div class="h"><span class="hbadge" style="background:${color}22;color:${color}">${esc(label)}</span>
       <div><div>${esc(x.notes||'—')}</div><div class="faint mono" style="font-size:11px">${new Date(x.created_at).toLocaleString([], {hour12:false})}</div></div></div>`;
   }).join('');
 }
@@ -916,6 +932,19 @@ $('cPad').onclick=()=>$('padWrap').classList.toggle('hidden');
 $('cHang').onclick=async()=>{ try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ toast(e.message,'err'); } };
 document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/agent/dtmf','POST',{digits:b.textContent}); log('DTMF '+b.textContent); }catch(e){ toast(e.message,'err'); } });
 
+// Save a standalone note on the current contact (shows up in History as NOTE).
+$('notesSave').onclick=async()=>{
+  const v=$('notes').value.trim();
+  if(!v){ toast('Nothing to save','warn'); return; }
+  if(!curLeadId){ toast('No active contact','warn'); return; }
+  try{
+    await apiJson('/api/agent/note','POST',{notes:v, lead_id:curLeadId});
+    $('notes').value='';
+    toast('Note saved');
+    loadContext();   // refresh History so the note appears immediately
+  }catch(e){ toast(e.message,'err'); }
+};
+
 // ── AUX status dropdown (Ready / Break) ─────────────────────────────────────
 // Ready → AVAILABLE, receives calls immediately.
 // Break → paused, max 15 min, auto-returns to Ready (client-timed).
@@ -932,6 +961,13 @@ function ensureBreakTimer(){
     if(Date.now()>=auxDeadline){ clearAuxTimer(); setAux('READY'); return; }
     renderAuxBtn(serverState);
   },500);
+}
+// AVAILABLE: count-up of how long the agent has been waiting for the next call,
+// shown under "Ready" on the aux button (display only).
+function ensureWaitTimer(){
+  if(auxKind==='WAIT' && auxTimerInt) return;
+  clearAuxTimer(); auxKind='WAIT';
+  auxTimerInt=setInterval(()=>renderAuxBtn(serverState),500);
 }
 // WRAP_UP: display-only countdown to the server's deadline. The server flips the
 // agent back to AVAILABLE itself, so we never call setAux here.
@@ -957,7 +993,9 @@ function renderAuxBtn(s){
   if(s==='DIALING'||s==='CLAIMING'){ b.textContent='Waiting…'; b.className='btn btn-sm'; return; }
   if(s==='WRAP_UP'){ b.textContent='Wrap up '+fmtMS(auxRemainMs()); b.className='btn btn-sm btn-warn'; return; }
   if(s==='BREAK'){ b.textContent='Break '+fmtMS(auxRemainMs()); b.className='btn btn-sm btn-warn'; return; }
-  b.textContent='Ready'; b.className='btn btn-sm'; // AVAILABLE
+  // AVAILABLE — show how long the agent has been waiting for the next call.
+  b.className='btn btn-sm';
+  b.innerHTML='Ready<span style="display:block;font-size:10px;line-height:1.1;opacity:.65;font-variant-numeric:tabular-nums">'+fmtMS(Math.max(0,Date.now()-(waitSince||Date.now())))+'</span>';
 }
 async function setAux(target){
   $('auxMenu').classList.add('hidden');
@@ -966,7 +1004,12 @@ async function setAux(target){
     // Not connected yet → do a full go-available (registers softphone).
     if(!client || serverState==='OFFLINE'){ startAgent(); return; }
     try{ await apiJson('/api/agent/aux','POST',{state:'AVAILABLE'}); }
-    catch(e){ toast(e.message,'err'); }
+    catch(e){
+      // Server lost the softphone leg (redeploy / dropped conference): do a full
+      // reconnect instead of stranding the agent on the error.
+      if(/softphone not connected/i.test(e.message||'')){ toast('Reconnecting softphone…','warn'); startAgent(); return; }
+      toast(e.message,'err');
+    }
     return;
   }
   // Only BREAK is agent-selectable (Wrap-up is automated server-side).

@@ -58,22 +58,22 @@ const SIP_DOMAIN  = 'sip.telnyx.com';
 // Default one-click dispositions (used when a campaign hasn't customised its own).
 // outcome: final lead status. is_callback/is_dnc/recycle drive special handling.
 const DEFAULT_DISPOSITIONS = [
-  { code: 'SALE',           label: 'Sale / Appt',    color: '#2ea043', hotkey: '1', outcome: 'DONE' },
+  // code SALE kept for historical rows; label 'Lead' still matches LONG_WRAP_RE / isPositiveDisp.
+  { code: 'SALE',           label: 'Lead',           color: '#2ea043', hotkey: '1', outcome: 'DONE' },
   { code: 'CALLBACK',       label: 'Callback',       color: '#2f81f7', hotkey: '2', is_callback: true },
   { code: 'NOT_INTERESTED', label: 'Not Interested', color: '#8b95a5', hotkey: '3', outcome: 'DONE' },
-  { code: 'NO_ANSWER',      label: 'No Answer',      color: '#d29922', hotkey: '4', recycle: 'no_answer' },
-  { code: 'VOICEMAIL',      label: 'Left Voicemail', color: '#a371f7', hotkey: '5', recycle: 'no_answer' },
+  { code: 'NO_ANSWER',      label: 'Silent call',    color: '#d29922', hotkey: '4', recycle: 'no_answer' },
+  { code: 'VOICEMAIL',      label: 'Voicemail',      color: '#a371f7', hotkey: '5', recycle: 'no_answer' },
   { code: 'WRONG_NUMBER',   label: 'Wrong Number',   color: '#f0883e', hotkey: '6', outcome: 'BAD_NUMBER' },
   { code: 'DNC',            label: 'Do Not Call',    color: '#da3633', hotkey: '7', is_dnc: true },
-  // AMD-accuracy ground truth: the agent bridged in, but it was actually a
-  // machine/voicemail AMD failed to catch (a false negative). Recorded so the
-  // amd-stats disagreement report can score real-world miss rate against labels.
-  { code: 'AMD_MISS',       label: 'Voicemail reached me (AMD miss)', color: '#6e40c9', hotkey: '8', recycle: 'no_answer' },
   // System-written (agent_id null) when the predictive engine kills a leg AMD
-  // classified as a machine — never surfaced as an agent hotkey, but present so
-  // the accuracy cross-check and per-campaign reports can count machine kills.
-  { code: 'AUTO_ANSWERING_MACHINE', label: 'Answering machine (auto)', color: '#57606a', recycle: 'no_answer' },
+  // classified as a machine — never surfaced as an agent button (system:true is
+  // filtered out of the agent payload), but present so the accuracy cross-check
+  // and per-campaign reports can count machine kills.
+  { code: 'AUTO_ANSWERING_MACHINE', label: 'Answering machine (auto)', color: '#57606a', recycle: 'no_answer', system: true },
 ];
+// Codes never shown as agent buttons even if present in a campaign's custom list.
+const AGENT_HIDDEN_DISPOSITIONS = new Set(['AUTO_ANSWERING_MACHINE', 'AMD_MISS', 'NOTE']);
 const DEFAULT_RECYCLE = { no_answer: { hours: 4, max: 5 }, busy: { minutes: 20, max: 8 } };
 
 // ── Disposition → DNC / recycle policy (Karim's rules) ────────────────────────
@@ -825,8 +825,11 @@ function scheduleWrapReturn(agentId, seconds) {
     const s = rt[agentId];
     if (!s) return;
     s.wrapTimer = null; s.wrapUntil = 0;
-    // Only auto-advance if still wrapping on a connected softphone.
-    if (s.state === 'WRAP_UP' && s.conferenceId) { s.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
+    if (s.state !== 'WRAP_UP') return;
+    // Softphone still connected → back to the floor; otherwise drop to OFFLINE so
+    // the agent isn't marooned in WRAP_UP (client reconnects on next Ready click).
+    if (s.conferenceId) { s.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
+    else { s.state = 'OFFLINE'; await setAgentState(agentId, 'OFFLINE'); }
   }, seconds * 1000);
 }
 
@@ -902,6 +905,9 @@ async function rehydrateRt() {
         leadNumber: a.lead_number, fromNumber: a.from_number, conferenceId: a.conference_id,
         rtUpdatedAt: Date.now(),
       };
+      // The wrap auto-return setTimeout died with the old process; re-arm it so a
+      // restored WRAP_UP agent doesn't sit in wrap-up forever after a redeploy.
+      if (a.state === 'WRAP_UP') scheduleWrapReturn(a.id, WRAP_SHORT_SEC);
       n++;
     }
     if (n) console.log(`[rehydrate] restored ${n} live agent(s) from DB`);
@@ -2726,8 +2732,18 @@ app.post('/api/agent/aux', auth, async (req, res) => {
   // Wrap-up is automated (set by call-end / disposition), never agent-selected.
   if (!['AVAILABLE', 'BREAK'].includes(want))
     return res.status(400).json({ error: 'invalid aux state' });
-  if (!st || !st.conferenceId)
-    return res.status(409).json({ error: 'softphone not connected' });
+  if (!st || !st.conferenceId) {
+    // Softphone leg is gone (server redeploy wiped rt, or the agent leg dropped
+    // mid-wrap). Don't dead-end the agent: reset to OFFLINE so the client can do
+    // a full go-available reconnect instead of being stuck on this 409 forever.
+    if (st) {
+      clearWrapTimer(st);
+      if (st.agentLeg) telnyx('POST', `/calls/${st.agentLeg}/actions/hangup`, {}).catch(() => {});
+    }
+    rt[id] = { state: 'OFFLINE' };
+    await setAgentState(id, 'OFFLINE');
+    return res.status(409).json({ error: 'softphone not connected', reconnect: true });
+  }
   if (['DIALING', 'CLAIMING', 'ON_CALL'].includes(st.state))
     return res.status(409).json({ error: 'busy on a call' });
   clearWrapTimer(st);   // manual Ready/Break cancels any pending wrap auto-return
@@ -2828,7 +2844,8 @@ app.get('/api/agent/context', auth, async (req, res) => {
       lead: { ...lead, custom: lead.custom || {} },
       caller_id: st.fromNumber || null,
       campaign: cfg ? { id: cfg.id, name: cfg.name, wrap_seconds: cfg.wrap_seconds,
-        dispositions: cfg.dispositions, script: cfg.script, script_merged: mergeScript(cfg.script, lead) } : null,
+        dispositions: (cfg.dispositions || []).filter(d => !d.system && !AGENT_HIDDEN_DISPOSITIONS.has(d.code)),
+        script: cfg.script, script_merged: mergeScript(cfg.script, lead) } : null,
       history,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -2918,6 +2935,25 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
       }
     }
     res.json({ ok: true, next_status: patch.status, wrap_seconds: wrapSec });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Save a standalone note on the current lead (no disposition). Stored as a
+// dispositions row with code NOTE so it shows up in the lead's contact history.
+app.post('/api/agent/note', auth, async (req, res) => {
+  const st = rt[req.user.id];
+  const leadId = (st && st.leadId) || (req.body && req.body.lead_id);
+  const notes = String((req.body && req.body.notes) || '').trim();
+  if (!leadId) return res.status(400).json({ error: 'no lead' });
+  if (!notes) return res.status(400).json({ error: 'empty note' });
+  try {
+    const leadRows = await sbSelect('leads', `id=eq.${leadId}&select=campaign_id`);
+    const lead = leadRows[0];
+    if (!lead) return res.status(404).json({ error: 'lead not found' });
+    await sbWrite('POST', 'dispositions', { lead_id: leadId, agent_id: req.user.id,
+      campaign_id: lead.campaign_id, code: 'NOTE', notes,
+      telnyx_call_control_id: (st && st.leadLeg) || null }, 'return=minimal', 'note');
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -4346,6 +4382,13 @@ async function reaperTick() {
           st.rtUpdatedAt && (now - st.rtUpdatedAt) > 5000) {
         console.log(`[reaper] agent ${id.slice(0,8)} idle in ${st.state} -> freeing`);
         st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
+        st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
+        await setAgentState(id, st.state);
+      }
+      // WRAP_UP whose auto-return timer is gone (lost setTimeout) and whose
+      // deadline has clearly passed -> free the agent instead of stranding them.
+      if (st.state === 'WRAP_UP' && !st.wrapTimer && (!st.wrapUntil || now > st.wrapUntil + 10000)) {
+        console.log(`[reaper] agent ${id.slice(0,8)} stuck in WRAP_UP -> freeing`);
         st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
         await setAgentState(id, st.state);
       }
