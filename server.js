@@ -2770,8 +2770,80 @@ app.post('/api/agent/offline', auth, async (req, res) => {
 
 app.post('/api/agent/hangup', auth, async (req, res) => {
   const st = rt[req.user.id];
-  try { if (st && st.leadLeg) await telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}); res.json({ ok: true }); }
-  catch (e) { res.status(502).json({ error: e.message }); }
+  try {
+    if (st && st.leadLeg) { await telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}); return res.json({ ok: true }); }
+    // No connected call — cancel any still-ringing legs (manual dial or background
+    // dials) and requeue their leads, then free the agent immediately.
+    if (st && st.pending && Object.keys(st.pending).length) {
+      for (const cc of Object.keys(st.pending)) {
+        const pi = st.pending[cc];
+        telnyx('POST', `/calls/${cc}/actions/hangup`, {}).catch(() => {});
+        if (pi && pi.leadId && !pi.manual) sbUpdate('leads', `id=eq.${pi.leadId}`,
+          { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 5 * 60e3).toISOString() }).catch(() => {});
+      }
+      st.pending = {};
+      if (st.state === 'DIALING' || st.state === 'CLAIMING') {
+        st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
+        await setAgentState(req.user.id, st.state);
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+// Manual outbound: agent types any number on the dialpad and calls it (e.g. to
+// reach someone back). DNC is still enforced; if the number matches a known lead
+// the call is attached to it so history/disposition work. AMD is off — the agent
+// is live on the line and hears the ring themselves.
+app.post('/api/agent/manual-dial', auth, async (req, res) => {
+  const id = req.user.id;
+  const st = rt[id];
+  const phone = normPhone(String((req.body && req.body.phone) || ''));
+  if (!phone || phone.replace(/\D/g, '').length < 10) return res.status(400).json({ error: 'enter a valid phone number' });
+  if (!st || !st.conferenceId) return res.status(409).json({ error: 'softphone not connected' });
+  if (st.state === 'ON_CALL' || st.leadLeg) return res.status(409).json({ error: 'already on a call' });
+  try {
+    const nowIso = new Date().toISOString();
+    const hit = await sbSelect('dnc_list',
+      `phone=eq.${encodeURIComponent(phone)}&or=(expires_at.is.null,expires_at.gt.${nowIso})&select=phone&limit=1`);
+    if (hit && hit.length) return res.status(409).json({ error: 'number is on the DNC list' });
+    // The manual call takes the line: cancel background dials in flight and
+    // requeue their leads, and stop any pending wrap auto-return.
+    if (st.pending) {
+      for (const cc of Object.keys(st.pending)) {
+        const pi = st.pending[cc];
+        telnyx('POST', `/calls/${cc}/actions/hangup`, {}).catch(() => {});
+        if (pi && pi.leadId) sbUpdate('leads', `id=eq.${pi.leadId}`,
+          { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 5 * 60e3).toISOString() }).catch(() => {});
+      }
+      st.pending = {};
+    }
+    clearWrapTimer(st);
+    const [lead] = await sbSelect('leads',
+      `phone=eq.${encodeURIComponent(phone)}&select=*&order=created_at.desc&limit=1`).catch(() => []);
+    const from = pickCallerId(areaCodeOf(phone));
+    const cid = crypto.randomUUID();
+    const result = await telnyx('POST', '/calls', {
+      connection_id: CONNECTION_ID, to: phone, from,
+      timeout_secs: DIALER.ring_secs,
+      record: 'record-from-answer', record_channels: 'dual', record_format: 'mp3',
+      client_state: enc({ role: 'lead', agentId: id, conf: st.conferenceId,
+        leadId: lead ? lead.id : null, campaignId: lead ? lead.campaign_id : null, cid, amd: 'disabled', manual: true }),
+    });
+    const ccid = result.data && result.data.call_control_id;
+    st.pending = st.pending || {};
+    st.pending[ccid] = { leadId: lead ? lead.id : null, leadNumber: phone, fromNumber: from,
+      campaignId: lead ? lead.campaign_id : null, playlistId: null, at: Date.now(), cid,
+      amdMode: 'disabled', manual: true, answeredAt: null, lead: lead || null };
+    st.state = 'DIALING'; st.onCallSince = null;
+    await persistRt(id);
+    logStateEvent(id, 'DIALING');
+    wsAgentSnapshot(id);
+    saveCall({ id: cid, lead_id: lead ? lead.id : null, agent_id: id, campaign_id: lead ? lead.campaign_id : null,
+      telnyx_call_control_id: ccid, from_number: from, to_number: phone, direction: 'outbound' }, 'call-open-manual');
+    audit(req.user, 'MANUAL_DIAL', { target_type: 'call', meta: { phone } });
+    res.json({ ok: true, state: st.state });
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 // AUX status switch: Ready (AVAILABLE) / Wrap up (WRAP_UP) / Break (BREAK).

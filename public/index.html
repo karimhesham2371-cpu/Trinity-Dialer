@@ -417,12 +417,16 @@
           <button id="cHang" class="btn ctrlBtn danger" disabled><span class="ic">☎</span><span>Hang up</span></button>
         </div>
         <div id="padWrap" class="mt3 hidden">
+          <div id="padDialRow" style="margin-bottom:8px">
+            <input id="padNum" class="field" placeholder="Enter number to call" inputmode="tel" style="width:100%;font-family:var(--font-mono)">
+          </div>
           <div class="dialpad">
             <button>1</button><button>2</button><button>3</button>
             <button>4</button><button>5</button><button>6</button>
             <button>7</button><button>8</button><button>9</button>
             <button>*</button><button>0</button><button>#</button>
           </div>
+          <button id="padCall" class="btn btn-primary btn-block mt2">Call</button>
         </div>
       </div>
 
@@ -745,8 +749,13 @@ function applyState(s, snap){
   $('agState').innerHTML=dotHtml+' '+u.txt;
   $('bannerDot').className='dot dot--'+u.dot+(u.pulse?' dot--pulse':'');
   const live = (s==='ON_CALL');
-  ['cMute','cHold','cPad'].forEach(id=>$(id).disabled=!live);
-  $('cHang').disabled=!(s==='ON_CALL'||s==='DIALING');
+  ['cMute','cHold'].forEach(id=>$(id).disabled=!live);
+  // Dialpad works whenever the softphone is connected: DTMF during a call,
+  // manual outbound dialing otherwise (agents can call anyone back).
+  $('cPad').disabled=(s==='OFFLINE'||s==='CONNECTING');
+  $('padDialRow').classList.toggle('hidden',live);
+  $('padCall').classList.toggle('hidden',live);
+  $('cHang').disabled=!(s==='ON_CALL'||s==='DIALING'||s==='CLAIMING');
   if(snap&&snap.onCallSince) onCallSince=snap.onCallSince;
   if(snap&&snap.wrapUntil) serverWrapUntil=snap.wrapUntil;
 
@@ -985,7 +994,25 @@ $('cHold').onclick=async()=>{ held=!held; try{ await apiJson('/api/agent/hold','
   $('cHold').classList.toggle('active',held); $('cHold').querySelector('span:last-child').textContent=held?'Resume':'Hold'; };
 $('cPad').onclick=()=>$('padWrap').classList.toggle('hidden');
 $('cHang').onclick=async()=>{ try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ toast(e.message,'err'); } };
-document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{ try{ await apiJson('/api/agent/dtmf','POST',{digits:b.textContent}); log('DTMF '+b.textContent); }catch(e){ toast(e.message,'err'); } });
+document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{
+  if(serverState==='ON_CALL'){
+    try{ await apiJson('/api/agent/dtmf','POST',{digits:b.textContent}); log('DTMF '+b.textContent); }catch(e){ toast(e.message,'err'); }
+  } else {
+    const inp=$('padNum'); inp.value+=b.textContent; inp.focus();
+  }
+});
+$('padCall').onclick=async()=>{
+  const raw=$('padNum').value.trim();
+  const digits=raw.replace(/[^\d+]/g,'');
+  if(digits.replace(/\D/g,'').length<10){ toast('Enter a valid phone number','warn'); return; }
+  $('padCall').disabled=true;
+  try{
+    await apiJson('/api/agent/manual-dial','POST',{phone:digits});
+    toast('Dialing '+digits,'ok'); $('padNum').value='';
+  }catch(e){ toast(e.message,'err'); }
+  finally{ $('padCall').disabled=false; }
+};
+$('padNum').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); $('padCall').click(); } });
 
 // Save a standalone note on the current contact (shows up in History as NOTE).
 $('notesSave').onclick=async()=>{
