@@ -2746,8 +2746,23 @@ app.post('/api/agent/aux', auth, async (req, res) => {
     await setAgentState(id, 'OFFLINE');
     return res.status(409).json({ error: 'softphone not connected', reconnect: true });
   }
-  if (['DIALING', 'CLAIMING', 'ON_CALL'].includes(st.state))
+  if (st.state === 'ON_CALL')
     return res.status(409).json({ error: 'busy on a call' });
+  if (['DIALING', 'CLAIMING'].includes(st.state)) {
+    // Waiting between calls with background dials in flight. Ready is a no-op
+    // (already in the dial pool). Break cancels the pending legs and requeues
+    // their leads so nobody answers into an empty line.
+    if (want === 'AVAILABLE') return res.json({ ok: true, state: st.state });
+    if (st.pending) {
+      for (const ccid of Object.keys(st.pending)) {
+        const pi = st.pending[ccid];
+        telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+        if (pi && pi.leadId) sbUpdate('leads', `id=eq.${pi.leadId}`,
+          { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 5 * 60e3).toISOString() }).catch(() => {});
+      }
+      st.pending = {};
+    }
+  }
   clearWrapTimer(st);   // manual Ready/Break cancels any pending wrap auto-return
   // Returning to Ready with an undispositioned lead still attached (e.g. the
   // wrap-up timer expired): release the leftover leg so the pacer starts clean.
@@ -3098,6 +3113,19 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
     if (lid) sbUpdate('leads', `id=eq.${lid}`,
       { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 10 * 60e3).toISOString() }).catch(() => {});
     console.log(`[bridge] extra answer dropped for agent ${agentId.slice(0, 8)} (already on a call) — ABANDONED`);
+    return;
+  }
+  // Agent bailed to Break/Offline while this dial was in flight — never bridge a
+  // human into an empty conference. Drop + requeue like an abandoned answer.
+  if (st.state === 'BREAK' || st.state === 'OFFLINE') {
+    if (st.pending) delete st.pending[ccid];
+    telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+    if (ccid) saveCall({ telnyx_call_control_id: ccid, abandoned: true,
+      ended_at: new Date().toISOString() }, 'call-abandoned');
+    const lid2 = (cs && cs.leadId);
+    if (lid2) sbUpdate('leads', `id=eq.${lid2}`,
+      { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 10 * 60e3).toISOString() }).catch(() => {});
+    console.log(`[bridge] answer dropped — agent ${agentId.slice(0, 8)} went on ${st.state}`);
     return;
   }
   const info = (st.pending && st.pending[ccid]) || {};

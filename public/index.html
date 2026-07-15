@@ -1022,11 +1022,10 @@ function auxRemainMs(){ return Math.max(0, auxDeadline-Date.now()); }
 function fmtMS(ms){ const s=Math.ceil(ms/1000); return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
 function renderAuxBtn(s){
   const b=$('auxBtn');
-  // Only lock the aux control while a call is live/pending — in every other
-  // state (incl. OFFLINE/CONNECTING) the dropdown must open so the agent can
-  // pick a status. "Ready" from the menu is what triggers the connect.
-  const busy = (s==='ON_CALL'||s==='DIALING'||s==='CLAIMING');
-  b.disabled = busy;
+  // Only lock the aux control while a call is live — waiting states (DIALING/
+  // CLAIMING are background dials) must stay clickable so agents can take a
+  // break; the server cancels the in-flight legs and requeues those leads.
+  b.disabled = (s==='ON_CALL');
   if(s==='OFFLINE'){ b.textContent='Offline'; b.className='btn btn-sm btn-primary'; return; }
   if(s==='CONNECTING'){ b.textContent='Connecting…'; b.className='btn btn-sm'; return; }
   if(s==='ON_CALL'){ b.textContent='On call'; b.className='btn btn-sm'; return; }
