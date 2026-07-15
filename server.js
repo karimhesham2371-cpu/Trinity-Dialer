@@ -254,6 +254,50 @@ function sbLog(table, row) { // fire-and-forget audit insert
   if (!SB_HOST || !SB_KEY) return;
   sbReq('POST', table, row, 'return=minimal').catch(e => console.error('[sbLog]', e.message));
 }
+
+// ── Durable writes (at-least-once) ───────────────────────────────────────────────
+// Call/event/disposition writes are the product's memory — losing one to a transient
+// Supabase blip is unacceptable. sbWrite() tries inline, and on failure parks the
+// request in an in-memory outbox that a background flusher retries with backoff for
+// up to ~6h. Combined with the nightly Telnyx reconciliation, no call is silently
+// dropped. The outbox is bounded so a prolonged outage can't exhaust memory.
+const writeOutbox = [];
+const OUTBOX_MAX = 5000;
+let outboxDropped = 0;
+function queueWrite(w) {
+  if (writeOutbox.length >= OUTBOX_MAX) { writeOutbox.shift(); outboxDropped++; }
+  writeOutbox.push(w);
+}
+async function sbWrite(method, pathQ, body, prefer, desc) {
+  if (!SB_HOST || !SB_KEY) return null;
+  try { return await sbReq(method, pathQ, body, prefer); }
+  catch (e) {
+    console.error(`[sbWrite:${desc || pathQ}]`, e.message);
+    queueWrite({ method, pathQ, body, prefer, desc: desc || pathQ, tries: 0, at: Date.now() });
+    return null;
+  }
+}
+async function flushOutbox() {
+  if (!writeOutbox.length || !SB_HOST) return;
+  const batch = writeOutbox.splice(0, 50);
+  for (const w of batch) {
+    try { await sbReq(w.method, w.pathQ, w.body, w.prefer); }
+    catch (e) {
+      w.tries++; w.lastErr = e.message;
+      const tooOld = (Date.now() - w.at) > 6 * 3600 * 1000;
+      if (w.tries < 30 && !tooOld) queueWrite(w);
+      else { outboxDropped++; console.error(`[outbox:drop:${w.desc}] after ${w.tries} tries: ${e.message}`); }
+    }
+  }
+}
+// Upsert a calls row keyed on the Telnyx call_control_id (unique). Order-independent:
+// whichever event arrives first creates the row, later events merge onto it — so a
+// missed call.initiated can't strand every subsequent update. Always durable.
+function saveCall(patch, desc) {
+  if (!patch || !patch.telnyx_call_control_id) return;
+  sbWrite('POST', 'calls?on_conflict=telnyx_call_control_id', patch,
+    'resolution=merge-duplicates,return=minimal', desc || 'calls');
+}
 // Exact row count regardless of PostgREST's default 1000-row select cap.
 async function sbCount(table, q = '') {
   const r = await fetch(`https://${SB_HOST}/rest/v1/${table}?${q}${q ? '&' : ''}select=id`, {
@@ -716,6 +760,8 @@ app.get('/health', (_req, res) => {
     telnyx_key: !!TELNYX_KEY, connection_id: !!CONNECTION_ID, supabase: !!(SB_HOST && SB_KEY),
     caller_pool: CALLER_POOL.length, agents_online: Object.keys(rt).length,
     ws_clients: wsClients.size, recording: true,
+    outbox_depth: writeOutbox.length, outbox_dropped: outboxDropped,
+    uptime_sec: Math.round(process.uptime()),
     time: new Date().toISOString(),
   });
 });
@@ -2375,8 +2421,8 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
     const disp = (cfg.dispositions || DEFAULT_DISPOSITIONS).find(d => d.code === code) || { code, outcome: 'DONE' };
 
     // Record the disposition row.
-    sbLog('dispositions', { lead_id: leadId, agent_id: req.user.id, campaign_id: lead.campaign_id,
-      code, notes: notes || null, callback_at: callback_at || null });
+    sbWrite('POST', 'dispositions', { lead_id: leadId, agent_id: req.user.id, campaign_id: lead.campaign_id,
+      code, notes: notes || null, callback_at: callback_at || null }, 'return=minimal', 'dispositions');
 
     // Decide the lead's next status + DNC policy (see the rules block near the top).
     const patch = { last_outcome: code };
@@ -2536,9 +2582,9 @@ async function dialLead(agentId, lead) {
     { status: 'IN_PROGRESS', attempts: (lead.attempts || 0) + 1, last_attempt_at: new Date().toISOString(), assigned_agent_id: agentId })
     .catch(e => console.error('[dialLead:update]', e.message));
   markFirstDial(lead.phone);   // stamps first_dial_at once — anchors the 10-day recycle window
-  // Open a calls row for history/recording linkage.
-  sbLog('calls', { lead_id: lead.id, agent_id: agentId, campaign_id: lead.campaign_id,
-    telnyx_call_control_id: ccid, from_number: from, to_number: lead.phone, direction: 'outbound' });
+  // Open a calls row for history/recording linkage (durable upsert by ccid).
+  saveCall({ lead_id: lead.id, agent_id: agentId, campaign_id: lead.campaign_id,
+    telnyx_call_control_id: ccid, from_number: from, to_number: lead.phone, direction: 'outbound' }, 'call-open-outbound');
   console.log(`[pacing] agent ${agentId.slice(0, 8)} -> ${lead.phone} from ${from} (${Object.keys(st.pending).length} in flight)`);
 }
 
@@ -2571,7 +2617,7 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
   st.state = 'ON_CALL';
   await telnyx('POST', `/conferences/${conf}/actions/join`, { call_control_id: ccid, start_conference_on_enter: true, mute: false });
   await setAgentState(agentId, 'ON_CALL');
-  sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`, { bridged_at: new Date().toISOString(), amd_result: amd || null }).catch(() => {});
+  saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString(), amd_result: amd || null }, 'call-bridged');
   if (st.leadId) sbUpdate('leads', `id=eq.${st.leadId}`, { status: 'CONTACTED' }).catch(() => {});
   // Drop the sibling dials and requeue their leads so nothing is wasted.
   if (st.pending) {
@@ -2760,8 +2806,8 @@ async function dialAiLead(lead) {
     { status: 'IN_PROGRESS', attempts: (lead.attempts || 0) + 1, last_attempt_at: new Date().toISOString() })
     .catch(e => console.error('[dialAiLead:update]', e.message));
   markFirstDial(lead.phone);
-  sbLog('calls', { lead_id: lead.id, campaign_id: lead.campaign_id,
-    telnyx_call_control_id: ccid, from_number: from, to_number: lead.phone, direction: 'outbound' });
+  saveCall({ lead_id: lead.id, campaign_id: lead.campaign_id,
+    telnyx_call_control_id: ccid, from_number: from, to_number: lead.phone, direction: 'outbound' }, 'call-open-ai');
   console.log(`[ai] -> ${lead.phone} from ${from} (${Object.keys(aiRt).length}/${AI.concurrency} live)`);
 }
 
@@ -2818,8 +2864,7 @@ async function startAiAssistant(ccid) {
     });
     info.phase = 'assistant';
     info.bridgedAt = Date.now();   // talk-clock start, used to compute duration_sec on hangup
-    sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
-      { bridged_at: new Date().toISOString(), amd_result: 'human' }).catch(() => {});
+    saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString(), amd_result: 'human' }, 'call-bridged-ai');
     if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`, { status: 'CONTACTED' }).catch(() => {});
     console.log(`[ai] assistant attached ${ccid.slice(-8)} (${info.leadNumber})`);
   } catch (e) {
@@ -2960,7 +3005,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
               (payload.hangup_source ? ` src=${payload.hangup_source}` : '') +
               (payload.sip_hangup_cause ? ` sip=${payload.sip_hangup_cause}` : '') +
               (payload.to ? ` to=${payload.to}` : ''));
-  sbLog('call_events', { event_type: event, telnyx_call_control_id: ccid, client_state: cs, payload });
+  sbWrite('POST', 'call_events', { event_type: event, telnyx_call_control_id: ccid, client_state: cs, payload }, 'return=minimal', 'call_events');
 
   try {
     // Recording saved -> archive the audio into Supabase Storage so it stays
@@ -2972,8 +3017,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
       const recId = payload.recording_id || null;
       const url = (payload.public_recording_urls && (payload.public_recording_urls.mp3 || payload.public_recording_urls.wav)) ||
                   (payload.recording_urls && (payload.recording_urls.mp3 || payload.recording_urls.wav)) || null;
-      if (ccid) await sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
-        { recording_url: url, recording_id: recId }).catch(() => {});
+      if (ccid) saveCall({ telnyx_call_control_id: ccid, recording_url: url, recording_id: recId }, 'call-recording-saved');
       if (ccid && recId) {
         archiveCallRecording(ccid, recId, url, false)
           .then(r => console.log(`[rec-archive] ${ccid.slice(-8)} -> ${recId} (${r.bytes}B)`))
@@ -3009,7 +3053,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
           delete aiRt[ccid];
           await telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
           if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
-          sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`, { amd_result: r }).catch(() => {});
+          saveCall({ telnyx_call_control_id: ccid, amd_result: r }, 'call-ai-machine');
           console.log(`[ai] dropped machine ${ccid ? ccid.slice(-8) : '-'} (result=${r})`);
         }
         return;
@@ -3024,9 +3068,9 @@ app.post('/webhooks/telnyx', async (req, res) => {
         const resultRecorded = !!(info && info.resultRecorded);   // end_call tool already disposed this lead
         delete aiRt[ccid];
         endAiStream(ccid);   // tear down any live-listen fork + notify listeners
-        sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
-          { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null,
-            duration_sec: talkSec, talk_seconds: talkSec }).catch(() => {});
+        saveCall({ telnyx_call_control_id: ccid, ended_at: new Date().toISOString(),
+            hangup_cause: payload.hangup_cause || null,
+            duration_sec: talkSec, talk_seconds: talkSec }, 'call-ai-ended');
         if (resultRecorded) {
           // The assistant's end_call tool already wrote the definitive outcome to the
           // lead; don't clobber it with the generic ai_contacted/no_answer default.
@@ -3094,8 +3138,8 @@ app.post('/webhooks/telnyx', async (req, res) => {
       await telnyx('POST', `/calls/${ccid}/actions/answer`, {
         client_state: enc({ role: 'inbound', agentId: chosen, conf: st.conferenceId, campaignId: did.campaign_id, from: fromNum }),
       });
-      sbLog('calls', { agent_id: chosen, campaign_id: did.campaign_id,
-        telnyx_call_control_id: ccid, from_number: fromNum, to_number: toNum, direction: 'inbound' });
+      saveCall({ agent_id: chosen, campaign_id: did.campaign_id,
+        telnyx_call_control_id: ccid, from_number: fromNum, to_number: toNum, direction: 'inbound' }, 'call-open-inbound');
       console.log(`[inbound] ${toNum} -> agent ${chosen.slice(0, 8)} (campaign ${did.campaign_id.slice(0, 8)})`);
       return;
     }
@@ -3109,7 +3153,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         st.leadLeg = ccid; st.inbound = true; st.leadId = null;
         st.onCallSince = Date.now(); st.state = 'ON_CALL';
         await setAgentState(agentId, 'ON_CALL');
-        sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`, { bridged_at: new Date().toISOString() }).catch(() => {});
+        saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString() }, 'call-bridged-inbound');
         console.log(`[inbound] agent ${agentId.slice(0, 8)} ON_CALL (bridged inbound)`);
       }
       return;
@@ -3161,8 +3205,8 @@ app.post('/webhooks/telnyx', async (req, res) => {
       // nothing else is in flight and no call has connected.
       if (st.pending && st.pending[ccid]) {
         const info = st.pending[ccid]; delete st.pending[ccid];
-        if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
-          { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
+        if (ccid) saveCall({ telnyx_call_control_id: ccid,
+          ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }, 'call-ended-pending');
         if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
           { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
         const idle = !st.leadLeg && Object.keys(st.pending).length === 0;
@@ -3173,15 +3217,13 @@ app.post('/webhooks/telnyx', async (req, res) => {
       if (wasLead) {
         if (ccid) endAiStream(ccid);   // notify + close any live-monitor listeners on this leg
         const talked = st.state === 'ON_CALL';   // agent actually spoke to a human
-        if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
-          { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
+        if (ccid) saveCall({ telnyx_call_control_id: ccid,
+          ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }, 'call-ended-lead');
         const wasInbound = st.inbound === true;
         st.leadLeg = null; st.leadNumber = null; st.fromNumber = null; st.onCallSince = null;
         if (wasInbound) {
           // Inbound calls have no lead to disposition — return straight to AVAILABLE.
           st.inbound = false; st.leadId = null;
-          if (ccid) sbUpdate('calls', `telnyx_call_control_id=eq.${ccid}`,
-            { ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }).catch(() => {});
           if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
           console.log(`[bridge] inbound ended, agent ${agentId.slice(0, 8)} AVAILABLE`);
         } else if (talked) {
@@ -3420,6 +3462,16 @@ server.on('upgrade', (req, socket, head) => {
   target.handleUpgrade(req, socket, head, (ws) => target.emit('connection', ws, req));
 });
 
+// Global crash guards — a single stray rejection/throw must never take the whole
+// dialer down mid-shift. Log loudly, keep serving. (Telnyx webhooks, WS handlers
+// and fire-and-forget writes are the usual sources.)
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
+
 server.listen(PORT, async () => {
   console.log(`Trinity Dialer (phase0) listening on :${PORT}`);
   await bootstrapAdmin();
@@ -3436,6 +3488,7 @@ server.listen(PORT, async () => {
   console.log(`[boot] ai caller: ${AI.enabled ? 'ENABLED' : 'off'}, concurrency ${AI.concurrency}, ${AI.campaign_ids.length} campaign(s), assistant ${AI.assistant_id || '(none)'}`);
   setInterval(pacingTick, PACING_MS);
   setInterval(aiPacingTick, PACING_MS);   // AI Cold Caller lane (independent of human agents)
+  setInterval(flushOutbox, 5 * 1000);     // drain any Supabase writes that failed, at-least-once
   setInterval(reaperTick, 30 * 1000);
   setInterval(refreshCallerPool, 5 * 60 * 1000);
   setInterval(loadCallingWindow, 5 * 60 * 1000);
