@@ -3356,30 +3356,25 @@ app.post('/webhooks/telnyx', async (req, res) => {
       return;
     }
 
-    // Lead premium AMD result. The leg is already bridged (we connect on answer),
-    // so a human needs no action; a machine is torn down and the agent freed.
+    // Lead premium AMD result. The leg is already bridged (we connect on answer).
+    // Auto hang-up on machine detection is DISABLED by request: premium AMD is
+    // unreliable here — it drops live humans (false positives) while missing real
+    // voicemails (false negatives), which made the agent's connect pool look
+    // machine-heavy. We therefore NEVER tear the leg down automatically. Every
+    // answered call stays bridged and the agent decides what to do with it. We
+    // only record the classification for history/labels and count MD for the Live
+    // stats tab's visibility.
     if (event === 'call.machine.premium.detection.ended' && role === 'lead' && agentId) {
       const r = payload.result || '';
       const isHuman = r.startsWith('human') || r === 'silence' || r === 'not_sure';   // TCPA-safe: keep ambiguous
       const st = rt[agentId];
-      if (isHuman) {
-        // Already talking. Record the classification for history; leave the call up.
-        if (ccid) saveCall({ telnyx_call_control_id: ccid, amd_result: r }, 'call-amd-human');
-        return;
+      if (!isHuman) {
+        const pid = (st && st.pending && st.pending[ccid] && st.pending[ccid].playlistId)
+          || (st && st.leadLeg === ccid ? st.leadPlaylistId : null);
+        plStat(pid).md++;   // informational only — no teardown, agent stays on the call
       }
-      // Machine: hang up this leg whether it was bridged or still ringing, mark the
-      // lead, and return the agent straight to AVAILABLE (no wrap-up for a machine).
-      const pid = (st && st.pending && st.pending[ccid] && st.pending[ccid].playlistId)
-        || (st && st.leadLeg === ccid ? st.leadPlaylistId : null);
-      plStat(pid).md++;
-      const wasConnected = st && st.leadLeg === ccid;
-      if (st && st.pending) delete st.pending[ccid];
-      if (wasConnected) { st.leadLeg = null; st.leadId = null; st.leadNumber = null; st.fromNumber = null; st.leadPlaylistId = null; st.onCallSince = null; }
-      await telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
-      if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
-      if (ccid) saveCall({ telnyx_call_control_id: ccid, amd_result: r }, 'call-amd-machine');
-      if (wasConnected && st && st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
-      console.log(`[bridge] machine leg dropped agent ${agentId.slice(0, 8)} (result=${r})`);
+      if (ccid) saveCall({ telnyx_call_control_id: ccid, amd_result: r },
+        isHuman ? 'call-amd-human' : 'call-amd-machine');
       return;
     }
 
