@@ -418,6 +418,10 @@
         </div>
         <div id="padWrap" class="mt3 hidden">
           <div id="padDialRow" style="margin-bottom:8px">
+            <div style="display:flex;gap:6px;margin-bottom:6px">
+              <select id="padFrom" class="field" style="flex:1;font-family:var(--font-mono)"></select>
+              <button id="padLock" class="btn btn-sm" style="white-space:nowrap">Lock it</button>
+            </div>
             <input id="padNum" class="field" placeholder="Enter number to call" inputmode="tel" style="width:100%;font-family:var(--font-mono)">
           </div>
           <div class="dialpad">
@@ -992,7 +996,33 @@ function toggleMute(){ if(!agentCall) return; muted=!muted; try{ muted?agentCall
   $('cMute').classList.toggle('active',muted); $('cMute').querySelector('span:last-child').textContent=muted?'Unmute':'Mute'; }
 $('cHold').onclick=async()=>{ held=!held; try{ await apiJson('/api/agent/hold','POST',{on:held}); }catch(e){ held=!held; toast(e.message,'err'); return; }
   $('cHold').classList.toggle('active',held); $('cHold').querySelector('span:last-child').textContent=held?'Resume':'Hold'; };
-$('cPad').onclick=()=>$('padWrap').classList.toggle('hidden');
+$('cPad').onclick=()=>{ $('padWrap').classList.toggle('hidden'); if(!$('padWrap').classList.contains('hidden')&&!callerIds.length) loadCallerIds(); };
+
+// Manual-dial caller ID: agents pick a number, press "Lock it", and every manual
+// call goes out from it until they press Change and lock another one.
+let callerIds=[], lockedFrom=null;
+async function loadCallerIds(){
+  try{ const j=await apiJson('/api/agent/caller-ids'); callerIds=j.numbers||[]; lockedFrom=j.locked||null; renderPadFrom(); }
+  catch(e){ toast(e.message,'err'); }
+}
+function renderPadFrom(){
+  const sel=$('padFrom');
+  sel.innerHTML='<option value="">Caller ID…</option>'+callerIds.map(n=>`<option value="${n}"${n===lockedFrom?' selected':''}>${n}</option>`).join('');
+  sel.disabled=!!lockedFrom;
+  const b=$('padLock');
+  b.textContent=lockedFrom?'Change':'Lock it';
+  b.classList.toggle('active',!!lockedFrom);
+}
+$('padLock').onclick=async()=>{
+  if(lockedFrom){ // unlock so the agent can pick another number
+    try{ await apiJson('/api/agent/caller-id','POST',{number:null}); }catch(e){ toast(e.message,'err'); return; }
+    lockedFrom=null; renderPadFrom(); return;
+  }
+  const n=$('padFrom').value;
+  if(!n){ toast('Pick a caller ID first','warn'); return; }
+  try{ await apiJson('/api/agent/caller-id','POST',{number:n}); lockedFrom=n; renderPadFrom(); toast('Caller ID locked: '+n,'ok'); }
+  catch(e){ toast(e.message,'err'); }
+};
 $('cHang').onclick=async()=>{ try{ await apiJson('/api/agent/hangup','POST',{}); }catch(e){ toast(e.message,'err'); } };
 document.querySelectorAll('.dialpad button').forEach(b=>b.onclick=async()=>{
   if(serverState==='ON_CALL'){
@@ -1005,6 +1035,7 @@ $('padCall').onclick=async()=>{
   const raw=$('padNum').value.trim();
   const digits=raw.replace(/[^\d+]/g,'');
   if(digits.replace(/\D/g,'').length<10){ toast('Enter a valid phone number','warn'); return; }
+  if(!lockedFrom){ toast('Pick a caller ID and press Lock it first','warn'); return; }
   $('padCall').disabled=true;
   try{
     await apiJson('/api/agent/manual-dial','POST',{phone:digits});

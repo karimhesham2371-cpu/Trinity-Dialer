@@ -162,6 +162,24 @@ async function loadPlaylistStats() {
 // Discovered outbound caller-ID pool (refreshed from Telnyx).
 let CALLER_POOL = CALLER_IDS_ENV.slice();
 
+// Per-agent manual-dial caller-ID lock (app_settings key 'caller_locks' so a
+// redeploy doesn't drop an agent's chosen number mid-shift). agentId -> +E164.
+let CALLER_LOCKS = {};
+function saveCallerLocks() {
+  if (!SB_HOST) return;
+  sbReq('POST', 'app_settings?on_conflict=key',
+    { key: 'caller_locks', value: CALLER_LOCKS, updated_at: new Date().toISOString() },
+    'resolution=merge-duplicates,return=minimal')
+    .catch(e => console.error('[callerLocks:save]', e.message));
+}
+async function loadCallerLocks() {
+  try {
+    const rows = await sbSelect('app_settings', 'key=eq.caller_locks&select=value');
+    const v = rows && rows[0] && rows[0].value;
+    if (v && typeof v === 'object') CALLER_LOCKS = v;
+  } catch (e) { console.error('[callerLocks:load]', e.message); }
+}
+
 // Per-state lead-local calling window (ReadyMode-style compliance). Each US state
 // maps to its own timezone; the admin can disable a state entirely or override its
 // start/end time, else it inherits the queue-default window. Cached from
@@ -2791,6 +2809,35 @@ app.post('/api/agent/hangup', auth, async (req, res) => {
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
+// Every number the dialer owns, for the manual-dial "call from" picker: the live
+// Telnyx caller pool merged with the imported DID list (covers env-pinned pools
+// that hide some owned numbers). Also returns this agent's current lock.
+app.get('/api/agent/caller-ids', auth, async (req, res) => {
+  try {
+    const dids = await sbSelect('dids', 'select=phone_number').catch(() => []);
+    const all = [...new Set([...CALLER_POOL, ...(dids || []).map(d => d.phone_number).filter(Boolean)])].sort();
+    res.json({ numbers: all, locked: CALLER_LOCKS[req.user.id] || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Lock (or clear, with number:null) the caller ID this agent dials manually from.
+// The lock sticks for the whole dialing session — across calls and redeploys —
+// until the agent changes it.
+app.post('/api/agent/caller-id', auth, async (req, res) => {
+  const num = req.body && req.body.number ? normPhone(String(req.body.number)) : null;
+  if (num) {
+    const dids = await sbSelect('dids', 'select=phone_number').catch(() => []);
+    const all = new Set([...CALLER_POOL, ...(dids || []).map(d => d.phone_number)]);
+    if (!all.has(num)) return res.status(400).json({ error: 'that number is not in the dialer pool' });
+    CALLER_LOCKS[req.user.id] = num;
+  } else {
+    delete CALLER_LOCKS[req.user.id];
+  }
+  saveCallerLocks();
+  audit(req.user, 'LOCK_CALLER_ID', { target_type: 'agent', meta: { number: num } });
+  res.json({ ok: true, locked: num });
+});
+
 // Manual outbound: agent types any number on the dialpad and calls it (e.g. to
 // reach someone back). DNC is still enforced; if the number matches a known lead
 // the call is attached to it so history/disposition work. AMD is off — the agent
@@ -2821,7 +2868,9 @@ app.post('/api/agent/manual-dial', auth, async (req, res) => {
     clearWrapTimer(st);
     const [lead] = await sbSelect('leads',
       `phone=eq.${encodeURIComponent(phone)}&select=*&order=created_at.desc&limit=1`).catch(() => []);
-    const from = pickCallerId(areaCodeOf(phone));
+    // Manual calls go out from the agent's locked caller ID (chosen + locked on
+    // the dialpad); fall back to the area-code match only if nothing is locked.
+    const from = CALLER_LOCKS[id] || pickCallerId(areaCodeOf(phone));
     const cid = crypto.randomUUID();
     const result = await telnyx('POST', '/calls', {
       connection_id: CONNECTION_ID, to: phone, from,
@@ -4753,6 +4802,7 @@ server.listen(PORT, async () => {
   await loadCallingWindow();
   await loadDialerConfig();
   await loadPlaylistStats();
+  await loadCallerLocks();
   await loadCallPolicy();
   await loadAiConfig();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
