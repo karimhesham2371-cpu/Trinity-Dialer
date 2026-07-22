@@ -134,6 +134,66 @@ const DEFAULT_DISPOSITIONS = [
 const AGENT_HIDDEN_DISPOSITIONS = new Set(['AUTO_ANSWERING_MACHINE', 'AMD_MISS', 'NOTE']);
 const DEFAULT_RECYCLE = { no_answer: { hours: 4, max: 5 }, busy: { minutes: 20, max: 8 } };
 
+// ── System-outcome list recycling (admin-editable, app_settings key "recycle") ──
+// When a dial ends WITHOUT reaching a human (ring-out / busy / voicemail), the
+// lead is re-queued for another round instead of being retired — up to
+// max_rounds attempts, spaced by delay_minutes — matching ReadyMode's "keep
+// dialing the no-answers up to N rounds". One global setting for all campaigns.
+const RECYCLE_DEFAULT = {
+  no_answer: { delay_minutes: 240, max_rounds: 11 },  // ring-out / no pickup
+  busy:      { delay_minutes: 20,  max_rounds: 11 },  // line busy → retry sooner
+  voicemail: { delay_minutes: 360, max_rounds: 5  },  // reached a machine
+  positive_dnc_days: 90,                              // Lead/Sale → DNC this long, then auto-removed
+};
+let RECYCLE = JSON.parse(JSON.stringify(RECYCLE_DEFAULT));
+async function loadRecycle() {
+  try {
+    const rows = await sbSelect('app_settings', 'key=eq.recycle&select=value');
+    const v = rows && rows[0] && rows[0].value;
+    const rule = (r, d) => ({
+      delay_minutes: Math.max(1, Math.min(43200, parseInt(r && r.delay_minutes, 10) || d.delay_minutes)),
+      max_rounds:    Math.max(1, Math.min(50,    parseInt(r && r.max_rounds, 10)    || d.max_rounds)),
+    });
+    RECYCLE = v ? {
+      no_answer: rule(v.no_answer, RECYCLE_DEFAULT.no_answer),
+      busy:      rule(v.busy,      RECYCLE_DEFAULT.busy),
+      voicemail: rule(v.voicemail, RECYCLE_DEFAULT.voicemail),
+      positive_dnc_days: Math.max(1, Math.min(3650, parseInt(v.positive_dnc_days, 10) || RECYCLE_DEFAULT.positive_dnc_days)),
+    } : JSON.parse(JSON.stringify(RECYCLE_DEFAULT));
+    POLICY.positive_dnc_days = RECYCLE.positive_dnc_days;   // single source of truth for the DNC-expiry
+  } catch (e) { console.error('[recycle-load]', e.message); }
+}
+// Classify a Telnyx hangup_cause for an unbridged (no-human) call.
+function outcomeKindFromCause(cause) {
+  const c = String(cause || '').toLowerCase();
+  if (/busy/.test(c)) return 'busy';
+  if (/unallocated|no_route|invalid|does_not_exist|number_changed|no_such/.test(c)) return 'bad_number';
+  return 'no_answer';
+}
+// Re-queue a lead that a dial didn't connect (no-answer/busy/voicemail): bump it
+// back to NEW with a future next_callback_at until it hits max_rounds, then
+// retire it EXHAUSTED. Guarded on status=IN_PROGRESS so it never clobbers a
+// disposition/callback that landed first. Bad numbers are retired immediately.
+async function recycleSystemOutcome(leadId, kind) {
+  if (!leadId) return;
+  try {
+    if (kind === 'bad_number') {
+      await sbUpdate('leads', `id=eq.${leadId}&status=eq.IN_PROGRESS`, { status: 'BAD_NUMBER', last_outcome: 'bad_number' });
+      return;
+    }
+    const rows = await sbSelect('leads', `id=eq.${leadId}&select=attempts,status`);
+    const lead = rows && rows[0];
+    if (!lead || lead.status !== 'IN_PROGRESS') return;   // already coded / moved on
+    const r = RECYCLE[kind] || RECYCLE.no_answer;
+    if ((lead.attempts || 0) >= r.max_rounds) {
+      await sbUpdate('leads', `id=eq.${leadId}&status=eq.IN_PROGRESS`, { status: 'EXHAUSTED', last_outcome: kind });
+    } else {
+      const next = new Date(Date.now() + r.delay_minutes * 60000).toISOString();
+      await sbUpdate('leads', `id=eq.${leadId}&status=eq.IN_PROGRESS`, { status: 'NEW', next_callback_at: next, last_outcome: kind });
+    }
+  } catch (e) { console.error('[recycle]', e.message); }
+}
+
 // ── Disposition → DNC / recycle policy (Karim's rules) ────────────────────────
 //  • Sale / appointment (positive outcome): DNC for 90 days, then auto-removed.
 //  • DNC disposition: permanent DNC, only an admin can clear it.
@@ -2098,6 +2158,38 @@ app.put('/api/admin/settings/call-policy', auth, adminOnly, async (req, res) => 
     audit(req.user, 'EDIT_CALL_POLICY', { target_type: 'settings', meta: { code, ...dispositions[code] } });
     res.json({ ok: true, code, policy: dispositions[code] });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Call-result recycling — the global no-answer/busy/voicemail redial rounds +
+// positive-result DNC days (ReadyMode-style "Edit call results" for the system
+// outcomes). One setting for all campaigns.
+app.get('/api/admin/settings/recycle', auth, adminOnly, (_req, res) => {
+  res.json({ recycle: RECYCLE, defaults: RECYCLE_DEFAULT });
+});
+app.put('/api/admin/settings/recycle', auth, adminOnly, async (req, res) => {
+  const b = req.body || {};
+  const rule = (r, d) => {
+    const dm = parseInt(r && r.delay_minutes, 10), mr = parseInt(r && r.max_rounds, 10);
+    if (!(dm >= 1 && dm <= 43200)) throw new Error('delay_minutes must be 1–43200');
+    if (!(mr >= 1 && mr <= 50))    throw new Error('max_rounds must be 1–50');
+    return { delay_minutes: dm, max_rounds: mr };
+  };
+  try {
+    const dncDays = parseInt(b.positive_dnc_days, 10);
+    if (!(dncDays >= 1 && dncDays <= 3650)) return res.status(400).json({ error: 'positive_dnc_days must be 1–3650' });
+    const value = {
+      no_answer: rule(b.no_answer, RECYCLE_DEFAULT.no_answer),
+      busy:      rule(b.busy,      RECYCLE_DEFAULT.busy),
+      voicemail: rule(b.voicemail, RECYCLE_DEFAULT.voicemail),
+      positive_dnc_days: dncDays,
+    };
+    await sbReq('POST', 'app_settings?on_conflict=key',
+      { key: 'recycle', value, updated_at: new Date().toISOString() },
+      'resolution=merge-duplicates,return=minimal');
+    RECYCLE = value; POLICY.positive_dnc_days = dncDays;
+    audit(req.user, 'EDIT_RECYCLE', { target_type: 'settings', meta: value });
+    res.json({ ok: true, recycle: RECYCLE });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // AI Cold Caller — master config. GET returns the config plus the campaign and
@@ -4608,8 +4700,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         const info = st.pending[ccid]; delete st.pending[ccid];
         if (ccid) saveCall({ telnyx_call_control_id: ccid,
           ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }, 'call-ended-pending');
-        if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
-          { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+        if (info.leadId) recycleSystemOutcome(info.leadId, outcomeKindFromCause(payload.hangup_cause)).catch(() => {});
         const idle = !st.leadLeg && Object.keys(st.pending).length === 0;
         if (idle && st.state === 'DIALING') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
         return;
@@ -4645,9 +4736,10 @@ app.post('/webhooks/telnyx', async (req, res) => {
             }
           }
         } else {
-          // Never reached a human (no-answer/machine). System dispositions, auto-advance.
+          // Never reached a human (no-answer / machine). Recycle for another
+          // round instead of retiring the lead after one ring.
           if (cs && cs.leadId)
-            sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.IN_PROGRESS`, { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+            recycleSystemOutcome(cs.leadId, outcomeKindFromCause(payload.hangup_cause)).catch(() => {});
           st.leadId = null;
           if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
           console.log(`[bridge] no-answer, agent ${agentId.slice(0, 8)} AVAILABLE`);
@@ -4763,10 +4855,12 @@ async function reaperTick() {
         }
       }
     }
-    // 2) Requeue leads stuck IN_PROGRESS (dialer died mid-call).
+    // 2) Requeue leads stuck IN_PROGRESS (dialer died mid-call) back into the
+    // recycle pool (NEW + short delay) instead of retiring them as NO_ANSWER.
     const cutoff = new Date(now - REAP_LEAD_MS).toISOString();
+    const reNext = new Date(now + RECYCLE.no_answer.delay_minutes * 60000).toISOString();
     await sbUpdate('leads', `status=eq.IN_PROGRESS&last_attempt_at=lt.${cutoff}`,
-      { status: 'NO_ANSWER', last_outcome: 'reaper_timeout' }).catch(() => {});
+      { status: 'NEW', next_callback_at: reNext, last_outcome: 'reaper_timeout' }).catch(() => {});
     // 3) Prune webhook idempotency rows older than 24h.
     const dayAgo = new Date(now - 24 * 3600 * 1000).toISOString();
     sbDelete('webhook_events', `received_at=lt.${dayAgo}`).catch(() => {});
@@ -4959,6 +5053,7 @@ server.listen(PORT, async () => {
   await loadPlaylistStats();
   await loadCallerLocks();
   await loadCallPolicy();
+  await loadRecycle();   // after call-policy: owns positive_dnc_days
   await loadAiConfig();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
   {
@@ -4980,6 +5075,7 @@ server.listen(PORT, async () => {
   setInterval(loadDialerConfig, 60 * 1000);
   setInterval(savePlaylistStats, 15 * 1000);   // durable Live stats — survive redeploys
   setInterval(loadCallPolicy, 60 * 1000);
+  setInterval(loadRecycle, 60 * 1000);
   setInterval(loadAiConfig, 60 * 1000);
   sweepExpiredDnc();
   setInterval(sweepExpiredDnc, 10 * 60 * 1000);   // auto-remove expired (e.g. 90-day) DNC entries

@@ -538,6 +538,7 @@
       <button class="navtab" data-lt="fields" onclick="leadTab('fields')">Custom fields</button>
       <button class="navtab" data-lt="dnc" onclick="leadTab('dnc')">DNC list</button>
       <button class="navtab" data-lt="window" onclick="leadTab('window')">Calling window</button>
+      <button class="navtab" data-lt="recycle" onclick="leadTab('recycle')">Call results</button>
       <button class="navtab" data-lt="stats" onclick="leadTab('stats')">Live stats</button>
     </div>
     <div id="ldBody"></div>
@@ -2170,7 +2171,7 @@ function leadTab(t){
   $('ldSub').querySelectorAll('[data-lt]').forEach(b=>b.classList.toggle('active', b.dataset.lt===t));
   const body=$('ldBody'); body.innerHTML='<p class="dim">Loading…</p>';
   if(!ldCampId && ['import','script','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
-  ({import:renderImport,script:renderScriptAdmin,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow,stats:renderPlaylistStats}[t]||(()=>{}))();
+  ({import:renderImport,script:renderScriptAdmin,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow,recycle:renderRecycle,stats:renderPlaylistStats}[t]||(()=>{}))();
 }
 
 // ── Global lead search ──
@@ -3021,6 +3022,46 @@ async function renderWindow(){
       d.policy=j.policy;
       $('cpMsg').innerHTML=`<b style="color:var(--ok)">Saved “${esc(d.label)}” — recycle ${j.policy.recycle_window_days}d · ${j.policy.neg_strike_limit} strikes → DNC · redial every ${j.policy.neg_redial_hours}h</b>`; }
     catch(e){ $('cpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  };
+}
+
+// ── Call results: system-outcome list recycling (global) ──
+// Controls how leads that DIDN'T reach a human get re-dialed: no-answer / busy /
+// voicemail each get a re-dial delay + a max number of rounds. Plus the DNC
+// expiry for positive results (Lead/Sale).
+async function renderRecycle(){
+  let r={no_answer:{delay_minutes:240,max_rounds:11},busy:{delay_minutes:20,max_rounds:11},voicemail:{delay_minutes:360,max_rounds:5},positive_dnc_days:90};
+  try{ const j=await apiJson('/api/admin/settings/recycle'); r=j.recycle||r; }catch(e){}
+  const fmtDelay=(mins)=>{ if(mins>=1440&&mins%1440===0)return (mins/1440)+' day'+(mins/1440>1?'s':''); if(mins>=60&&mins%60===0)return (mins/60)+' hour'+(mins/60>1?'s':''); return mins+' min'; };
+  const row=(key,title,desc)=>`<tr>
+      <td><div style="font-weight:600">${title}</div><div class="dim" style="font-size:12px">${desc}</div></td>
+      <td><input id="rc_${key}_delay" class="field" type="number" min="1" max="43200" value="${r[key].delay_minutes}" style="width:110px"><div class="dim mono" style="font-size:11px" id="rc_${key}_dlbl">${fmtDelay(r[key].delay_minutes)}</div></td>
+      <td><input id="rc_${key}_max" class="field" type="number" min="1" max="50" value="${r[key].max_rounds}" style="width:90px"></td>
+    </tr>`;
+  $('ldBody').innerHTML=`<div class="card" style="max-width:720px"><h2>Call result recycling</h2>
+    <p class="dim" style="font-size:13px">When a dial <b>doesn't reach a person</b>, the lead is re-queued and dialed again — up to <b>Max rounds</b> times, each round waiting <b>Re-dial after</b>. After the last round the lead is retired (Exhausted). Answered calls are handled by the agent's disposition instead. One global setting for every campaign. The calling window and DNC list are always still enforced.</p>
+    <div class="tblwrap mt3"><table class="wbtbl">
+      <thead><tr><th>Call result</th><th>Re-dial after (minutes)</th><th>Max rounds</th></tr></thead>
+      <tbody>
+        ${row('no_answer','No answer','Rang out — nobody picked up')}
+        ${row('busy','Busy','Line was busy — retry sooner')}
+        ${row('voicemail','Voicemail / machine','Reached an answering machine')}
+      </tbody></table></div>
+    <div class="row mt3" style="gap:12px;align-items:flex-end">
+      <div class="fw"><span class="lbl">Positive result (Lead / Sale) → DNC for (days)</span><input id="rc_dnc" class="field" type="number" min="1" max="3650" value="${r.positive_dnc_days}" style="width:130px"></div>
+      <button class="btn btn-primary" id="rcSave" style="flex:0 0 auto">Save</button>
+    </div>
+    <div class="dim mt2" style="font-size:12px">A Lead/Sale goes on the DNC list for this many days, then is auto-removed — so the same number can be re-dialed if it's uploaded again after that.</div>
+    <div id="rcMsg" class="dim mt3" style="font-size:12px"></div></div>`;
+  enhanceAll($('ldBody'));
+  ['no_answer','busy','voicemail'].forEach(k=>{ const d=$('rc_'+k+'_delay'); if(d) d.oninput=()=>{ const l=$('rc_'+k+'_dlbl'); if(l) l.textContent=fmtDelay(Math.max(1,+d.value||1)); }; });
+  $('rcSave').onclick=async()=>{
+    const pack=(k)=>({delay_minutes:+$('rc_'+k+'_delay').value, max_rounds:+$('rc_'+k+'_max').value});
+    try{
+      const j=await apiJson('/api/admin/settings/recycle','PUT',{ no_answer:pack('no_answer'), busy:pack('busy'), voicemail:pack('voicemail'), positive_dnc_days:+$('rc_dnc').value });
+      const R=j.recycle;
+      $('rcMsg').innerHTML=`<b style="color:var(--ok)">Saved — no-answer ${R.no_answer.max_rounds} rounds / ${fmtDelay(R.no_answer.delay_minutes)}, busy ${R.busy.max_rounds} / ${fmtDelay(R.busy.delay_minutes)}, voicemail ${R.voicemail.max_rounds} / ${fmtDelay(R.voicemail.delay_minutes)}, positive DNC ${R.positive_dnc_days}d</b>`;
+    }catch(e){ $('rcMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
 }
 
