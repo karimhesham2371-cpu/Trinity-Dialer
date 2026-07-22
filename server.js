@@ -924,6 +924,12 @@ async function setAgentState(id, state) {
 // so it survives a client refresh and correctly gates pacing (WRAP_UP is not
 // dialable). The client renders the countdown off `wrapUntil` in the snapshot.
 const WRAP_SHORT_SEC = 3, WRAP_LONG_SEC = 180;
+// Require a disposition on every CONNECTED call before the agent gets the next
+// one. When on, a talked call holds the agent in WRAP_UP with no auto-return
+// until they submit a disposition (the wrap timer starts only after they code
+// it). A 30-min safety cap frees an agent who clearly walked away.
+const REQUIRE_DISPOSITION = true;
+const DISP_WRAP_SAFETY_MS = 30 * 60 * 1000;
 const LONG_WRAP_RE = /appointment|appt|(^|[^a-z])sale([^a-z]|$)|(^|[^a-z])lead([^a-z]|$)/i;
 function wrapSecondsFor(disp) {
   if (!disp) return WRAP_SHORT_SEC;
@@ -1077,7 +1083,7 @@ function agentSnapshot(id) {
   const st = rt[id] || { state: 'OFFLINE' };
   return { agentId: id, state: st.state, leadId: st.leadId || null, leadNumber: st.leadNumber || null,
            fromNumber: st.fromNumber || null, onCallSince: st.onCallSince || null, wrapUntil: st.wrapUntil || null,
-           stateSince: st.stateStart || null };
+           dispRequired: !!st.awaitingDisp, stateSince: st.stateStart || null };
 }
 // Push one agent's state to that agent and to every admin (floor view).
 function wsAgentSnapshot(id) {
@@ -2996,6 +3002,9 @@ app.post('/api/agent/aux', auth, async (req, res) => {
   }
   if (st.state === 'ON_CALL')
     return res.status(409).json({ error: 'busy on a call' });
+  // Enforcement: can't go Available with a connected call still uncoded.
+  if (want === 'AVAILABLE' && st.awaitingDisp)
+    return res.status(409).json({ error: 'Disposition required — code this call before continuing.' });
   if (['DIALING', 'CLAIMING'].includes(st.state)) {
     // Waiting between calls with background dials in flight. Ready is a no-op
     // (already in the dial pool). Break cancels the pending legs and requeues
@@ -3222,6 +3231,7 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
     // (appointment / sale / lead) so the agent can finish paperwork.
     let wrapSec = WRAP_SHORT_SEC;
     if (st) {
+      st.awaitingDisp = false;   // call is now coded — release the enforcement hold
       if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});
       st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
       if (st.state !== 'OFFLINE' && st.conferenceId) {
@@ -4618,11 +4628,22 @@ app.post('/webhooks/telnyx', async (req, res) => {
           if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
           console.log(`[bridge] inbound ended, agent ${agentId.slice(0, 8)} AVAILABLE`);
         } else if (talked) {
-          // Automated wrap-up: hold WRAP_UP with a 3s auto-return; keep leadId so
-          // /api/agent/context + /disposition resolve the right lead. A positive
-          // disposition (appointment/sale/lead) extends the window to 3 minutes.
-          if (st.state !== 'OFFLINE') { st.state = 'WRAP_UP'; await setAgentState(agentId, 'WRAP_UP'); scheduleWrapReturn(agentId, WRAP_SHORT_SEC); }
-          console.log(`[bridge] call ended (talked), agent ${agentId.slice(0, 8)} WRAP_UP (${WRAP_SHORT_SEC}s)`);
+          // Talked to a human → WRAP_UP, keeping leadId so /context + /disposition
+          // resolve the right lead. When REQUIRE_DISPOSITION is on we do NOT start
+          // an auto-return: the agent is held (awaitingDisp) until they code the
+          // call — the wrap timer starts only after they submit. Otherwise fall
+          // back to the old 3s auto-advance.
+          if (st.state !== 'OFFLINE') {
+            st.state = 'WRAP_UP'; await setAgentState(agentId, 'WRAP_UP');
+            if (REQUIRE_DISPOSITION) {
+              clearWrapTimer(st); st.awaitingDisp = true; st.wrapEnteredAt = Date.now();
+              wsAgentSnapshot(agentId);   // push dispRequired so the client blocks Ready
+              console.log(`[bridge] call ended (talked), agent ${agentId.slice(0, 8)} WRAP_UP — awaiting disposition`);
+            } else {
+              scheduleWrapReturn(agentId, WRAP_SHORT_SEC);
+              console.log(`[bridge] call ended (talked), agent ${agentId.slice(0, 8)} WRAP_UP (${WRAP_SHORT_SEC}s)`);
+            }
+          }
         } else {
           // Never reached a human (no-answer/machine). System dispositions, auto-advance.
           if (cs && cs.leadId)
@@ -4706,9 +4727,20 @@ async function reaperTick() {
         st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
         await setAgentState(id, st.state);
       }
+      // Agent held in WRAP_UP awaiting a required disposition: leave them there
+      // (that's the enforcement) UNLESS they've clearly walked away — a 30-min
+      // safety cap frees them so they aren't wedged for the rest of the shift.
+      if (st.state === 'WRAP_UP' && st.awaitingDisp) {
+        if (st.wrapEnteredAt && (now - st.wrapEnteredAt) > DISP_WRAP_SAFETY_MS) {
+          console.log(`[reaper] agent ${id.slice(0,8)} awaiting disposition >30min -> freeing (uncoded call)`);
+          st.awaitingDisp = false; st.leadId = null;
+          st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
+          await setAgentState(id, st.state);
+        }
+      }
       // WRAP_UP whose auto-return timer is gone (lost setTimeout) and whose
       // deadline has clearly passed -> free the agent instead of stranding them.
-      if (st.state === 'WRAP_UP' && !st.wrapTimer && (!st.wrapUntil || now > st.wrapUntil + 10000)) {
+      else if (st.state === 'WRAP_UP' && !st.wrapTimer && (!st.wrapUntil || now > st.wrapUntil + 10000)) {
         console.log(`[reaper] agent ${id.slice(0,8)} stuck in WRAP_UP -> freeing`);
         st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
         await setAgentState(id, st.state);

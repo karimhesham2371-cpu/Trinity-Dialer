@@ -385,6 +385,7 @@
         <span id="bannerDot" class="dot dot--faint"></span>
         <div><div id="bannerState" class="big">Waiting</div><div id="bannerSub" class="dim" style="font-size:12px">Auto-dial runs when you go available.</div></div>
         <div class="sp" style="flex:1"></div>
+        <span id="recInd" class="hidden" style="display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--danger);margin-right:12px"><span class="dot dot--danger dot--pulse"></span>REC</span>
         <div id="timer" class="timer hidden">00:00</div>
       </div>
 
@@ -432,6 +433,18 @@
             <button>*</button><button>0</button><button>#</button>
           </div>
           <button id="padCall" class="btn btn-primary btn-block mt2">Call</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <p class="panelTitle" style="display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="$('audioBody').classList.toggle('hidden')">Audio <span class="dim" style="font-size:11px">⚙</span></p>
+        <div id="audioBody" class="hidden">
+          <label class="lbl">Speaker</label>
+          <select id="devSpeaker" class="field" style="width:100%"></select>
+          <label class="lbl mt2">Microphone</label>
+          <select id="devMic" class="field" style="width:100%"></select>
+          <label class="lbl mt2">Volume <span id="volPct" class="mono dim">100%</span></label>
+          <input id="volSlider" type="range" min="0" max="100" value="100" style="width:100%">
         </div>
       </div>
 
@@ -584,6 +597,9 @@ let client=null, ws=null, serverState='OFFLINE', usersCache=[];
 // consults it so a reconnect/refresh restores server state instead of forcing
 // the agent available. (Fixes agents being pulled off Break by a network blip.)
 let intendAvailable=false;
+// True while the server is holding this agent in WRAP_UP until they code the
+// current call (disposition-required enforcement).
+let dispRequiredNow=false;
 let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null, serverWrapUntil=0;
 let dispositions=[], curCampaign=null, pendingCb=null;
 let waitSince=0;   // when the agent last entered a waiting state (drives the wait counter)
@@ -711,7 +727,7 @@ $('liPass').addEventListener('keydown', e=>{ if(e.key==='Enter') $('btnLogin').c
 function route(){
   if(!TOKEN||!USER){ show('login'); return; }
   if(USER.role==='admin'||USER.role==='support'){ show('admin'); $('adWho').textContent=USER.name+' · '+USER.email; loadAdmin(); }
-  else { show('agent'); $('agWho').textContent=USER.name; startAgent(); }
+  else { show('agent'); $('agWho').textContent=USER.name; initAudioSettings(); startAgent(); }
 }
 
 // ═══════════ AGENT ═══════════
@@ -783,13 +799,28 @@ function applyState(s, snap){
   if(snap&&snap.onCallSince) onCallSince=snap.onCallSince;
   if(snap&&snap.wrapUntil) serverWrapUntil=snap.wrapUntil;
 
+  const recEl=$('recInd'); if(recEl) recEl.classList.toggle('hidden', s!=='ON_CALL');   // all calls are recorded
   if(s==='ON_CALL'){ $('bannerState').textContent='Connected — live'; $('bannerSub').textContent='Speak now.'; $('timer').style.color='var(--ok)'; startTimer(); loadContext(); if(prev!=='ON_CALL') beep(); }
   // Background dialing (ReadyMode-style): the lead is dialed silently and the
   // agent keeps a "waiting" screen — no contact details are revealed until the
   // lead actually answers and the call goes live (ON_CALL).
   else if(s==='DIALING'||s==='CLAIMING'){ if(!isWaitState(prev)) waitSince=Date.now(); $('bannerState').textContent='Waiting for next call…'; $('bannerSub').textContent='Dialing in the background.'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL'||curLeadId) clearLead(); }
-  else if(s==='WRAP_UP'){ $('bannerState').textContent='Wrap-up'; $('bannerSub').textContent='Auto-returns to Ready when the timer ends.'; stopTimer(); $('dispReq').classList.toggle('hidden', !curLeadId); }
-  else if(s==='AVAILABLE'){ if(!isWaitState(prev)) waitSince=Date.now(); $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
+  else if(s==='WRAP_UP'){
+    stopTimer();
+    // Disposition-required hold: the server keeps the agent here (no auto-return)
+    // until they code the call. Make the requirement loud and unmissable.
+    if(snap && snap.dispRequired){
+      dispRequiredNow=true;
+      $('bannerState').textContent='Disposition required';
+      $('bannerSub').textContent='Code this call to continue to the next lead.';
+      $('dispReq').classList.remove('hidden');
+    } else {
+      dispRequiredNow=false;
+      $('bannerState').textContent='Wrap-up'; $('bannerSub').textContent='Auto-returns to Ready when the timer ends.';
+      $('dispReq').classList.toggle('hidden', !curLeadId);
+    }
+  }
+  else if(s==='AVAILABLE'){ dispRequiredNow=false; if(!isWaitState(prev)) waitSince=Date.now(); $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
   else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
   else { $('bannerState').textContent=u.txt; }
 
@@ -820,24 +851,33 @@ function scheduleSipReconnect(){
 }
 async function startAgent(){
   if(sipReconnT){ clearTimeout(sipReconnT); sipReconnT=null; }
+  if(startRetryT){ clearTimeout(startRetryT); startRetryT=null; }
   const old=client; client=null;   // detach BEFORE disconnect so its socket.close is ignored
   try{ if(old) old.disconnect(); }catch(e){}
   agentCall=null;
   applyState('CONNECTING');
   openWs();
   const TelnyxRTC = getTelnyxRTC();
-  if(!TelnyxRTC){ log('ERROR: Telnyx WebRTC SDK not loaded'); toast('Softphone SDK failed to load','err'); return; }
+  if(!TelnyxRTC){
+    // SDK didn't load from the CDN. Don't strand the agent at "Connecting" —
+    // retry with backoff (a transient CDN/network hiccup usually clears).
+    log('ERROR: Telnyx WebRTC SDK not loaded — retrying'); toast('Loading softphone…','warn');
+    scheduleStartRetry(); return;
+  }
   try {
     log('fetching softphone token…');
     const j = await apiJson('/api/agent/token');
+    startRetries=0;
     log('got token for '+j.name+', connecting…');
     const c = new TelnyxRTC({ login_token: j.login_token });
     client = c;
     client.remoteElement = 'remoteAudio';
+    applyMicToClient();   // use the agent's chosen mic for calls on this client
     client.on('telnyx.ready', async () => {
       if(client!==c) return;
       sipRetries=0;
       $('agConn').className='pill pill--ok'; $('agConn').innerHTML='<span class="dot dot--ok"></span> Softphone';
+      applyVolume(); applySpeaker(); populateAudioDevices();   // device labels are available now that mic is permitted
       // Only go AVAILABLE when the agent actually intends to be (they clicked
       // Ready). On a reconnect, browser refresh, or laptop wake we re-register
       // the softphone but ADOPT the server's authoritative state instead of
@@ -868,7 +908,55 @@ async function startAgent(){
       }
     });
     client.connect();
-  } catch(e){ log('connect failed: '+e.message); toast(e.message,'err'); }
+  } catch(e){
+    // Token fetch or SDK init failed (server waking, transient 5xx, network).
+    // Retry with backoff instead of leaving the agent stuck on "Connecting".
+    log('connect failed: '+e.message+' — retrying'); toast('Connecting… (retrying)','warn');
+    scheduleStartRetry();
+  }
+}
+// Backoff retry for the go-available/token path (distinct from softphone
+// socket-drop reconnect). Capped so it keeps trying all shift without hammering.
+let startRetries=0, startRetryT=null;
+function scheduleStartRetry(){
+  if(startRetryT || !TOKEN) return;
+  const delay=Math.min(20000, 1500*Math.pow(2, startRetries++));
+  startRetryT=setTimeout(()=>{ startRetryT=null; if(TOKEN) startAgent(); }, delay);
+}
+
+// ── Audio: output volume + speaker/mic device selection ─────────────────────
+// Preferences persist per-browser. Speaker uses HTMLMediaElement.setSinkId
+// (Chromium); mic is applied to the Telnyx client for the next call and, if
+// possible, to the live call. Device labels only appear after mic permission
+// is granted (i.e. once the softphone has gone available).
+const AUDIO_PREF = { spk: localStorage.getItem('trinity_spk')||'', mic: localStorage.getItem('trinity_mic')||'', vol: Number(localStorage.getItem('trinity_vol')||100) };
+function applyVolume(){ const a=$('remoteAudio'); if(a) a.volume=Math.max(0,Math.min(1,AUDIO_PREF.vol/100)); const p=$('volPct'); if(p) p.textContent=AUDIO_PREF.vol+'%'; const s=$('volSlider'); if(s&&document.activeElement!==s) s.value=AUDIO_PREF.vol; }
+async function applySpeaker(){ const a=$('remoteAudio'); if(a && AUDIO_PREF.spk && a.setSinkId){ try{ await a.setSinkId(AUDIO_PREF.spk); }catch(e){ log('speaker set failed: '+e.message); } } }
+function applyMicToClient(){ if(client && AUDIO_PREF.mic){ try{ client.micId=AUDIO_PREF.mic; }catch(e){} } }
+async function populateAudioDevices(){
+  try{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.enumerateDevices) return;
+    const devs=await navigator.mediaDevices.enumerateDevices();
+    const spk=$('devSpeaker'), mic=$('devMic'); if(!spk||!mic) return;
+    const fill=(sel,kind,cur,dflt)=>{ const list=devs.filter(d=>d.kind===kind);
+      sel.innerHTML=`<option value="">${dflt}</option>`+list.map((d,i)=>`<option value="${d.deviceId}">${esc(d.label||('Device '+(i+1)))}</option>`).join('');
+      if(cur) sel.value=cur; };
+    fill(spk,'audiooutput',AUDIO_PREF.spk,'System default'); fill(mic,'audioinput',AUDIO_PREF.mic,'System default');
+    if(!$('remoteAudio').setSinkId){ spk.disabled=true; spk.innerHTML='<option>Output switch not supported</option>'; }
+  }catch(e){ log('device list failed: '+e.message); }
+}
+let _audioWired=false;
+function initAudioSettings(){
+  applyVolume();
+  if(!_audioWired){
+    _audioWired=true;
+    const s=$('volSlider'); if(s) s.oninput=()=>{ AUDIO_PREF.vol=Number(s.value); localStorage.setItem('trinity_vol',AUDIO_PREF.vol); applyVolume(); };
+    const spk=$('devSpeaker'); if(spk) spk.onchange=async()=>{ AUDIO_PREF.spk=spk.value; localStorage.setItem('trinity_spk',AUDIO_PREF.spk); await applySpeaker(); toast('Speaker updated'); };
+    const mic=$('devMic'); if(mic) mic.onchange=()=>{ AUDIO_PREF.mic=mic.value; localStorage.setItem('trinity_mic',AUDIO_PREF.mic); applyMicToClient();
+      try{ if(agentCall&&agentCall.setAudioInDevice) agentCall.setAudioInDevice(AUDIO_PREF.mic); }catch(e){} toast('Microphone updated'); };
+    if(navigator.mediaDevices&&navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener('devicechange', populateAudioDevices);
+  }
+  populateAudioDevices();
 }
 
 async function loadContext(){
@@ -976,7 +1064,11 @@ async function chooseDisposition(d){
 $('cbSave').onclick=async()=>{ if(!pendingCb) return; const v=$('cbTime').value; if(!v){toast('Pick a time','warn');return;}
   await submitDisposition(pendingCb.code, new Date(v).toISOString()); $('cbWrap').classList.add('hidden'); pendingCb=null; };
 
+let dispSubmitting=false;
 async function submitDisposition(code, callback_at){
+  if(dispSubmitting) return;   // guard against double-submit (fast double-tap / hotkey)
+  dispSubmitting=true;
+  document.querySelectorAll('#dispGrid .dispBtn').forEach(b=>b.disabled=true);
   try{
     const notes=$('notes').value.trim();
     const j=await apiJson('/api/agent/disposition','POST',{code, notes, callback_at, lead_id:curLeadId});
@@ -985,7 +1077,8 @@ async function submitDisposition(code, callback_at){
     const w=$('wrapMsg'); w.classList.remove('hidden');
     w.textContent = secs>=60 ? `Wrap-up — ${Math.round(secs/60)} min for paperwork` : 'Advancing to next lead…';
     setTimeout(()=>w.classList.add('hidden'),2500);
-  }catch(e){ toast(e.message,'err'); }
+  }catch(e){ toast(e.message,'err'); document.querySelectorAll('#dispGrid .dispBtn').forEach(b=>b.disabled=false); }
+  finally{ dispSubmitting=false; }
 }
 // ── Live-call alert tone ────────────────────────────────────────────────────
 // Two quick rising beeps the instant a lead answers, so the agent looks up.
@@ -1141,11 +1234,15 @@ async function setAux(target){
   $('auxMenu').classList.add('hidden');
   if(target==='READY'){
     clearAuxTimer();
+    // Can't go Ready while a call is still uncoded — nudge the agent to disposition.
+    if(dispRequiredNow){ toast('Disposition required — code this call first.','warn'); return; }
     intendAvailable=true;   // explicit go-available intent (survives reconnects)
     // Not connected yet → do a full go-available (registers softphone).
     if(!client || serverState==='OFFLINE'){ startAgent(); return; }
     try{ await apiJson('/api/agent/aux','POST',{state:'AVAILABLE'}); }
     catch(e){
+      // Server still holding a required disposition — surface it, don't reconnect.
+      if(/disposition required/i.test(e.message||'')){ toast(e.message,'warn'); return; }
       // Server lost the softphone leg (redeploy / dropped conference): do a full
       // reconnect instead of stranding the agent on the error.
       if(/softphone not connected/i.test(e.message||'')){ toast('Reconnecting softphone…','warn'); startAgent(); return; }
