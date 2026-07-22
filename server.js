@@ -33,6 +33,7 @@ const TELNYX_KEY         = env('TELNYX_KEY');
 const CONNECTION_ID      = env('TELNYX_CONNECTION_ID');                    // Call Control app (dials leads + agent SIP)
 const CRED_CONNECTION_ID = env('TELNYX_CRED_CONNECTION_ID', '3001006440748943295'); // Credential Connection (agent WebRTC)
 const WH_TOKEN           = env('WH_TOKEN', 'trinity-2026');
+const TELNYX_PUBLIC_KEY   = env('TELNYX_PUBLIC_KEY', '');   // base64 Ed25519 key for webhook signature verification
 // AMD_MODE:
 //   'greet_first' (default) — greet the instant the line is answered, keep premium
 //        AMD running in the background; if AMD later says "machine" the call is
@@ -54,6 +55,55 @@ const CALLER_IDS_ENV     = (process.env.CALLER_IDS || '').split(',').map(s => s.
 
 const TELNYX_BASE = 'https://api.telnyx.com/v2';
 const SIP_DOMAIN  = 'sip.telnyx.com';
+
+// ── Fail-closed on forgeable secrets ──────────────────────────────────────────
+// A default JWT secret means anyone can forge admin tokens; a default webhook
+// token means anyone can POST fake call events. Refuse to boot with either so a
+// production deploy can't silently run wide open. (Set JWT_SECRET and WH_TOKEN
+// in the environment — long random strings.)
+{
+  const fatal = [];
+  if (!JWT_SECRET || JWT_SECRET === 'trinity-dev-secret-change-me') fatal.push('JWT_SECRET is unset or still the default — set a long random value');
+  // Webhooks must be protected by EITHER Ed25519 signature verification
+  // (TELNYX_PUBLIC_KEY — the strong, recommended option) OR a non-default shared
+  // token. Only fail if BOTH are missing, so setting the public key alone is
+  // enough and WH_TOKEN can stay as-is (no Telnyx webhook-URL change needed).
+  if ((!WH_TOKEN || WH_TOKEN === 'trinity-2026') && !TELNYX_PUBLIC_KEY)
+    fatal.push('Webhook auth is wide open — set TELNYX_PUBLIC_KEY (recommended) OR change WH_TOKEN from its default');
+  if (!TELNYX_KEY) fatal.push('TELNYX_KEY is required');
+  if (!SB_HOST || !SB_KEY) fatal.push('SUPABASE_HOST and SUPABASE_KEY are required');
+  if (fatal.length) {
+    console.error('[boot] FATAL — refusing to start:\n  - ' + fatal.join('\n  - '));
+    process.exit(1);
+  }
+  if (!TELNYX_PUBLIC_KEY) console.warn('[boot] WARNING: TELNYX_PUBLIC_KEY not set — webhooks fall back to shared-token auth only. Set it to verify Telnyx Ed25519 signatures.');
+}
+
+// Verify a Telnyx webhook's Ed25519 signature over `${timestamp}|${rawBody}`.
+// Telnyx sends the raw 32-byte public key base64-encoded; wrap it in the
+// standard Ed25519 SPKI DER prefix so Node's crypto can use it. Also rejects
+// stale timestamps (>5 min) to block replay. Returns true when verified.
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+function verifyTelnyxSignature(req) {
+  const sig = req.get('telnyx-signature-ed25519');
+  const ts  = req.get('telnyx-timestamp');
+  if (!sig || !ts || !req.rawBody) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  try {
+    const signed = Buffer.concat([Buffer.from(ts + '|'), req.rawBody]);
+    const pub = crypto.createPublicKey({
+      key: Buffer.concat([ED25519_SPKI_PREFIX, Buffer.from(TELNYX_PUBLIC_KEY, 'base64')]),
+      format: 'der', type: 'spki',
+    });
+    return crypto.verify(null, signed, pub, Buffer.from(sig, 'base64'));
+  } catch { return false; }
+}
+// Webhook auth: prefer the cryptographic signature when a public key is
+// configured (strong, unforgeable); otherwise fall back to the shared token.
+function webhookAuthorized(req) {
+  if (TELNYX_PUBLIC_KEY) return verifyTelnyxSignature(req);
+  return req.query.token === WH_TOKEN;
+}
 
 // Default one-click dispositions (used when a campaign hasn't customised its own).
 // outcome: final lead status. is_callback/is_dnc/recycle drive special handling.
@@ -504,9 +554,25 @@ function endAiStream(ccid) {
   if (st.telnyxWs) { try { st.telnyxWs.close(); } catch {} }
 }
 
+// A hung Telnyx/Supabase socket must never stall the pacer forever (its busy
+// flag would never clear and the whole floor stops dialing). Every outbound
+// request is bounded by an AbortController timeout — on timeout it rejects like
+// any other error, so existing try/catch + durable-outbox paths handle it.
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000);
+async function fetchT(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try { return await fetch(url, { ...opts, signal: ac.signal }); }
+  catch (e) {
+    if (e.name === 'AbortError') throw new Error(`request timed out after ${timeoutMs}ms: ${url.split('?')[0]}`);
+    throw e;
+  }
+  finally { clearTimeout(t); }
+}
+
 // ── Telnyx REST ───────────────────────────────────────────────────────────────
 async function telnyx(method, endpoint, body) {
-  const res = await fetch(`${TELNYX_BASE}${endpoint}`, {
+  const res = await fetchT(`${TELNYX_BASE}${endpoint}`, {
     method,
     headers: { 'Authorization': `Bearer ${TELNYX_KEY}`, 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
@@ -519,7 +585,7 @@ async function telnyx(method, endpoint, body) {
 
 // ── Supabase REST (PostgREST) ──────────────────────────────────────────────────
 async function sbReq(method, pathQ, body, prefer) {
-  const res = await fetch(`https://${SB_HOST}/rest/v1/${pathQ}`, {
+  const res = await fetchT(`https://${SB_HOST}/rest/v1/${pathQ}`, {
     method,
     headers: {
       'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}`,
@@ -586,7 +652,7 @@ function saveCall(patch, desc) {
 }
 // Exact row count regardless of PostgREST's default 1000-row select cap.
 async function sbCount(table, q = '') {
-  const r = await fetch(`https://${SB_HOST}/rest/v1/${table}?${q}${q ? '&' : ''}select=id`, {
+  const r = await fetchT(`https://${SB_HOST}/rest/v1/${table}?${q}${q ? '&' : ''}select=id`, {
     headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, Prefer: 'count=exact', Range: '0-0' },
   });
   const cr = r.headers.get('content-range') || '*/0';
@@ -596,7 +662,7 @@ async function sbCount(table, q = '') {
 async function sbSelectAll(table, q = '', page = 1000) {
   const out = [];
   for (let offset = 0; ; offset += page) {
-    const r = await fetch(`https://${SB_HOST}/rest/v1/${table}?${q}`, {
+    const r = await fetchT(`https://${SB_HOST}/rest/v1/${table}?${q}`, {
       headers: {
         apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`,
         Range: `${offset}-${offset + page - 1}`, 'Range-Unit': 'items',
@@ -681,7 +747,7 @@ const dec = (b64) => { if (!b64) return null; try { return JSON.parse(Buffer.fro
 function signToken(a) {
   return jwt.sign(
     { id: a.id, role: a.role, name: a.name, email: a.email, permissions: normPerms(a.permissions) },
-    JWT_SECRET, { expiresIn: '12h' });
+    JWT_SECRET, { expiresIn: '30d' });   // long-lived so a token never lapses mid-shift
 }
 
 // ── Role tiers & granular support permissions ────────────────────────────────
@@ -3997,7 +4063,9 @@ app.post('/webhooks/ai-result', async (req, res) => {
 
 // ══ WEBHOOK + BRIDGE ═════════════════════════════════════════════════════════════
 app.post('/webhooks/telnyx', async (req, res) => {
-  if (req.query.token !== WH_TOKEN) return res.sendStatus(403);
+  // Strong auth: verified Telnyx Ed25519 signature when TELNYX_PUBLIC_KEY is set,
+  // else the (now boot-enforced non-default) shared token.
+  if (!webhookAuthorized(req)) return res.sendStatus(403);
   res.sendStatus(200);
 
   const data    = (req.body && req.body.data) || {};
@@ -4600,6 +4668,7 @@ function normPhone(p) {
 // lead stuck IN_PROGRESS after a crash). This self-heals the floor every 30s.
 const REAP_DIALING_MS = 90 * 1000;      // agent dialing/claiming this long w/ no bridge -> free them
 const REAP_LEAD_MS    = 8  * 60 * 1000; // lead IN_PROGRESS this long -> requeue as NO_ANSWER
+const REAP_ONCALL_CHECK_MS = 45 * 1000; // ON_CALL longer than this -> verify with Telnyx it's still alive
 async function reaperTick() {
   if (!SB_HOST) return;
   try {
@@ -4634,6 +4703,23 @@ async function reaperTick() {
         console.log(`[reaper] agent ${id.slice(0,8)} stuck in WRAP_UP -> freeing`);
         st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
         await setAgentState(id, st.state);
+      }
+      // ON_CALL watchdog: if a lead-leg hangup webhook is ever lost, the agent
+      // is stuck ON_CALL forever (no other timeout covers this). We can't just
+      // time it out — a real call can run long — so we ASK Telnyx whether the
+      // call is still alive, and only free the agent if it's confirmed dead.
+      if (st.state === 'ON_CALL' && st.onCallSince && (now - st.onCallSince) > REAP_ONCALL_CHECK_MS) {
+        let alive = false;
+        if (st.leadLeg) {
+          try { const r = await telnyx('GET', `/calls/${st.leadLeg}`); alive = !!(r && r.data && r.data.is_alive); }
+          catch { alive = false; }   // 404 / API error => treat as gone
+        }
+        if (!alive) {
+          console.log(`[reaper] agent ${id.slice(0,8)} stuck ON_CALL (Telnyx says call is dead) -> freeing`);
+          st.leadLeg = null; st.leadNumber = null; st.fromNumber = null; st.onCallSince = null;
+          if (st.conferenceId) { st.state = 'WRAP_UP'; await setAgentState(id, 'WRAP_UP'); scheduleWrapReturn(id, WRAP_SHORT_SEC); }
+          else { st.state = 'OFFLINE'; st.leadId = null; await setAgentState(id, 'OFFLINE'); }
+        }
       }
     }
     // 2) Requeue leads stuck IN_PROGRESS (dialer died mid-call).
@@ -4792,6 +4878,34 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err && err.stack ? err.stack : err);
 });
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+// Render sends SIGTERM on every redeploy. Without draining, the durable write
+// outbox (call/disposition writes) and the latest agent runtime state are lost
+// mid-flight. On shutdown we: stop accepting new connections, persist every
+// agent's runtime row (so rehydrate is accurate), and flush the outbox until
+// empty (bounded), then exit. Idempotent + time-boxed so a stuck write can't
+// hang the shutdown past Render's kill timeout.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal} received — draining…`);
+  const hardKill = setTimeout(() => { console.error('[shutdown] drain timed out — forcing exit'); process.exit(0); }, 12000);
+  try { server.close(); } catch {}
+  try {
+    // Persist all agent runtime state so a restart rehydrates correctly.
+    await Promise.all(Object.keys(rt).map(id => persistRt(id).catch(() => {})));
+    // Flush the durable-write outbox until empty (or we run low on time).
+    const deadline = Date.now() + 9000;
+    while (writeOutbox.length && Date.now() < deadline) { await flushOutbox(); }
+    if (writeOutbox.length) console.error(`[shutdown] ${writeOutbox.length} writes still queued at exit`);
+    console.log('[shutdown] drain complete');
+  } catch (e) { console.error('[shutdown]', e.message); }
+  finally { clearTimeout(hardKill); process.exit(0); }
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
 server.listen(PORT, async () => {
   console.log(`Trinity Dialer (phase0) listening on :${PORT}`);

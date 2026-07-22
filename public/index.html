@@ -349,6 +349,7 @@
 <div id="viewAgent" class="hidden">
   <div id="reconnBanner" class="reconn hidden">Reconnecting…</div>
   <div id="kickBanner" class="reconn hidden" style="background:#dc2626"></div>
+  <div id="sessBanner" class="reconn hidden" style="background:#b45309;cursor:pointer" onclick="location.reload()">Session expired — finish your current call, then click here to sign in again.</div>
   <div class="appbar">
     <div class="brand"><div class="mark">T</div><h1>Trinity</h1></div>
     <span id="agState" class="pill pill--faint"><span class="dot dot--faint"></span> Offline</span>
@@ -578,6 +579,11 @@ const $ = (id) => document.getElementById(id);
 let TOKEN = localStorage.getItem('trinity_token') || '';
 let USER  = JSON.parse(localStorage.getItem('trinity_user') || 'null');
 let client=null, ws=null, serverState='OFFLINE', usersCache=[];
+// The agent's DESIRED availability. Set true only when they explicitly click
+// Ready; false on Break/sign-out and by default on page load. telnyx.ready
+// consults it so a reconnect/refresh restores server state instead of forcing
+// the agent available. (Fixes agents being pulled off Break by a network blip.)
+let intendAvailable=false;
 let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null, serverWrapUntil=0;
 let dispositions=[], curCampaign=null, pendingCb=null;
 let waitSince=0;   // when the agent last entered a waiting state (drives the wait counter)
@@ -640,10 +646,24 @@ function syncCsel(sel){
   if(b) b.innerHTML=`<span>${esc(o?o.textContent:'')}</span><span class="csel-caret">▾</span>`;
 }
 
+let sessionExpired=false;
 async function api(path, opts={}) {
   opts.headers = Object.assign({ 'Authorization':'Bearer '+TOKEN }, opts.headers||{});
   const r = await fetch(path, opts);
-  if (r.status===401){ logout(); throw new Error('unauthorized'); }
+  if (r.status===401){
+    // A 401 must NEVER drop a live call. The WebRTC softphone runs on a separate
+    // Telnyx token, so the call keeps working even if the app JWT lapsed. If the
+    // agent is on a call (or has a live softphone leg), show a persistent banner
+    // and keep the call alive; hard-logout only once they're off the call.
+    const onCall = (serverState==='ON_CALL' || (typeof agentCall!=='undefined' && agentCall));
+    if(onCall){
+      sessionExpired=true;
+      const b=$('sessBanner'); if(b) b.classList.remove('hidden');
+      throw new Error('unauthorized');
+    }
+    logout();
+    throw new Error('unauthorized');
+  }
   return r;
 }
 async function apiJson(path, method='GET', body){
@@ -818,8 +838,17 @@ async function startAgent(){
       if(client!==c) return;
       sipRetries=0;
       $('agConn').className='pill pill--ok'; $('agConn').innerHTML='<span class="dot dot--ok"></span> Softphone';
-      log('registered ✓ — going available');
-      try { await apiJson('/api/agent/available','POST',{}); } catch(e){ log('available error: '+e.message); }
+      // Only go AVAILABLE when the agent actually intends to be (they clicked
+      // Ready). On a reconnect, browser refresh, or laptop wake we re-register
+      // the softphone but ADOPT the server's authoritative state instead of
+      // forcing available — so an agent on Break isn't yanked live, and calls
+      // are never routed to an unattended desk. Never override a live call.
+      if(intendAvailable && serverState!=='ON_CALL' && serverState!=='WRAP_UP'){
+        log('registered ✓ — going available');
+        try { await apiJson('/api/agent/available','POST',{}); } catch(e){ log('available error: '+e.message); }
+      } else {
+        log('registered ✓ — keeping current state ('+serverState+')');
+      }
     });
     client.on('telnyx.error', e => log('telnyx.error: '+(e&&e.error&&e.error.message||JSON.stringify(e))));
     client.on('telnyx.socket.close', () => {
@@ -1112,6 +1141,7 @@ async function setAux(target){
   $('auxMenu').classList.add('hidden');
   if(target==='READY'){
     clearAuxTimer();
+    intendAvailable=true;   // explicit go-available intent (survives reconnects)
     // Not connected yet → do a full go-available (registers softphone).
     if(!client || serverState==='OFFLINE'){ startAgent(); return; }
     try{ await apiJson('/api/agent/aux','POST',{state:'AVAILABLE'}); }
@@ -1124,6 +1154,7 @@ async function setAux(target){
     return;
   }
   // Only BREAK is agent-selectable (Wrap-up is automated server-side).
+  intendAvailable=false;   // going on break — don't auto-return on reconnect
   try{ await apiJson('/api/agent/aux','POST',{state:'BREAK'}); ensureBreakTimer(); applyState('BREAK'); }
   catch(e){ toast(e.message,'err'); }
 }
@@ -1235,7 +1266,7 @@ function scriptPreviewHtml(text){
     return `<span class="mf">${esc(v)}</span>`;
   });
 }
-function renderScript(){
+function renderScriptAdmin(){
   const c=leadCampaigns.find(x=>x.id===ldCampId)||{};
   const chips=SCRIPT_MERGE_FIELDS.map(f=>`<button type="button" class="btn btn-sm" data-mf="${f}" style="margin:0 6px 6px 0">{{${f}}}</button>`).join('');
   $('ldBody').innerHTML=`<div class="grid2">
@@ -2042,7 +2073,7 @@ function leadTab(t){
   $('ldSub').querySelectorAll('[data-lt]').forEach(b=>b.classList.toggle('active', b.dataset.lt===t));
   const body=$('ldBody'); body.innerHTML='<p class="dim">Loading…</p>';
   if(!ldCampId && ['import','script','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
-  ({import:renderImport,script:renderScript,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow,stats:renderPlaylistStats}[t]||(()=>{}))();
+  ({import:renderImport,script:renderScriptAdmin,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow,stats:renderPlaylistStats}[t]||(()=>{}))();
 }
 
 // ── Global lead search ──
