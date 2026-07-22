@@ -98,11 +98,19 @@ function verifyTelnyxSignature(req) {
     return crypto.verify(null, signed, pub, Buffer.from(sig, 'base64'));
   } catch { return false; }
 }
-// Webhook auth: prefer the cryptographic signature when a public key is
-// configured (strong, unforgeable); otherwise fall back to the shared token.
+// Webhook auth. When a public key is configured we PREFER the cryptographic
+// signature (strong, unforgeable), but fall back to the shared token so a
+// key/format mismatch can never silently break call bridging. Counters let us
+// confirm from /health that real Telnyx signatures actually validate; once
+// confirmed, the token fallback can be removed for signature-only auth.
+let whSigOk = 0, whSigFail = 0, whToken = 0;
 function webhookAuthorized(req) {
-  if (TELNYX_PUBLIC_KEY) return verifyTelnyxSignature(req);
-  return req.query.token === WH_TOKEN;
+  if (TELNYX_PUBLIC_KEY) {
+    if (verifyTelnyxSignature(req)) { whSigOk++; return true; }
+    whSigFail++;   // fall through to token — never break the dialer on a mismatch
+  }
+  if (req.query.token === WH_TOKEN) { whToken++; return true; }
+  return false;
 }
 
 // Default one-click dispositions (used when a campaign hasn't customised its own).
@@ -1120,6 +1128,7 @@ app.get('/health', (_req, res) => {
     caller_pool: CALLER_POOL.length, agents_online: Object.keys(rt).length,
     ws_clients: wsClients.size, recording: true,
     outbox_depth: writeOutbox.length, outbox_dropped: outboxDropped,
+    wh_public_key: !!TELNYX_PUBLIC_KEY, wh_sig_ok: whSigOk, wh_sig_fail: whSigFail, wh_token: whToken,
     uptime_sec: Math.round(process.uptime()),
     time: new Date().toISOString(),
   });
