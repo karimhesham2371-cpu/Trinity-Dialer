@@ -225,7 +225,10 @@ async function loadCallPolicy() {
       if (v.dispositions && typeof v.dispositions === 'object')
         for (const [code, cfg] of Object.entries(v.dispositions)) disp[code] = clampDispPolicy(cfg);
       POLICY = {
-        positive_dnc_days: Math.max(1, Math.min(3650, parseInt(v.positive_dnc_days, 10) || POSITIVE_DNC_DAYS_DEFAULT)),
+        // positive_dnc_days is owned solely by loadRecycle (app_settings key
+        // 'recycle') — keep the current in-memory value so the two 60s loaders
+        // don't fight over it from two different keys.
+        positive_dnc_days: POLICY.positive_dnc_days,
         dispositions: disp,
       };
     }
@@ -1089,9 +1092,15 @@ async function rehydrateRt() {
         leadNumber: a.lead_number, fromNumber: a.from_number, conferenceId: a.conference_id,
         rtUpdatedAt: Date.now(), stateStart: Date.now(), loggedState: a.state,
       };
-      // The wrap auto-return setTimeout died with the old process; re-arm it so a
-      // restored WRAP_UP agent doesn't sit in wrap-up forever after a redeploy.
-      if (a.state === 'WRAP_UP') scheduleWrapReturn(a.id, WRAP_SHORT_SEC);
+      // The wrap auto-return setTimeout died with the old process. For a WRAP_UP
+      // agent still holding a lead under REQUIRE_DISPOSITION, re-arm the
+      // disposition HOLD (awaitingDisp) instead of a 3s auto-return — otherwise
+      // a redeploy mid-wrap would let the agent skip coding the call. With no
+      // lead (or enforcement off), just re-arm the normal short auto-return.
+      if (a.state === 'WRAP_UP') {
+        if (REQUIRE_DISPOSITION && a.lead_id) { rt[a.id].awaitingDisp = true; rt[a.id].wrapEnteredAt = Date.now(); }
+        else scheduleWrapReturn(a.id, WRAP_SHORT_SEC);
+      }
       n++;
     }
     if (n) console.log(`[rehydrate] restored ${n} live agent(s) from DB`);
@@ -3570,7 +3579,7 @@ async function nextDialableLead(campaignIds, filters, nowIso) {
   return null;
 }
 async function pacingTick() {
-  if (pacingBusy || !SB_HOST || !CONNECTION_ID) return;
+  if (shuttingDown || pacingBusy || !SB_HOST || !CONNECTION_ID) return;   // don't place new calls during a redeploy drain
   pacingBusy = true;
   try {
     // Agents that can take MORE dials: in-conference, not on a connected call,
@@ -4838,20 +4847,32 @@ async function reaperTick() {
         await setAgentState(id, st.state);
       }
       // ON_CALL watchdog: if a lead-leg hangup webhook is ever lost, the agent
-      // is stuck ON_CALL forever (no other timeout covers this). We can't just
-      // time it out — a real call can run long — so we ASK Telnyx whether the
-      // call is still alive, and only free the agent if it's confirmed dead.
-      if (st.state === 'ON_CALL' && st.onCallSince && (now - st.onCallSince) > REAP_ONCALL_CHECK_MS) {
-        let alive = false;
+      // is stuck ON_CALL forever. We can't just time it out (a real call can run
+      // long), so we ASK Telnyx whether the call is still alive and only free the
+      // agent on a CONFIRMED-dead answer. `onCallSince` isn't persisted across a
+      // redeploy, so fall back to stateStart (set at rehydrate) — otherwise a
+      // call stranded during the restart would never be checked.
+      const onSince = st.onCallSince || st.stateStart;
+      if (st.state === 'ON_CALL' && onSince && (now - onSince) > REAP_ONCALL_CHECK_MS) {
+        let verdict = 'unknown';
         if (st.leadLeg) {
-          try { const r = await telnyx('GET', `/calls/${st.leadLeg}`); alive = !!(r && r.data && r.data.is_alive); }
-          catch { alive = false; }   // 404 / API error => treat as gone
-        }
-        if (!alive) {
-          console.log(`[reaper] agent ${id.slice(0,8)} stuck ON_CALL (Telnyx says call is dead) -> freeing`);
+          try { const r = await telnyx('GET', `/calls/${st.leadLeg}`); verdict = (r && r.data && r.data.is_alive) ? 'alive' : 'dead'; }
+          catch { verdict = 'unknown'; }   // transient Telnyx error → DON'T assume dead (avoids freeing a live call)
+        } else { verdict = 'dead'; }        // ON_CALL with no leg is already broken
+        // Only free on a confirmed-dead verdict. A transient API error leaves the
+        // agent alone (re-checked next tick) — treating it as dead risked freeing
+        // a genuinely live call and bridging the next lead into the same conference.
+        if (verdict === 'dead') {
+          console.log(`[reaper] agent ${id.slice(0,8)} stuck ON_CALL (Telnyx confirms call dead) -> freeing`);
+          if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});  // ensure the leg is gone (no cross-conference bleed)
           st.leadLeg = null; st.leadNumber = null; st.fromNumber = null; st.onCallSince = null;
-          if (st.conferenceId) { st.state = 'WRAP_UP'; await setAgentState(id, 'WRAP_UP'); scheduleWrapReturn(id, WRAP_SHORT_SEC); }
-          else { st.state = 'OFFLINE'; st.leadId = null; await setAgentState(id, 'OFFLINE'); }
+          if (st.conferenceId) {
+            // The agent talked to a human — hold for a disposition, same as a normal
+            // call end, so enforcement isn't silently bypassed by a lost webhook.
+            st.state = 'WRAP_UP'; await setAgentState(id, 'WRAP_UP');
+            if (REQUIRE_DISPOSITION && st.leadId) { st.awaitingDisp = true; st.wrapEnteredAt = Date.now(); wsAgentSnapshot(id); }
+            else scheduleWrapReturn(id, WRAP_SHORT_SEC);
+          } else { st.state = 'OFFLINE'; st.leadId = null; await setAgentState(id, 'OFFLINE'); }
         }
       }
     }

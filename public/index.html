@@ -601,6 +601,11 @@ let intendAvailable=false;
 // True while the server is holding this agent in WRAP_UP until they code the
 // current call (disposition-required enforcement).
 let dispRequiredNow=false;
+// The server's AUTHORITATIVE state (set only from WS agent.state pushes).
+// startAgent() clobbers `serverState` to CONNECTING, so the reconnect guard in
+// telnyx.ready reads this instead to avoid force-flipping an agent to AVAILABLE
+// mid-WRAP_UP on a socket-drop reconnect.
+let lastServerState='OFFLINE';
 let agentCall=null, muted=false, held=false, curLeadId=null, timerInt=null, onCallSince=null, serverWrapUntil=0;
 let dispositions=[], curCampaign=null, pendingCb=null;
 let waitSince=0;   // when the agent last entered a waiting state (drives the wait counter)
@@ -694,7 +699,13 @@ async function apiJson(path, method='GET', body){
 // A supervisor kicked this agent off the dialer: drop the softphone, force the UI
 // to OFFLINE, and tell them plainly. They can Go Available again when ready.
 function handleKicked(m){
+  // Cancel EVERY pending reconnect/retry so a queued timer can't silently
+  // re-register the agent and rejoin them as AVAILABLE after a kick.
   if(typeof sipReconnT!=='undefined'&&sipReconnT){ clearTimeout(sipReconnT); sipReconnT=null; }
+  if(typeof startRetryT!=='undefined'&&startRetryT){ clearTimeout(startRetryT); startRetryT=null; }
+  if(typeof wsReconnTimer!=='undefined'&&wsReconnTimer){ clearTimeout(wsReconnTimer); wsReconnTimer=null; }
+  intendAvailable=false;   // kicked → no auto-go-available intent
+  dispRequiredNow=false;   // clear any disposition hold so they can rejoin
   const _c=client; client=null;   // detach so socket.close doesn't trigger auto-reconnect
   try{ if(_c) _c.disconnect(); }catch{}
   try{ applyState('OFFLINE',{state:'OFFLINE'}); }catch{}
@@ -747,7 +758,7 @@ function openWs(){
   ws = sock;
   sock.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); log('ws open ✓'); };
   sock.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
-    if(m.type==='agent.state'){ applyState(m.state, m); }
+    if(m.type==='agent.state'){ lastServerState=m.state; applyState(m.state, m); }
     else if(m.type==='lead.context'){
       // Server pushes the full lead profile at bridge time — render instantly
       // instead of waiting for the loadContext HTTP round trip (which still
@@ -822,7 +833,7 @@ function applyState(s, snap){
     }
   }
   else if(s==='AVAILABLE'){ dispRequiredNow=false; if(!isWaitState(prev)) waitSince=Date.now(); $('bannerState').textContent='Available'; $('bannerSub').textContent='Waiting for next lead…'; stopTimer(); if(prev==='WRAP_UP'||prev==='ON_CALL') clearLead(); $('dispReq').classList.add('hidden'); }
-  else if(s==='OFFLINE'){ $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
+  else if(s==='OFFLINE'){ dispRequiredNow=false; $('bannerState').textContent='Offline'; $('bannerSub').textContent=''; stopTimer(); }
   else { $('bannerState').textContent=u.txt; }
 
   // AUX timers: WRAP_UP is server-timed (display only — the server flips it
@@ -884,11 +895,11 @@ async function startAgent(){
       // the softphone but ADOPT the server's authoritative state instead of
       // forcing available — so an agent on Break isn't yanked live, and calls
       // are never routed to an unattended desk. Never override a live call.
-      if(intendAvailable && serverState!=='ON_CALL' && serverState!=='WRAP_UP'){
+      if(intendAvailable && lastServerState!=='ON_CALL' && lastServerState!=='WRAP_UP'){
         log('registered ✓ — going available');
         try { await apiJson('/api/agent/available','POST',{}); } catch(e){ log('available error: '+e.message); }
       } else {
-        log('registered ✓ — keeping current state ('+serverState+')');
+        log('registered ✓ — keeping current state ('+lastServerState+')');
       }
     });
     client.on('telnyx.error', e => log('telnyx.error: '+(e&&e.error&&e.error.message||JSON.stringify(e))));
@@ -1073,6 +1084,7 @@ async function submitDisposition(code, callback_at){
   try{
     const notes=$('notes').value.trim();
     const j=await apiJson('/api/agent/disposition','POST',{code, notes, callback_at, lead_id:curLeadId});
+    dispRequiredNow=false;   // coded — release the hold immediately (don't wait for the next state push)
     toast('Saved '+code); $('dispReq').classList.add('hidden');
     const secs=(j&&j.wrap_seconds)||3;
     const w=$('wrapMsg'); w.classList.remove('hidden');
@@ -3030,8 +3042,10 @@ async function renderWindow(){
 // voicemail each get a re-dial delay + a max number of rounds. Plus the DNC
 // expiry for positive results (Lead/Sale).
 async function renderRecycle(){
-  let r={no_answer:{delay_minutes:240,max_rounds:11},busy:{delay_minutes:20,max_rounds:11},voicemail:{delay_minutes:360,max_rounds:5},positive_dnc_days:90};
-  try{ const j=await apiJson('/api/admin/settings/recycle'); r=j.recycle||r; }catch(e){}
+  const RDEF={no_answer:{delay_minutes:240,max_rounds:11},busy:{delay_minutes:20,max_rounds:11},voicemail:{delay_minutes:360,max_rounds:5},positive_dnc_days:90};
+  let r=RDEF;
+  try{ const j=await apiJson('/api/admin/settings/recycle'); const g=j.recycle||{};
+    r={ no_answer:g.no_answer||RDEF.no_answer, busy:g.busy||RDEF.busy, voicemail:g.voicemail||RDEF.voicemail, positive_dnc_days:g.positive_dnc_days||RDEF.positive_dnc_days }; }catch(e){}
   const fmtDelay=(mins)=>{ if(mins>=1440&&mins%1440===0)return (mins/1440)+' day'+(mins/1440>1?'s':''); if(mins>=60&&mins%60===0)return (mins/60)+' hour'+(mins/60>1?'s':''); return mins+' min'; };
   const row=(key,title,desc)=>`<tr>
       <td><div style="font-weight:600">${title}</div><div class="dim" style="font-size:12px">${desc}</div></td>
