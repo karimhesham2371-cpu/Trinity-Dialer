@@ -2914,9 +2914,9 @@ app.get('/api/agent/token', auth, async (req, res) => {
     const rows = await sbSelect('agents', `id=eq.${req.user.id}&select=telnyx_credential_id,name,sip_username`);
     const a = rows[0];
     if (!a || !a.telnyx_credential_id) return res.status(400).json({ error: 'no telnyx credential provisioned' });
-    const jwtTok = await (await fetch(`${TELNYX_BASE}/telephony_credentials/${a.telnyx_credential_id}/token`, {
+    const jwtTok = await (await fetchT(`${TELNYX_BASE}/telephony_credentials/${a.telnyx_credential_id}/token`, {
       method: 'POST', headers: { 'Authorization': `Bearer ${TELNYX_KEY}` },
-    })).text();
+    })).text();   // fetchT: a hung Telnyx request can't stall the agent's login
     res.json({ login_token: jwtTok.trim(), name: a.name, sip: a.sip_username });
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
@@ -4800,8 +4800,10 @@ function normPhone(p) {
 const REAP_DIALING_MS = 90 * 1000;      // agent dialing/claiming this long w/ no bridge -> free them
 const REAP_LEAD_MS    = 8  * 60 * 1000; // lead IN_PROGRESS this long -> requeue as NO_ANSWER
 const REAP_ONCALL_CHECK_MS = 45 * 1000; // ON_CALL longer than this -> verify with Telnyx it's still alive
+let reaperBusy = false;
 async function reaperTick() {
-  if (!SB_HOST) return;
+  if (reaperBusy || !SB_HOST) return;   // the ON_CALL watchdog awaits a Telnyx GET per agent; guard against overlap during API slowness
+  reaperBusy = true;
   try {
     // 1) Free agents wedged in transient states.
     const now = Date.now();
@@ -4886,6 +4888,7 @@ async function reaperTick() {
     const dayAgo = new Date(now - 24 * 3600 * 1000).toISOString();
     sbDelete('webhook_events', `received_at=lt.${dayAgo}`).catch(() => {});
   } catch (e) { console.error('[reaper]', e.message); }
+  finally { reaperBusy = false; }
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
