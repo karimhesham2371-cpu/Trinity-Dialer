@@ -445,6 +445,61 @@
     .btn:hover,.rtile:hover{transform:none}
     .dialpad button:active{transform:none}
   }
+
+  /* ═══ STATE-COLORED THEMING ═══════════════════════════════════════════
+     applyState() stamps data-agstate on <body>; the whole console shifts
+     hue with the agent's state. Green = live call, blue = hunting for a
+     call, amber = wrap-up, ember = break, neutral = offline.            */
+  body{--st:#566072;--st-tint:rgba(86,96,114,.10);--st-glow:rgba(86,96,114,.12)}
+  body:is([data-agstate="AVAILABLE"],[data-agstate="DIALING"],[data-agstate="CLAIMING"],[data-agstate="CONNECTING"]){
+    --st:#5B8DEF;--st-tint:rgba(91,141,239,.13);--st-glow:rgba(91,141,239,.22)}
+  body[data-agstate="ON_CALL"]{--st:#34C77B;--st-tint:rgba(52,199,123,.15);--st-glow:rgba(52,199,123,.30)}
+  body[data-agstate="WRAP_UP"]{--st:#E8A13D;--st-tint:rgba(232,161,61,.14);--st-glow:rgba(232,161,61,.26)}
+  body[data-agstate="BREAK"]{--st:#E07A45;--st-tint:rgba(224,122,69,.13);--st-glow:rgba(224,122,69,.22)}
+
+  /* Ambient wash: the page itself breathes the state color from the top */
+  body[data-agstate="ON_CALL"]{background:
+      radial-gradient(1200px 600px at 50% -12%, rgba(52,199,123,.13), transparent 62%),
+      radial-gradient(1100px 640px at 104% 112%, rgba(52,199,123,.05), transparent 55%),
+      linear-gradient(180deg,#07100B,#06080F 70%)}
+  body:is([data-agstate="AVAILABLE"],[data-agstate="DIALING"],[data-agstate="CLAIMING"]){background:
+      radial-gradient(1200px 600px at 50% -12%, rgba(91,141,239,.11), transparent 62%),
+      linear-gradient(180deg,#080C15,#06080F 70%)}
+  body[data-agstate="WRAP_UP"]{background:
+      radial-gradient(1200px 600px at 50% -12%, rgba(232,161,61,.11), transparent 62%),
+      linear-gradient(180deg,#100C06,#06080F 70%)}
+  body[data-agstate="BREAK"]{background:
+      radial-gradient(1200px 600px at 50% -12%, rgba(224,122,69,.10), transparent 62%),
+      linear-gradient(180deg,#100906,#06080F 70%)}
+
+  /* Appbar: state-colored hairline across the very top of the console */
+  body[data-agstate] .appbar{box-shadow:inset 0 2px 0 var(--st)}
+
+  /* Call banner: the hero — soaks fully in the state color */
+  body[data-agstate] .callBanner{
+    border-color:color-mix(in srgb, var(--st) 45%, transparent);
+    background:linear-gradient(90deg, var(--st-tint), rgba(18,24,40,0) 60%), linear-gradient(180deg,#121828,#0E131E);
+    box-shadow:0 0 30px var(--st-glow), inset 0 1px 0 rgba(255,255,255,.05);
+    transition:border-color .5s,box-shadow .5s}
+  body[data-agstate] .callBanner .big{color:var(--st);transition:color .5s}
+  body[data-agstate] .timer{color:var(--st);text-shadow:0 0 24px var(--st-glow)}
+
+  /* Hunting shimmer while the system dials for the agent */
+  @keyframes huntPulse{0%,100%{box-shadow:0 0 18px var(--st-glow)}50%{box-shadow:0 0 42px var(--st-glow)}}
+  body:is([data-agstate="DIALING"],[data-agstate="CLAIMING"]) .callBanner{animation:huntPulse 2.2s ease-in-out infinite}
+  /* Live-call presence: slow strong breathing glow */
+  @keyframes liveBreathe{0%,100%{box-shadow:0 0 26px var(--st-glow)}50%{box-shadow:0 0 52px var(--st-glow)}}
+  body[data-agstate="ON_CALL"] .callBanner{animation:liveBreathe 3.4s ease-in-out infinite}
+
+  /* State-tinted chrome details */
+  body[data-agstate] #agState{box-shadow:0 0 14px var(--st-glow)}
+  body[data-agstate="ON_CALL"] .ctrlBtn:not(:disabled){border-color:color-mix(in srgb, var(--st) 30%, transparent)}
+  body[data-agstate="BREAK"] .agentGrid{opacity:.88;filter:saturate(.85);transition:opacity .5s,filter .5s}
+  body:not([data-agstate="BREAK"]) .agentGrid{opacity:1;filter:none;transition:opacity .5s,filter .5s}
+
+  @media(prefers-reduced-motion:reduce){
+    body[data-agstate] .callBanner{animation:none!important}
+  }
 </style>
 </head>
 <body>
@@ -924,6 +979,7 @@ const STATE_UI = {
 };
 function applyState(s, snap){
   const prev=serverState; serverState=s;
+  document.body.setAttribute('data-agstate', s);   // drives the state-colored theme
   if(s!=='OFFLINE'){ const kb=$('kickBanner'); if(kb) kb.classList.add('hidden'); }
   const u=STATE_UI[s]||{dot:'faint',pulse:false,txt:'—'};
   const dotHtml=`<span class="dot dot--${u.dot}${u.pulse?' dot--pulse':''}"></span>`;
