@@ -898,6 +898,7 @@ function permForPath(path, method) {
   if (/^\/api\/admin\/reports\/calls\/[^/]+\/qa$/.test(path)) return 'reports.qa';
   if (path.startsWith('/api/admin/reports/calls'))        return 'reports.call_logs';
   if (path.startsWith('/api/admin/reports/agent'))        return 'reports.agent_report';
+  if (path.startsWith('/api/admin/reports/attendance'))   return 'reports.agent_report';
   if (path.startsWith('/api/admin/reports/wallboard'))    return 'reports.wallboard';
   if (path.startsWith('/api/admin/reports/research'))     return 'reports.research';
   if (path.startsWith('/api/admin/reports/recording'))    return ['reports.call_logs', 'reports.research'];
@@ -2824,9 +2825,9 @@ app.get('/api/admin/reports/recording/:id', auth, adminOnly, async (req, res) =>
 // that an <audio> tag / anchor can't send — so those play as 0:00/0:00 if handed
 // to the browser directly. We fetch server-side (with the key when needed) and
 // pipe the bytes back over our own https origin. Auth via ?token= (see auth()).
-app.get('/api/admin/reports/recording/:id/stream', auth, adminOnly, async (req, res) => {
+async function streamRecordingHandler(req, res) {
   try {
-    const rows = await sbSelect('calls', `id=eq.${req.params.id}&select=id,recording_url,to_number`);
+    const rows = await sbSelect('calls', `id=eq.${req.params.id}&select=id,recording_url,recording_id,to_number`);
     const c = rows[0];
     if (!c || !c.recording_url) return res.status(404).json({ error: 'no recording' });
     // Resolve the storage source. `sb:recordings/<id>.mp3` = durable copy in our own
@@ -2879,6 +2880,56 @@ app.get('/api/admin/reports/recording/:id/stream', auth, adminOnly, async (req, 
       { target_type: 'call', target_id: c.id, meta: { to: c.to_number } });
     const { Readable } = require('stream');
     Readable.fromWeb(upstream.body).pipe(res);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+app.get('/api/admin/reports/recording/:id/stream', auth, adminOnly, streamRecordingHandler);
+// Closers hear the original agent conversation before a follow-up call.
+app.get('/api/agent/recording/:id/stream', auth, closerOrAdmin, streamRecordingHandler);
+
+// Recorded calls for one lead (closer context panel). Names attached for display.
+app.get('/api/agent/lead-calls/:leadId', auth, closerOrAdmin, async (req, res) => {
+  try {
+    const [rows, names] = await Promise.all([
+      sbSelect('calls', `lead_id=eq.${req.params.leadId}&recording_url=not.is.null` +
+        '&select=id,created_at,bridged_at,ended_at,duration_sec,agent_id&order=created_at.desc&limit=10'),
+      agentNameMap(),
+    ]);
+    res.json({ calls: (rows || []).map(r => ({ ...r, agent_name: names[r.agent_id] || null })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Attendance — first clock-in / last clock-out / hours per agent per day, from
+// agent_state_events. "Late" = first non-OFFLINE span starts after shift_start
+// (HH:MM, default 09:00, compared in server-local time).
+app.get('/api/admin/reports/attendance', auth, adminOnly, async (req, res) => {
+  const days = Math.min(31, Math.max(1, parseInt(req.query.days, 10) || 7));
+  const shift = /^\d{2}:\d{2}$/.test(req.query.shift_start || '') ? req.query.shift_start : '09:00';
+  const fromIso = new Date(Date.now() - days * 86400e3).toISOString();
+  try {
+    const [spans, names] = await Promise.all([
+      sbSelect('agent_state_events',
+        `started_at=gte.${encodeURIComponent(fromIso)}&select=agent_id,state,started_at,ended_at&order=started_at.asc&limit=100000`),
+      agentNameMap(),
+    ]);
+    const byDay = {};   // `${agent}|${yyyy-mm-dd}` -> row
+    for (const s of spans || []) {
+      if (!PROD_LOGGED.has(s.state)) continue;
+      const start = new Date(s.started_at);
+      const key = s.agent_id + '|' + start.toISOString().slice(0, 10);
+      const end = s.ended_at ? new Date(s.ended_at) : new Date();
+      const r = byDay[key] || (byDay[key] = { agent_id: s.agent_id, date: start.toISOString().slice(0, 10),
+        first_in: s.started_at, last_out: s.ended_at, seconds: 0 });
+      if (s.started_at < r.first_in) r.first_in = s.started_at;
+      if (!s.ended_at || !r.last_out || s.ended_at > r.last_out) r.last_out = s.ended_at || null;
+      r.seconds += Math.max(0, (end - start) / 1000);
+    }
+    const rows = Object.values(byDay).map(r => {
+      const fi = new Date(r.first_in);
+      const hm = String(fi.getHours()).padStart(2, '0') + ':' + String(fi.getMinutes()).padStart(2, '0');
+      return { ...r, name: names[r.agent_id] || '—', seconds: Math.round(r.seconds),
+        first_in_hm: hm, late: hm > shift, still_on: r.last_out == null };
+    }).sort((a, b) => b.date.localeCompare(a.date) || a.name.localeCompare(b.name));
+    res.json({ rows, shift_start: shift, days });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3286,6 +3337,47 @@ app.post('/api/agent/deals/:id', auth, closerOrAdmin, async (req, res) => {
     audit(req.user, 'DEAL_UPDATE', { target_type: 'lead', target_id: req.params.id, meta: { stage: deal.stage, noted: !!note } });
     res.json({ ok: true, deal });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── In-call lead editing ─────────────────────────────────────────────────────
+// Agents fix wrong data while talking to the seller. Standard fields update the
+// lead columns; anything else merges into the custom JSON. Guard: agents may
+// only edit the lead they're currently on; closers/admins may edit any lead.
+const LEAD_EDIT_FIELDS = ['first_name', 'last_name', 'address', 'city', 'state', 'zip'];
+app.post('/api/agent/lead/:id', auth, async (req, res) => {
+  const c = permCache.get(req.user.id);
+  const role = c ? c.role : req.user.role;
+  const st = rt[req.user.id];
+  const own = st && st.leadId === req.params.id;
+  if (!own && !['closer', 'admin'].includes(role)) return res.status(403).json({ error: 'you can only edit your current lead' });
+  const b = (req.body && req.body.fields) || {};
+  try {
+    const [lead] = await sbSelect('leads', `id=eq.${req.params.id}&select=id,custom`);
+    if (!lead) return res.status(404).json({ error: 'lead not found' });
+    const patch = {}; const custom = { ...(lead.custom || {}) };
+    let extras = false;
+    for (const [k, v] of Object.entries(b)) {
+      const val = String(v == null ? '' : v).trim().slice(0, 200);
+      if (LEAD_EDIT_FIELDS.includes(k)) patch[k] = val || null;
+      else if (/^[\w .-]{1,40}$/.test(k)) { custom[k] = val; extras = true; }
+    }
+    if (extras) patch.custom = custom;
+    if (!Object.keys(patch).length) return res.status(400).json({ error: 'nothing to update' });
+    await sbUpdate('leads', `id=eq.${req.params.id}`, patch);
+    audit(req.user, 'LEAD_EDIT', { target_type: 'lead', target_id: req.params.id, meta: { fields: Object.keys(b) } });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Raise hand: agent pings the supervisors ──────────────────────────────────
+// Fire-and-forget WS event to every admin/support console; the office map
+// highlights the seat and everyone gets a toast.
+app.post('/api/agent/raise-hand', auth, (req, res) => {
+  const st = rt[req.user.id] || {};
+  wsToAdmins({ type: 'floor.hand', agentId: req.user.id, name: req.user.name || 'Agent',
+    state: st.state || 'OFFLINE', at: Date.now() });
+  audit(req.user, 'RAISE_HAND', { target_type: 'agent', target_id: req.user.id, meta: { state: st.state || 'OFFLINE' } });
+  res.json({ ok: true });
 });
 
 // ── Closer calendar: this user's scheduled callbacks, next 14 days + overdue ──

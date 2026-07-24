@@ -549,6 +549,7 @@
     <span id="agConn" class="pill pill--faint">Softphone —</span>
     <div class="sp"></div>
     <span class="who" id="agWho"></span>
+    <button id="handBtn" class="btn btn-sm" title="Ask a supervisor for help">🖐</button>
     <div id="auxWrap" class="aux">
       <button id="auxBtn" class="btn btn-sm" disabled>Offline</button>
       <div id="auxMenu" class="auxMenu hidden">
@@ -722,6 +723,7 @@
         <button id="rtile-agent" class="rtile" onclick="openReport('agent')"><h3>Agent report</h3><p>Logged-in, dialing, talk, wrap and break time per agent. Export CSV.</p></button>
         <button id="rtile-research" class="rtile" onclick="openReport('research')"><h3>Research calls</h3><p>Find a specific call by its phone number.</p></button>
         <button id="rtile-map" class="rtile" onclick="openReport('map')"><h3>Office map</h3><p>Live floor — each agent's seat and current status.</p></button>
+        <button id="rtile-attendance" class="rtile" onclick="openReport('attendance')"><h3>Attendance</h3><p>First clock-in, last clock-out and hours per agent per day, with late flags.</p></button>
       </div>
     </div>
     <!-- panel -->
@@ -1228,8 +1230,9 @@ async function loadContext(){
   }catch(e){ /* transient */ }
 }
 
-let renderedLeadId=null;
+let renderedLeadId=null, curLeadObj=null, curCallerId=null;
 function renderLead(l, callerId){
+  curLeadObj=l; curCallerId=callerId;
   const name=[l.first_name,l.last_name].filter(Boolean).join(' ')||'Unknown contact';
   const custom=l.custom||{};
   const cell=(k,v,wide)=>`<div class="ciCell${wide?' ciCell--wide':''}"><span class="cl">${esc(k)}</span><span class="cv" title="${v!=null&&v!==''?esc(v):''}">${v!=null&&v!==''?esc(v):'<span class="faint">—</span>'}</span></div>`;
@@ -1238,7 +1241,10 @@ function renderLead(l, callerId){
   const extra=Object.keys(custom).filter(k=>k!==emailKey&&custom[k]!=null&&custom[k]!=='').map(k=>cell(k,custom[k])).join('');
   $('leadCard').classList.remove('empty');
   $('leadCard').innerHTML=`
-    <h3 class="leadName">${esc(name)}</h3>
+    <div style="display:flex;align-items:flex-start;gap:8px">
+      <h3 class="leadName" style="flex:1">${esc(name)}</h3>
+      <button id="leadEdit" class="btn btn-sm" title="Fix wrong contact data">✎ Edit</button>
+    </div>
     <div class="leadPhone mt2">${esc(l.phone||'')}</div>
     <div class="ciPanel mt">
       <div class="ciHead">Contact Information</div>
@@ -1256,10 +1262,62 @@ function renderLead(l, callerId){
         ${extra}
       </div>
     </div>`;
+  $('leadEdit').onclick=()=>renderLeadEdit();
   // Only clear notes when a NEW lead lands — the instant WS push and the
   // loadContext refresh both render the same lead, and the second render must
   // not wipe what the agent already typed.
-  if(renderedLeadId!==l.id){ $('notes').value=''; renderedLeadId=l.id; }
+  if(renderedLeadId!==l.id){ $('notes').value=''; renderedLeadId=l.id; loadLeadRecordings(l.id); }
+}
+// In-place edit form for the lead card — fix bad data mid-call, save, re-render.
+function renderLeadEdit(){
+  const l=curLeadObj; if(!l) return;
+  const custom=l.custom||{};
+  const emailKey=Object.keys(custom).find(k=>/^e-?mail(_?address)?$/i.test(k))||'email';
+  const f=(k,label,v)=>`<div><label class="lbl">${label}</label><input class="field" data-lf="${k}" value="${esc(v||'')}"></div>`;
+  $('leadCard').innerHTML=`
+    <h3 class="leadName">Edit contact</h3>
+    <div class="row mt2">${f('first_name','First name',l.first_name)}${f('last_name','Last name',l.last_name)}</div>
+    <div class="mt2">${f('address','Address',l.address)}</div>
+    <div class="row mt2">${f('city','City',l.city)}${f('state','State',l.state)}${f('zip','Zip',l.zip)}</div>
+    <div class="mt2">${f(emailKey,'Email',l.email||custom[emailKey])}</div>
+    <div class="row mt3">
+      <button id="leSave" class="btn btn-primary">Save</button>
+      <button id="leCancel" class="btn">Cancel</button>
+    </div>`;
+  $('leCancel').onclick=()=>renderLead(curLeadObj,curCallerId);
+  $('leSave').onclick=async()=>{
+    const fields={};
+    $('leadCard').querySelectorAll('[data-lf]').forEach(i=>fields[i.dataset.lf]=i.value);
+    $('leSave').disabled=true;
+    try{
+      await apiJson('/api/agent/lead/'+l.id,'POST',{fields});
+      // merge locally so the card refreshes instantly without a round trip
+      for(const [k,v] of Object.entries(fields)){
+        if(['first_name','last_name','address','city','state','zip'].includes(k)) l[k]=v;
+        else { l.custom=l.custom||{}; l.custom[k]=v; }
+      }
+      renderLead(l,curCallerId); toast('Contact updated','ok');
+    }catch(e){ toast(e.message,'err'); $('leSave').disabled=false; }
+  };
+}
+// Closer context: recordings of previous calls with this lead, playable inline.
+async function loadLeadRecordings(leadId){
+  if(!USER||USER.role!=='closer') return;
+  try{
+    const j=await apiJson('/api/agent/lead-calls/'+leadId);
+    const old=$('leadRecs'); if(old) old.remove();
+    if(!j.calls.length) return;
+    const div=document.createElement('div'); div.id='leadRecs'; div.className='mt';
+    div.innerHTML='<div class="ciPanel"><div class="ciHead">Previous call recordings</div><div style="padding:10px 12px">'+
+      j.calls.map(c=>{
+        const dt=new Date(c.created_at).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false});
+        return `<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+          <span class="dim" style="font-size:11.5px;min-width:110px">${dt}${c.agent_name?' · '+esc(c.agent_name):''}</span>
+          <audio class="mini" controls preload="none" src="/api/agent/recording/${c.id}/stream?token=${encodeURIComponent(TOKEN)}" style="flex:1;min-width:0"></audio>
+        </div>`;
+      }).join('')+'</div></div>';
+    $('leadCard').after(div);
+  }catch(e){ /* non-fatal */ }
 }
 function renderScript(c){
   if(!c||!c.script){ $('scriptBody').className='empty'; $('scriptBody').textContent='No script set for this campaign.'; }
@@ -1406,6 +1464,70 @@ function openOfferSheet(o){
   </body></html>`);
   w.document.close();
 }
+// ── Purchase agreement generator ──
+// Merges deal + terms into a print-ready wholesale purchase agreement. The
+// buyer entity is remembered per browser (localStorage) after first use.
+function openContract(d){
+  const name=[d.first_name,d.last_name].filter(Boolean).join(' ')||'';
+  const addr=[d.address,d.city,d.state,d.zip].filter(Boolean).join(', ');
+  const buyer=prompt('Buyer entity (your company):', localStorage.getItem('trinity_buyer')||'');
+  if(buyer==null) return;
+  if(buyer.trim()) localStorage.setItem('trinity_buyer', buyer.trim());
+  const price=prompt('Purchase price ($):',''); if(price==null) return;
+  const pNum=+String(price).replace(/[^\d.]/g,'')||0;
+  if(!pNum){ toast('Enter a valid price','warn'); return; }
+  const earnest=prompt('Earnest money deposit ($):','500'); if(earnest==null) return;
+  const eNum=+String(earnest).replace(/[^\d.]/g,'')||0;
+  const closeDays=prompt('Days to close:','30'); if(closeDays==null) return;
+  const cNum=Math.max(1,parseInt(closeDays,10)||30);
+  const today=new Date().toLocaleDateString([],{year:'numeric',month:'long',day:'numeric'});
+  const w=window.open('','_blank');
+  if(!w){ toast('Popup blocked — allow popups for this site','err'); return; }
+  const line=(label)=>`<div class="sig"><div class="sl"></div><div class="sk">${label}</div></div>`;
+  w.document.write(`<!DOCTYPE html><html><head><title>Purchase Agreement — ${esc(addr)}</title><style>
+    body{font:13.5px/1.7 Georgia,'Times New Roman',serif;color:#151a24;max-width:700px;margin:36px auto;padding:0 28px}
+    h1{font-size:19px;text-align:center;letter-spacing:.04em;margin:0 0 2px}
+    .sub{text-align:center;color:#6b7488;font-size:12px;margin:0 0 26px}
+    h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin:20px 0 6px}
+    p{margin:6px 0}
+    .box{border:1px solid #ccd2de;border-radius:6px;padding:12px 16px;margin:14px 0}
+    .kv{display:flex;justify-content:space-between;padding:3px 0}
+    .kv b{font-size:14px}
+    .sigs{display:flex;gap:40px;margin-top:44px}
+    .sig{flex:1}.sl{border-bottom:1px solid #151a24;height:34px}.sk{font-size:11px;color:#6b7488;margin-top:5px}
+    .foot{color:#9aa2b2;font-size:10.5px;margin-top:30px}
+    @media print{body{margin:10px auto}}
+  </style></head><body>
+    <h1>Real Estate Purchase and Sale Agreement</h1>
+    <p class="sub">Entered into on ${today}</p>
+    <p>This Purchase and Sale Agreement ("Agreement") is made between <b>${esc(name||'____________________')}</b> ("Seller") and <b>${esc(buyer.trim()||'____________________')}</b> and/or assigns ("Buyer").</p>
+    <h2>1. Property</h2>
+    <p>Seller agrees to sell and Buyer agrees to purchase the real property located at: <b>${esc(addr||'____________________')}</b>, together with all fixtures and improvements ("Property").</p>
+    <h2>2. Purchase Price &amp; Terms</h2>
+    <div class="box">
+      <div class="kv"><span>Purchase price</span><b>$${pNum.toLocaleString()}</b></div>
+      <div class="kv"><span>Earnest money deposit (credited at closing)</span><b>$${eNum.toLocaleString()}</b></div>
+      <div class="kv"><span>Balance due at closing</span><b>$${(pNum-eNum).toLocaleString()}</b></div>
+      <div class="kv"><span>Closing on or before</span><b>${cNum} days from acceptance</b></div>
+    </div>
+    <h2>3. Condition of Property</h2>
+    <p>The Property is sold in its present "AS-IS" condition. Seller shall deliver the Property in substantially the same condition as on the date of this Agreement.</p>
+    <h2>4. Title &amp; Closing</h2>
+    <p>Seller shall convey marketable title by general warranty deed, free of liens and encumbrances except as noted. Closing to occur at a title company or attorney of Buyer's choosing. Standard closing costs allocated per local custom.</p>
+    <h2>5. Assignment</h2>
+    <p>Buyer may assign this Agreement and its rights hereunder to a third party without Seller's prior consent. Upon assignment and assumption, the assignee shall assume Buyer's obligations herein.</p>
+    <h2>6. Inspection Period</h2>
+    <p>Buyer shall have ten (10) business days from acceptance to inspect the Property and may cancel this Agreement in writing within that period, whereupon the earnest deposit shall be returned.</p>
+    <h2>7. Entire Agreement</h2>
+    <p>This Agreement constitutes the entire understanding between the parties and may only be modified in writing signed by both parties.</p>
+    <div class="sigs">${line('Seller signature · date')}${line('Buyer signature · date')}</div>
+    <div class="sigs">${line('Seller printed name')}${line('Buyer printed name')}</div>
+    <p class="foot">This template is provided for convenience and does not constitute legal advice. Review with a licensed attorney in the property's state before use.</p>
+    <script>window.print()<\/script>
+  </body></html>`);
+  w.document.close();
+}
+
 // ── Closer deal pipeline ──
 const DEAL_LABELS={NEW:'New',OFFER_MADE:'Offer made',FOLLOW_UP:'Follow-up',UNDER_CONTRACT:'Under contract',CLOSED:'Closed',DEAD:'Dead'};
 const DEAL_COLORS={NEW:'var(--info)',OFFER_MADE:'var(--accent)',FOLLOW_UP:'var(--warn)',UNDER_CONTRACT:'#a371f7',CLOSED:'var(--ok)',DEAD:'var(--text-faint)'};
@@ -1417,26 +1539,40 @@ async function loadDeals(){
   el.dataset.loaded='1';
   if(!j.deals.length){ el.innerHTML='<div class="empty">No deals yet — leads dispositioned as Sale/Appt land here automatically.</div>'; return; }
   const stageOpts=(cur)=>j.stages.map(s=>`<option value="${s}"${s===cur?' selected':''}>${DEAL_LABELS[s]||s}</option>`).join('');
+  // Staleness: days since last touch. Active stages nag at 3d (amber) and 7d (red).
+  const NAG_STAGES=new Set(['NEW','OFFER_MADE','FOLLOW_UP']);
+  const staleDays=(d)=>Math.floor((Date.now()-new Date(d.deal.updated_at||d.deal.created_at||Date.now()).getTime())/86400e3);
   const byStage={}; j.deals.forEach(d=>{ (byStage[d.deal.stage||'NEW']=byStage[d.deal.stage||'NEW']||[]).push(d); });
+  for(const s of Object.keys(byStage)) byStage[s].sort((a,b)=>staleDays(b)-staleDays(a));   // oldest-touched first
   el.innerHTML=j.stages.filter(s=>byStage[s]&&byStage[s].length).map(s=>
     `<div class="prodGroup"><h3><span style="color:${DEAL_COLORS[s]}">●</span> ${DEAL_LABELS[s]} (${byStage[s].length})</h3>`+
     byStage[s].map(d=>{
       const name=[d.first_name,d.last_name].filter(Boolean).join(' ')||'—';
       const lastNote=(d.deal.notes||[]).slice(-1)[0];
-      return `<div style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:8px">
+      const days=staleDays(d);
+      const nag=NAG_STAGES.has(s)&&days>=3 ? (days>=7
+        ? `<span class="pill pill--danger" style="margin-left:auto">stale ${days}d</span>`
+        : `<span class="pill pill--warn" style="margin-left:auto">${days}d quiet</span>`) : '';
+      const stale7=NAG_STAGES.has(s)&&days>=7;
+      return `<div style="border:1px solid ${stale7?'var(--danger)':'var(--border)'};border-radius:10px;padding:10px 12px;margin-bottom:8px${stale7?';box-shadow:0 0 14px rgba(229,84,75,.18)':''}">
         <div style="display:flex;align-items:center;gap:8px">
           <b style="font-size:13.5px">${esc(name)}</b>
           <span class="mono dim" style="font-size:12px">${esc(d.phone||'')}</span>
-          <button class="btn btn-sm" data-dcall="${esc(d.phone||'')}" style="margin-left:auto">Call</button>
+          ${nag}
         </div>
         <div class="dim" style="font-size:12px;margin:3px 0 8px">${esc([d.address,d.city,d.state].filter(Boolean).join(', '))}</div>
         ${lastNote?`<div class="faint" style="font-size:11.5px;margin-bottom:8px">“${esc(lastNote.text)}” — ${esc(lastNote.by)}</div>`:''}
         <div style="display:flex;gap:6px">
           <select class="field" data-dstage="${d.id}" style="height:30px;font-size:12px;flex:1">${stageOpts(d.deal.stage||'NEW')}</select>
           <button class="btn btn-sm" data-dnote="${d.id}">＋ Note</button>
+          <button class="btn btn-sm" data-dcontract="${d.id}" title="Generate purchase agreement">📄</button>
+          <button class="btn btn-sm" data-dcall="${esc(d.phone||'')}">Call</button>
         </div>
       </div>`;
     }).join('')+'</div>').join('');
+  el.querySelectorAll('[data-dcontract]').forEach(b=>b.onclick=()=>{
+    const d=j.deals.find(x=>x.id===b.dataset.dcontract); if(d) openContract(d);
+  });
   el.querySelectorAll('[data-dstage]').forEach(sel=>sel.onchange=async()=>{
     try{ await apiJson('/api/agent/deals/'+sel.dataset.dstage,'POST',{stage:sel.value}); toast('Stage updated'); loadDeals(); }
     catch(e){ toast(e.message,'err'); } });
@@ -1589,7 +1725,9 @@ function beep(){
 }
 
 function clearLead(){
-  curLeadId=null; renderedLeadId=null; $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
+  curLeadId=null; renderedLeadId=null; curLeadObj=null;
+  const lr=$('leadRecs'); if(lr) lr.remove();
+  $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
   $('scriptBody').className='empty'; $('scriptBody').textContent='No active call.';
   $('history').className='empty'; $('history').textContent='No previous contact.';
   $('dispGrid').innerHTML=''; $('notes').value=''; $('cbWrap').classList.add('hidden');
@@ -1649,6 +1787,15 @@ $('padCall').onclick=async()=>{
   finally{ $('padCall').disabled=false; }
 };
 $('padNum').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); $('padCall').click(); } });
+
+// ── Raise hand: ping the supervisors (30s client-side cooldown) ──
+let handCooldown=0;
+$('handBtn').onclick=async()=>{
+  if(Date.now()<handCooldown){ toast('Supervisor already notified','warn'); return; }
+  try{ await apiJson('/api/agent/raise-hand','POST',{}); handCooldown=Date.now()+30000;
+    toast('🖐 Supervisor notified','ok'); }
+  catch(e){ toast(e.message,'err'); }
+};
 
 // ── Warm transfer to a closer ──
 $('cXfer').onclick=async()=>{
@@ -1995,7 +2142,7 @@ function anCard(s){
 
 // ═══════════ ADMIN: REPORTS ═══════════
 let adminWs=null, floorAgents=[], agentRepRows=[];
-const REPTITLES={audit:'Audit logs',calls:'Call logs',agent:'Agent report',research:'Research calls',map:'Office map',wallboard:'Wallboard'};
+const REPTITLES={audit:'Audit logs',calls:'Call logs',agent:'Agent report',research:'Research calls',map:'Office map',wallboard:'Wallboard',attendance:'Attendance'};
 
 // ═══════════ DIALER GUIDE — full feature manual (everyone except agents) ═══════════
 function dialerGuideHtml(role){
@@ -2027,7 +2174,9 @@ function dialerGuideHtml(role){
   sec('Taking a call: lead card, script, dispositions',['all','Everyone'],
     '<h4>Lead card</h4>Appears instantly when a call bridges: name, phone, address, custom CSV fields, attempts, and which caller ID the call went out on. <b>Notes</b> save to the contact history; <b>History</b> shows every previous touch.'+
     '<h4>Script</h4>The campaign script with the lead\'s real data merged into the {{fields}}. Under it, <b>Objections</b> — tap an objection to see the comeback (admin writes these per campaign).'+
-    '<h4>Dispositions</h4>Every connected call must be coded before the next one. Buttons have hotkeys (<kbd>1</kbd>–<kbd>7</kbd>). <b>Callback</b> asks for a date/time and routes the lead back to you at that time. <b>Sale / Appt / Lead</b> gives the long wrap and enrolls the lead in the closer Deal pipeline automatically. <b>DNC</b> permanently blocks the number.')+
+    '<h4>Dispositions</h4>Every connected call must be coded before the next one. Buttons have hotkeys (<kbd>1</kbd>–<kbd>7</kbd>). <b>Callback</b> asks for a date/time and routes the lead back to you at that time. <b>Sale / Appt / Lead</b> gives the long wrap and enrolls the lead in the closer Deal pipeline automatically. <b>DNC</b> permanently blocks the number.'+
+    '<h4>Fixing bad data</h4>Press <b>✎ Edit</b> on the lead card to correct name, address or email mid-call — saves straight to the lead.'+
+    '<h4>Raise hand</h4>The <b>🖐</b> button (top bar) pings every supervisor console and lights your seat up on the office map when you need help.')+
 
   sec('Call controls &amp; the dialpad',['all','Everyone'],
     '<ul>'+
@@ -2053,7 +2202,10 @@ function dialerGuideHtml(role){
     '<h4>Offer sheet</h4>The 🖨 button opens a clean printable summary (value, range, repairs, offer, comps) — print it or save as PDF for the seller. Allow popups if the browser blocks it.')+
 
   sec('Closer: Deals pipeline',['closer','Closer'],
-    'Every lead dispositioned <b>Sale / Appt / Lead</b> lands here automatically. Deals are grouped by stage: <b>New → Offer made → Follow-up → Under contract → Closed</b> (or Dead). Use the dropdown to move stages, <b>＋ Note</b> for timestamped notes, and <b>Call</b> to load the number into the dialpad ready to fire.')+
+    'Every lead dispositioned <b>Sale / Appt / Lead</b> lands here automatically. Deals are grouped by stage: <b>New → Offer made → Follow-up → Under contract → Closed</b> (or Dead). Use the dropdown to move stages, <b>＋ Note</b> for timestamped notes, and <b>Call</b> to load the number into the dialpad ready to fire.'+
+    '<h4>Stale-deal nudges</h4>Active deals untouched for 3+ days get an amber badge; 7+ days turns red and glows. Oldest-touched deals sort to the top of each stage — silence kills deals, the pipeline won\'t let you miss it.'+
+    '<h4>📄 Purchase agreement</h4>The contract button asks for buyer entity, price, earnest money and days-to-close, then opens a print-ready purchase &amp; sale agreement with the deal\'s name and address merged in (have an attorney bless the template for your state).'+
+    '<h4>Previous recordings</h4>When a call or deal pulls up a lead, the card shows playable recordings of every prior conversation — hear exactly what the seller told the agent before you dial.')+
 
   sec('Closer: Calendar',['closer','Closer'],
     'Your scheduled callbacks for the next 14 days, grouped by day — <b style="color:var(--danger)">overdue ones pinned to the top in red</b>. Each row has a Call button. Callbacks book themselves whenever you (or an agent) disposition a call as Callback with a time.')+
@@ -2090,6 +2242,7 @@ function dialerGuideHtml(role){
     '<li><b>Research</b> — look up every call ever made to one phone number.</li>'+
     '<li><b>Office map</b> — live floor: drag agents onto desks, see state + how long they\'ve been in it, <b>listen in</b> on live calls, <b>kick</b> a stuck agent, and the <b>📣 message bar</b> (next section).</li>'+
     '<li><b>Wallboard</b> — TV dashboard: dials, contact rate, sales, per-agent status.</li>'+
+    '<li><b>Attendance</b> — first clock-in / last clock-out / hours per agent per day, with late flags against your shift start time.</li>'+
     '</ul>')+
 
   sec('Floor messaging',['admin','Admin'],
@@ -2154,7 +2307,7 @@ function openReport(kind){
   $('repTitle').textContent=REPTITLES[kind]||''; $('repExport').classList.toggle('hidden', !showExport);
   $('repFilters').innerHTML=''; $('repBody').innerHTML='';
   if(kind!=='map') closeAdminWs();
-  ({audit:initAudit,calls:initCalls,agent:initAgent,research:initResearch,map:renderMap,wallboard:initWallboard}[kind]||(()=>{}))();
+  ({audit:initAudit,calls:initCalls,agent:initAgent,research:initResearch,map:renderMap,wallboard:initWallboard,attendance:initAttendance}[kind]||(()=>{}))();
 }
 // Hide the top-level admin tabs and report tiles a support user lacks. Admins see
 // everything. Called on every entry into the admin view.
@@ -2175,6 +2328,7 @@ function applyNavAccess(){
   setTile('rtile-agent', isAdmin || can('reports.agent_report'));
   setTile('rtile-research', isAdmin || can('reports.research'));
   setTile('rtile-map', isAdmin || can('reports.office_map'));
+  setTile('rtile-attendance', isAdmin || can('reports.agent_report'));
 }
 
 // ── User management ──
@@ -2606,10 +2760,50 @@ function openAdminWs(){
   const proto=location.protocol==='https:'?'wss':'ws';
   adminWs=new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
   adminWs.onmessage=(ev)=>{ let m; try{ m=JSON.parse(ev.data); }catch{ return; }
-    if(m.type==='floor.agent'){ const a=floorAgents.find(x=>x.id===m.agentId); if(a){ a.state=m.state; a.stateSince=m.stateSince||Date.now(); updateSeatState(a.id,m.state); } } };
+    if(m.type==='floor.agent'){ const a=floorAgents.find(x=>x.id===m.agentId); if(a){ a.state=m.state; a.stateSince=m.stateSince||Date.now(); updateSeatState(a.id,m.state); } }
+    else if(m.type==='floor.hand'){
+      try{ beep(); }catch{}
+      toast('🖐 '+m.name+' needs help ('+m.state+')','warn');
+      const floor=$('floor');
+      if(floor){ const el=floor.querySelector('.seat[data-aid="'+m.agentId+'"]');
+        if(el){ el.style.outline='2px solid var(--warn)'; el.style.boxShadow='0 0 22px rgba(232,161,61,.5)';
+          const b=el.querySelector('b'); if(b&&!b.textContent.startsWith('🖐')) b.textContent='🖐 '+b.textContent;
+          setTimeout(()=>{ el.style.outline=''; el.style.boxShadow=''; const bb=el.querySelector('b'); if(bb) bb.textContent=bb.textContent.replace(/^🖐 /,''); },120000);
+        } }
+    } };
   adminWs.onclose=()=>{ adminWs=null; };
 }
 function closeAdminWs(){ if(adminWs){ try{ adminWs.close(); }catch{} adminWs=null; } }
+// ── Attendance report ──
+async function initAttendance(){
+  $('repFilters').innerHTML=`
+    <div class="fw"><span class="lbl">Range</span><select id="atDays" class="field">
+      <option value="7">Last 7 days</option><option value="14">Last 14 days</option><option value="31">Last 31 days</option></select></div>
+    <div class="fw"><span class="lbl">Shift starts</span><input id="atShift" class="field" type="time" value="09:00" style="width:110px"></div>
+    <button id="atGo" class="btn btn-primary" style="align-self:flex-end">Apply</button>`;
+  $('atGo').onclick=loadAttendance; $('atDays').onchange=loadAttendance;
+  loadAttendance();
+}
+async function loadAttendance(){
+  $('repBody').innerHTML='<div class="empty">Loading…</div>';
+  let j; try{ j=await apiJson('/api/admin/reports/attendance?days='+$('atDays').value+'&shift_start='+encodeURIComponent($('atShift').value||'09:00')); }
+  catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
+  if(!j.rows.length){ $('repBody').innerHTML='<div class="empty">No activity in this range.</div>'; return; }
+  const hm=(iso)=>iso?new Date(iso).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false}):'—';
+  const hrs=(s)=>{ const h=Math.floor(s/3600),m=Math.round((s%3600)/60); return h+'h '+String(m).padStart(2,'0')+'m'; };
+  $('repBody').innerHTML=`<div class="tblwrap"><table>
+    <thead><tr><th>Date</th><th>Agent</th><th>First in</th><th>Last out</th><th>Hours</th><th></th></tr></thead><tbody>`+
+    j.rows.map(r=>`<tr>
+      <td class="mono" style="font-size:12.5px">${r.date}</td>
+      <td>${esc(r.name)}</td>
+      <td class="mono">${r.first_in_hm}</td>
+      <td class="mono">${r.still_on?'<span class="pill pill--ok">on now</span>':hm(r.last_out)}</td>
+      <td class="mono">${hrs(r.seconds)}</td>
+      <td>${r.late?'<span class="pill pill--danger">late</span>':''}</td>
+    </tr>`).join('')+'</tbody></table></div>'+
+    `<p class="dim" style="font-size:11.5px;margin-top:8px">Late = first clock-in after ${esc(j.shift_start)}. Hours = total time logged in (incl. calls, wrap, break).</p>`;
+}
+
 async function renderMap(){
   try{ const j=await apiJson('/api/admin/floor'); floorAgents=j.agents; }
   catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
