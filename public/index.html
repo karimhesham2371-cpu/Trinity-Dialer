@@ -6,7 +6,7 @@
 <title>Trinity Dialer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
   :root{
     /* Surfaces */
@@ -329,13 +329,131 @@
   .auxMenu button:hover{background:var(--surface-3,rgba(255,255,255,.06))}
   .auxMenu .auxHint{margin-left:auto;font:500 10px var(--font-mono);color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em}
 </style>
+<style id="themeV2">
+  /* ═══════════ TRINITY THEME V2 — "mission control" overlay ═══════════
+     Pure restyle: every selector matches the existing markup/JS hooks.
+     Loaded after the base sheet so equal-specificity rules win here.   */
+  :root{
+    --bg:#070A11; --surface:#0F141F; --surface-2:#161C2A; --surface-3:#1D2434;
+    --border:rgba(148,163,190,.10); --border-strong:rgba(148,163,190,.20);
+    --text:#EAEEF6; --text-dim:#939DB2; --text-faint:#5B6579;
+    --accent:#EFB63C; --accent-hover:#F8C955; --accent-ink:#161005;
+    --font-disp:"Space Grotesk","IBM Plex Sans",system-ui,sans-serif;
+    --glow-accent:rgba(239,182,60,.22);
+  }
+  /* Ambient depth: two fixed radial glows + vignette behind everything */
+  body{background:
+        radial-gradient(1000px 520px at 12% -8%, rgba(239,182,60,.065), transparent 60%),
+        radial-gradient(1100px 640px at 104% 112%, rgba(91,141,239,.055), transparent 55%),
+        linear-gradient(180deg,#080B13,#06080F 70%)}
+  /* Slim styled scrollbars */
+  *{scrollbar-width:thin;scrollbar-color:rgba(148,163,190,.22) transparent}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:rgba(148,163,190,.18);border-radius:8px;border:3px solid transparent;background-clip:content-box}
+  ::-webkit-scrollbar-thumb:hover{background:rgba(148,163,190,.32);border:3px solid transparent;background-clip:content-box}
+  ::-webkit-scrollbar-track{background:transparent}
+
+  /* Display typeface for identity + headings + hero numbers */
+  .brand h1,h2,.anname,.leadName,.wbk-val,.modal h3,.rtile h3,.agp-name,.callBanner .big{font-family:var(--font-disp)}
+
+  /* ── surfaces ── */
+  .card,.ancard,.wbcard,.rtile{background:linear-gradient(180deg,#121828,#0E131E);
+       border:1px solid rgba(148,163,190,.12);border-radius:14px;
+       box-shadow:inset 0 1px 0 rgba(255,255,255,.045), 0 10px 28px rgba(0,0,0,.30)}
+  .loginCard{max-width:400px;padding:30px;border-radius:18px}
+  .modal{border-radius:18px;background:linear-gradient(180deg,#141A2B,#0F141F)}
+  #modalBack{backdrop-filter:blur(5px);background:rgba(3,5,9,.6)}
+
+  /* ── app chrome ── */
+  .appbar{background:rgba(10,14,22,.74);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+          border-bottom:1px solid rgba(148,163,190,.12)}
+  .brand .mark{background:linear-gradient(145deg,#F6C64F,#D99A26);border-radius:10px;
+               box-shadow:0 0 16px var(--glow-accent), inset 0 1px 0 rgba(255,255,255,.35)}
+  .brand h1{letter-spacing:.005em}
+
+  /* ── buttons ── */
+  .btn{border-radius:10px;border:1px solid rgba(148,163,190,.18);background:rgba(255,255,255,.025);
+       transition:background .13s ease-out,border-color .13s ease-out,transform .13s ease-out,box-shadow .13s ease-out}
+  .btn:hover{background:rgba(255,255,255,.06);transform:translateY(-1px)}
+  .btn:active{transform:translateY(0)}
+  .btn:disabled{transform:none}
+  .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .btn-primary{background:linear-gradient(180deg,#F5C24E,#E0A62F);border-color:transparent;
+               box-shadow:0 4px 16px rgba(239,182,60,.22), inset 0 1px 0 rgba(255,255,255,.35)}
+  .btn-primary:hover{background:linear-gradient(180deg,#F8CB60,#E7AE38);box-shadow:0 6px 20px rgba(239,182,60,.30), inset 0 1px 0 rgba(255,255,255,.35)}
+  .btn-danger:hover{box-shadow:0 4px 14px rgba(229,84,75,.28)}
+
+  /* ── inputs ── */
+  .field,.csel-btn{background:#0A0F19;border-radius:10px;border:1px solid rgba(148,163,190,.14)}
+  .field:focus,.csel-btn.open{border-color:var(--accent);box-shadow:0 0 0 3px rgba(239,182,60,.14)}
+  .csel-list{border-radius:12px;background:rgba(22,28,42,.96);backdrop-filter:blur(10px);box-shadow:0 16px 40px rgba(0,0,0,.55)}
+
+  /* ── left-panel tabs → segmented control ── */
+  .ltabs{display:inline-flex;gap:2px;background:var(--surface-2);border:1px solid rgba(148,163,190,.12);
+         border-radius:10px;padding:3px;border-bottom:none;margin:0 0 14px}
+  .ltab{padding:6px 12px;border-radius:8px;border-bottom:none;margin-bottom:0}
+  .ltab.active{background:var(--surface-3);color:var(--accent);border-bottom:none;
+               box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 1px 4px rgba(0,0,0,.35)}
+
+  /* ── admin nav tabs → pill rail ── */
+  .navtab{height:34px;border-radius:999px;padding:0 14px}
+  .navtab.active{background:linear-gradient(180deg,#F5C24E,#E0A62F);color:var(--accent-ink);
+                 box-shadow:0 3px 12px rgba(239,182,60,.25)}
+
+  /* ── call banner + timer ── */
+  .callBanner{border-radius:14px;border:1px solid rgba(148,163,190,.14);
+              background:linear-gradient(90deg,rgba(239,182,60,.07),rgba(18,24,40,.0) 45%),linear-gradient(180deg,#121828,#0E131E)}
+  .timer{font-size:26px;color:var(--accent);text-shadow:0 0 20px var(--glow-accent)}
+
+  /* ── call controls + dialpad ── */
+  .ctrlBtn{border-radius:12px;background:rgba(255,255,255,.03)}
+  .ctrlBtn:hover{border-color:rgba(239,182,60,.45)}
+  .dialpad{gap:9px}
+  .dialpad button{height:48px;border-radius:12px;background:#111726;border:1px solid rgba(148,163,190,.16);
+                  font-size:17px;transition:background .1s,border-color .1s,color .1s,transform .08s}
+  .dialpad button:hover{border-color:rgba(239,182,60,.5);color:var(--accent);background:#151C2E}
+  .dialpad button:active{transform:scale(.94)}
+  .dispBtn{border-radius:10px;background:rgba(255,255,255,.02);transition:border-color .12s,background .12s}
+  .dispBtn:hover{border-color:rgba(239,182,60,.45);background:rgba(239,182,60,.05)}
+
+  /* ── tables ── */
+  thead tr{background:#141A29}
+  th{height:38px}
+  tbody tr:hover{background:rgba(239,182,60,.045)}
+  .tblwrap{border-radius:12px}
+  table.antbl th{border-bottom-color:rgba(148,163,190,.18)}
+
+  /* ── report tiles ── */
+  .rtile{transition:border-color .14s,transform .14s,box-shadow .14s}
+  .rtile:hover{border-color:rgba(239,182,60,.5);transform:translateY(-2px);
+               box-shadow:0 14px 34px rgba(0,0,0,.4), 0 0 0 1px rgba(239,182,60,.14)}
+
+  /* ── misc chrome ── */
+  .toast{border-radius:10px;background:rgba(22,28,42,.92);backdrop-filter:blur(8px)}
+  .auxMenu{border-radius:12px;background:rgba(22,28,42,.96);backdrop-filter:blur(10px)}
+  .seat{border-radius:12px;box-shadow:0 3px 10px rgba(0,0,0,.28)}
+  .agpanel{background:linear-gradient(180deg,#121828,#0E131E)}
+  #log{border-radius:10px;background:#080C14}
+  .pill{background:rgba(148,163,190,.10)}
+  .chip{background:rgba(148,163,190,.08)}
+  .permitem{border-radius:10px}
+  .dropzone{border-radius:12px}
+  .floorwrap{border-radius:14px;background:
+       radial-gradient(700px 380px at 50% 0%, rgba(91,141,239,.05), transparent 60%),#0E131E}
+  .wbk-val{letter-spacing:-.01em}
+  @media(prefers-reduced-motion:reduce){
+    .btn:hover,.rtile:hover{transform:none}
+    .dialpad button:active{transform:none}
+  }
+</style>
 </head>
 <body>
 
 <!-- ═══ LOGIN ═══ -->
 <div id="viewLogin">
   <div class="loginCard card">
-    <div class="brand" style="margin-bottom:22px"><div class="mark">T</div><h1>Trinity Dialer</h1></div>
+    <div class="brand" style="margin-bottom:6px"><div class="mark">T</div><h1>Trinity Dialer</h1></div>
+    <p class="dim" style="font-size:12.5px;margin:0 0 22px 42px">Cloud power dialing · sign in to your console</p>
     <label class="lbl">Email or username</label>
     <input id="liEmail" class="field" autocomplete="username" />
     <label class="lbl mt">Password</label>
