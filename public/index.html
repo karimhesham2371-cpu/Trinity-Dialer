@@ -523,6 +523,7 @@
   <div id="reconnBanner" class="reconn hidden">Reconnecting…</div>
   <div id="kickBanner" class="reconn hidden" style="background:#dc2626"></div>
   <div id="sessBanner" class="reconn hidden" style="background:#b45309;cursor:pointer" onclick="location.reload()">Session expired — finish your current call, then click here to sign in again.</div>
+  <div id="floorMsg" class="reconn hidden" style="background:var(--info);color:#fff;cursor:pointer" title="Click to dismiss"></div>
   <div class="appbar">
     <div class="brand"><div class="mark">T</div><h1>Trinity</h1></div>
     <span id="agState" class="pill pill--faint"><span class="dot dot--faint"></span> Offline</span>
@@ -547,9 +548,16 @@
           <button id="ltScript" class="ltab active" onclick="agLeftTab('script')">Script</button>
           <button id="ltProd" class="ltab" onclick="agLeftTab('prod')">Productivity</button>
           <button id="ltMarket" class="ltab hidden" onclick="agLeftTab('market')">Market Value</button>
+          <button id="ltDeals" class="ltab hidden" onclick="agLeftTab('deals')">Deals</button>
+          <button id="ltCal" class="ltab hidden" onclick="agLeftTab('cal')">Calendar</button>
         </div>
-        <div id="scriptBody" class="empty">No active call.</div>
+        <div id="scriptWrap">
+          <div id="scriptBody" class="empty">No active call.</div>
+          <div id="rebutWrap" class="hidden" style="margin-top:14px"></div>
+        </div>
         <div id="prodBody" class="hidden"></div>
+        <div id="dealsBody" class="hidden"></div>
+        <div id="calBody" class="hidden"></div>
         <div id="mvBody" class="hidden">
           <p class="dim" style="font-size:12px;margin-bottom:8px">Enter a property address to pull its estimated market value and recent comparable sales.</p>
           <div style="display:flex;gap:6px;margin-bottom:10px">
@@ -599,6 +607,10 @@
           <button id="cHold" class="btn ctrlBtn" disabled><span class="ic">⏸</span><span>Hold</span></button>
           <button id="cPad"  class="btn ctrlBtn" disabled><span class="ic">⌨</span><span>Dialpad</span></button>
           <button id="cHang" class="btn ctrlBtn danger" disabled><span class="ic">☎</span><span>Hang up</span></button>
+        </div>
+        <div id="xferWrap" class="mt2 hidden" style="position:relative">
+          <button id="cXfer" class="btn btn-block">⇄ Transfer to closer</button>
+          <div id="xferMenu" class="auxMenu hidden" style="left:0;right:0;top:calc(100% + 6px)"></div>
         </div>
         <div id="padWrap" class="mt3 hidden">
           <div id="padDialRow" style="margin-bottom:8px">
@@ -757,6 +769,13 @@
           Reset a password, rename, change role, activate/deactivate, or delete any user.
           Deleting removes their softphone credential and campaign assignments.
           You can't delete your own account or the last active admin.</p>
+        <h2 class="mt" style="margin-bottom:6px">Daily agent goals</h2>
+        <p class="dim" style="font-size:12.5px;margin:0 0 10px">Targets every agent sees as progress bars in their Productivity tab. 0 = no target.</p>
+        <div class="row">
+          <div><label class="lbl">Calls handled / day</label><input id="glCalls" class="field mono" inputmode="numeric"></div>
+          <div><label class="lbl">Sales &amp; appts / day</label><input id="glSales" class="field mono" inputmode="numeric"></div>
+        </div>
+        <button id="glSave" class="btn btn-primary mt3">Save goals</button>
       </div>
     </div>
     <div class="card mt">
@@ -922,8 +941,11 @@ function route(){
   if(!TOKEN||!USER){ show('login'); return; }
   if(USER.role==='admin'||USER.role==='support'){ show('admin'); $('adWho').textContent=USER.name+' · '+USER.email; loadAdmin(); }
   else { show('agent'); $('agWho').textContent=USER.name; initAudioSettings();
-    // Closers get the same calling console plus a Market Value tab.
-    $('ltMarket').classList.toggle('hidden', USER.role!=='closer');
+    // Closers get the same calling console plus Market Value / Deals / Calendar.
+    const closer = USER.role==='closer';
+    $('ltMarket').classList.toggle('hidden', !closer);
+    $('ltDeals').classList.toggle('hidden', !closer);
+    $('ltCal').classList.toggle('hidden', !closer);
     startAgent(); }
 }
 
@@ -952,6 +974,14 @@ function openWs(){
         renderLead(m.lead, m.caller_id);
         renderScript(m.campaign);
         renderDispositions(m.campaign&&m.campaign.dispositions||[]); }
+    }
+    else if(m.type==='floor.msg'){
+      const fb=$('floorMsg');
+      fb.textContent='📣 '+m.from+': '+m.text;
+      fb.classList.remove('hidden');
+      fb.onclick=()=>fb.classList.add('hidden');
+      try{ beep(); }catch{}
+      toast('Message from '+m.from,'warn');
     }
     else if(m.type==='kicked'){ handleKicked(m); } };
   sock.onerror = ()=>{ log('ws error'); };
@@ -993,6 +1023,8 @@ function applyState(s, snap){
   $('cPad').disabled=(s==='OFFLINE'||s==='CONNECTING');
   $('padDialRow').classList.toggle('hidden',live);
   $('padCall').classList.toggle('hidden',live);
+  $('xferWrap').classList.toggle('hidden',!live);
+  if(!live) $('xferMenu').classList.add('hidden');
   $('cHang').disabled=!(s==='ON_CALL'||s==='DIALING'||s==='CLAIMING');
   if(snap&&snap.onCallSince) onCallSince=snap.onCallSince;
   if(snap&&snap.wrapUntil) serverWrapUntil=snap.wrapUntil;
@@ -1203,24 +1235,37 @@ function renderLead(l, callerId){
   if(renderedLeadId!==l.id){ $('notes').value=''; renderedLeadId=l.id; }
 }
 function renderScript(c){
-  if(!c||!c.script){ $('scriptBody').className='empty'; $('scriptBody').textContent='No script set for this campaign.'; return; }
-  $('scriptBody').className='';
-  $('scriptBody').innerHTML=esc(c.script_merged||c.script);
+  if(!c||!c.script){ $('scriptBody').className='empty'; $('scriptBody').textContent='No script set for this campaign.'; }
+  else { $('scriptBody').className=''; $('scriptBody').innerHTML=esc(c.script_merged||c.script); }
+  renderRebuttals(c&&c.rebuttals||[]);
+}
+// Objection cheat-sheet under the script: tap an objection, see the comeback.
+function renderRebuttals(items){
+  const w=$('rebutWrap');
+  if(!items.length){ w.classList.add('hidden'); w.innerHTML=''; return; }
+  w.classList.remove('hidden');
+  w.innerHTML='<div class="prodGroup"><h3>Objections</h3></div>'+items.map(r=>
+    `<details style="margin-bottom:6px;border:1px solid var(--border);border-radius:10px;overflow:hidden">
+       <summary style="padding:9px 12px;cursor:pointer;font:600 13px var(--font-ui);color:var(--text)">“${esc(r.q)}”</summary>
+       <div style="padding:2px 12px 11px;font-size:13.5px;line-height:1.55;color:var(--text-dim);white-space:pre-wrap">${esc(r.a)}</div>
+     </details>`).join('');
 }
 let prodPollT=null;
 function prodDur(sec){ sec=Math.max(0,Math.round(sec||0)); const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;
   if(h) return h+'h '+m+'m'; if(m) return m+'m '+s+'s'; return s+'s'; }
 function agLeftTab(which){
-  $('ltScript').classList.toggle('active',which==='script');
-  $('ltProd').classList.toggle('active',which==='prod');
-  $('ltMarket').classList.toggle('active',which==='market');
-  $('scriptBody').classList.toggle('hidden',which!=='script');
-  $('prodBody').classList.toggle('hidden',which!=='prod');
-  $('mvBody').classList.toggle('hidden',which!=='market');
+  const tabs={script:'ltScript',prod:'ltProd',market:'ltMarket',deals:'ltDeals',cal:'ltCal'};
+  const bodies={script:'scriptWrap',prod:'prodBody',market:'mvBody',deals:'dealsBody',cal:'calBody'};
+  for(const k of Object.keys(tabs)){
+    $(tabs[k]).classList.toggle('active',k===which);
+    $(bodies[k]).classList.toggle('hidden',k!==which);
+  }
   if(which==='prod'){
     loadProductivity();
     if(!prodPollT) prodPollT=setInterval(()=>{ const p=$('prodBody'); if(!p||p.classList.contains('hidden')||$('viewAgent').classList.contains('hidden')){ clearInterval(prodPollT); prodPollT=null; return; } loadProductivity(true); },5000);
   } else if(prodPollT){ clearInterval(prodPollT); prodPollT=null; }
+  if(which==='deals') loadDeals();
+  if(which==='cal') loadCalendar();
 }
 
 // ── Closer Market Value lookup (RentCast AVM + external quick-links) ──
@@ -1249,14 +1294,170 @@ async function mvLookup(){
         <div class="prodStat"><span class="pl">Range</span><span class="pv">${mvMoney(j.low)} – ${mvMoney(j.high)}</span></div>
       </div>`+
       (comps?`<div class="prodGroup"><h3>Recent comparable sales</h3>${comps}</div>`:'')+
+      `<div class="prodGroup" style="margin-top:14px"><h3>Offer calculator</h3>
+        <div class="row mt2">
+          <div><label class="lbl">ARV ($)</label><input id="ocArv" class="field mono" inputmode="numeric" value="${j.estimate||''}"></div>
+          <div><label class="lbl">Sqft</label><input id="ocSqft" class="field mono" inputmode="numeric" value="${(j.subject&&j.subject.sqft)||''}" placeholder="?"></div>
+        </div>
+        <label class="lbl mt2">Condition / repairs</label>
+        <select id="ocLevel" class="field">
+          <option value="light">Light — cosmetic ($${j.calc.repair_presets.light}/sqft)</option>
+          <option value="medium" selected>Medium — dated ($${j.calc.repair_presets.medium}/sqft)</option>
+          <option value="heavy">Heavy — full rehab ($${j.calc.repair_presets.heavy}/sqft)</option>
+        </select>
+        <div id="ocOut" class="mt2"></div>
+        <button id="ocSheet" class="btn btn-block mt2">🖨 Offer sheet</button>
+      </div>`+
       (j.note?`<p class="dim" style="font-size:11px;margin-top:8px">${esc(j.note)}</p>`:'')+
       links;
+    wireOfferCalc(j);
   }catch(e){
     $('mvResult').innerHTML='<div class="empty">'+esc(e.message)+'</div>';
   }finally{ btn.disabled=false; btn.textContent='Look up'; }
 }
 $('mvGo').onclick=mvLookup;
 $('mvAddr').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); mvLookup(); } });
+
+// Offer math (Karim's rules): repairs = $/sqft preset x sqft (rounded to $500),
+// MAO = ARV x 70% - repairs, opening offer = 93% of MAO.
+function wireOfferCalc(j){
+  const r500=(n)=>Math.round(n/500)*500;
+  const calc=()=>{
+    const arv=+String($('ocArv').value).replace(/[^\d]/g,'')||0;
+    const sqft=+String($('ocSqft').value).replace(/[^\d]/g,'')||0;
+    const per=j.calc.repair_presets[$('ocLevel').value]||30;
+    if(!arv||!sqft){ $('ocOut').innerHTML='<p class="dim" style="font-size:12px">Enter ARV and sqft to see offers.</p>'; return; }
+    const repairs=r500(per*sqft);
+    const mao=r500(arv*j.calc.mao_pct-repairs);
+    const open=r500(mao*j.calc.opening_pct);
+    lastOffer={address:j.address,estimate:j.estimate,low:j.low,high:j.high,comps:j.comps,arv,sqft,repairs,mao,open,level:$('ocLevel').value};
+    $('ocOut').innerHTML=
+      `<div class="prodStat"><span class="pl">Repair estimate</span><span class="pv">${mvMoney(repairs)}</span></div>
+       <div class="prodStat"><span class="pl">Max offer (MAO)</span><span class="pv" style="color:var(--accent)">${mvMoney(mao)}</span></div>
+       <div class="prodStat"><span class="pl">Opening offer</span><span class="pv" style="color:var(--ok)">${mvMoney(open)}</span></div>
+       <p class="dim" style="font-size:11px;margin:6px 0 0">(${mvMoney(arv)} × 70%) − ${mvMoney(repairs)} repairs = ${mvMoney(mao)}</p>`;
+  };
+  ['ocArv','ocSqft'].forEach(id=>$(id).addEventListener('input',calc));
+  $('ocLevel').addEventListener('change',calc);
+  $('ocSheet').onclick=()=>{ if(!lastOffer){ toast('Enter ARV and sqft first','warn'); return; } openOfferSheet(lastOffer); };
+  calc();
+}
+let lastOffer=null;
+// One-click printable offer sheet — opens a clean document, browser handles PDF.
+function openOfferSheet(o){
+  const compRows=(o.comps||[]).map(c=>`<tr><td>${esc(c.address||'—')}</td><td>${c.beds!=null?c.beds+'bd/'+(c.baths??'—')+'ba':'—'}</td><td>${c.sqft?c.sqft.toLocaleString():'—'}</td><td style="text-align:right">${mvMoney(c.price)}</td></tr>`).join('');
+  const w=window.open('','_blank');
+  if(!w){ toast('Popup blocked — allow popups for this site','err'); return; }
+  w.document.write(`<!DOCTYPE html><html><head><title>Offer — ${esc(o.address)}</title><style>
+    body{font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;color:#1a2030;max-width:680px;margin:40px auto;padding:0 24px}
+    h1{font-size:21px;margin:0 0 2px} .sub{color:#6b7488;margin:0 0 24px;font-size:13px}
+    table{width:100%;border-collapse:collapse;font-size:13px;margin:8px 0 20px}
+    th{text-align:left;color:#6b7488;font-size:11px;text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;border-bottom:2px solid #e3e7ef}
+    td{padding:7px 8px;border-bottom:1px solid #eef1f6}
+    .big{display:flex;gap:14px;margin:18px 0}
+    .box{flex:1;border:1px solid #e3e7ef;border-radius:10px;padding:14px 16px}
+    .box .v{font-size:22px;font-weight:700} .box .k{font-size:11px;color:#6b7488;text-transform:uppercase;letter-spacing:.05em;margin-top:2px}
+    .hl{border-color:#caa53d;background:#fdf8ec}
+    .foot{color:#9aa2b2;font-size:11px;margin-top:28px}
+    @media print{body{margin:12px auto}}
+  </style></head><body>
+    <h1>Property Offer Summary</h1>
+    <p class="sub">${esc(o.address)} · prepared ${new Date().toLocaleDateString()}</p>
+    <div class="big">
+      <div class="box"><div class="v">${mvMoney(o.estimate)}</div><div class="k">Est. market value</div></div>
+      <div class="box"><div class="v">${mvMoney(o.low)} – ${mvMoney(o.high)}</div><div class="k">Value range</div></div>
+    </div>
+    <div class="big">
+      <div class="box"><div class="v">${mvMoney(o.repairs)}</div><div class="k">Repair estimate (${esc(o.level)})</div></div>
+      <div class="box hl"><div class="v">${mvMoney(o.open)}</div><div class="k">Our offer</div></div>
+    </div>
+    ${compRows?`<h1 style="font-size:15px;margin-top:26px">Recent comparable sales</h1>
+    <table><thead><tr><th>Address</th><th>Bed/Bath</th><th>Sqft</th><th style="text-align:right">Sold</th></tr></thead><tbody>${compRows}</tbody></table>`:''}
+    <p class="foot">Estimates are based on public records and automated valuation models; final offer subject to walkthrough.</p>
+    <script>window.print()<\/script>
+  </body></html>`);
+  w.document.close();
+}
+// ── Closer deal pipeline ──
+const DEAL_LABELS={NEW:'New',OFFER_MADE:'Offer made',FOLLOW_UP:'Follow-up',UNDER_CONTRACT:'Under contract',CLOSED:'Closed',DEAD:'Dead'};
+const DEAL_COLORS={NEW:'var(--info)',OFFER_MADE:'var(--accent)',FOLLOW_UP:'var(--warn)',UNDER_CONTRACT:'#a371f7',CLOSED:'var(--ok)',DEAD:'var(--text-faint)'};
+async function loadDeals(){
+  const el=$('dealsBody');
+  if(!el.dataset.loaded) el.innerHTML='<div class="empty">Loading…</div>';
+  let j; try{ j=await apiJson('/api/agent/deals'); }
+  catch(e){ el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
+  el.dataset.loaded='1';
+  if(!j.deals.length){ el.innerHTML='<div class="empty">No deals yet — leads dispositioned as Sale/Appt land here automatically.</div>'; return; }
+  const stageOpts=(cur)=>j.stages.map(s=>`<option value="${s}"${s===cur?' selected':''}>${DEAL_LABELS[s]||s}</option>`).join('');
+  const byStage={}; j.deals.forEach(d=>{ (byStage[d.deal.stage||'NEW']=byStage[d.deal.stage||'NEW']||[]).push(d); });
+  el.innerHTML=j.stages.filter(s=>byStage[s]&&byStage[s].length).map(s=>
+    `<div class="prodGroup"><h3><span style="color:${DEAL_COLORS[s]}">●</span> ${DEAL_LABELS[s]} (${byStage[s].length})</h3>`+
+    byStage[s].map(d=>{
+      const name=[d.first_name,d.last_name].filter(Boolean).join(' ')||'—';
+      const lastNote=(d.deal.notes||[]).slice(-1)[0];
+      return `<div style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <b style="font-size:13.5px">${esc(name)}</b>
+          <span class="mono dim" style="font-size:12px">${esc(d.phone||'')}</span>
+          <button class="btn btn-sm" data-dcall="${esc(d.phone||'')}" style="margin-left:auto">Call</button>
+        </div>
+        <div class="dim" style="font-size:12px;margin:3px 0 8px">${esc([d.address,d.city,d.state].filter(Boolean).join(', '))}</div>
+        ${lastNote?`<div class="faint" style="font-size:11.5px;margin-bottom:8px">“${esc(lastNote.text)}” — ${esc(lastNote.by)}</div>`:''}
+        <div style="display:flex;gap:6px">
+          <select class="field" data-dstage="${d.id}" style="height:30px;font-size:12px;flex:1">${stageOpts(d.deal.stage||'NEW')}</select>
+          <button class="btn btn-sm" data-dnote="${d.id}">＋ Note</button>
+        </div>
+      </div>`;
+    }).join('')+'</div>').join('');
+  el.querySelectorAll('[data-dstage]').forEach(sel=>sel.onchange=async()=>{
+    try{ await apiJson('/api/agent/deals/'+sel.dataset.dstage,'POST',{stage:sel.value}); toast('Stage updated'); loadDeals(); }
+    catch(e){ toast(e.message,'err'); } });
+  el.querySelectorAll('[data-dnote]').forEach(b=>b.onclick=async()=>{
+    const t=prompt('Note for this deal:'); if(!t||!t.trim()) return;
+    try{ await apiJson('/api/agent/deals/'+b.dataset.dnote,'POST',{note:t}); toast('Note added'); loadDeals(); }
+    catch(e){ toast(e.message,'err'); } });
+  el.querySelectorAll('[data-dcall]').forEach(b=>b.onclick=()=>prefillDial(b.dataset.dcall));
+}
+
+// ── Closer calendar: scheduled callbacks, overdue first ──
+async function loadCalendar(){
+  const el=$('calBody');
+  if(!el.dataset.loaded) el.innerHTML='<div class="empty">Loading…</div>';
+  let j; try{ j=await apiJson('/api/agent/calendar'); }
+  catch(e){ el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
+  el.dataset.loaded='1';
+  if(!j.items.length){ el.innerHTML='<div class="empty">No callbacks scheduled. Disposition a call as Callback to book one.</div>'; return; }
+  const days={};
+  j.items.forEach(it=>{
+    const d=new Date(it.next_callback_at);
+    const overdue=d.getTime()<Date.now();
+    const key=overdue?'⚠ Overdue':d.toLocaleDateString([],{weekday:'long',month:'short',day:'numeric'});
+    (days[key]=days[key]||[]).push({...it,overdue});
+  });
+  el.innerHTML=Object.entries(days).map(([day,items])=>
+    `<div class="prodGroup"><h3${day.startsWith('⚠')?' style="color:var(--danger)"':''}>${day}</h3>`+
+    items.map(it=>{
+      const name=[it.first_name,it.last_name].filter(Boolean).join(' ')||'—';
+      const t=new Date(it.next_callback_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false});
+      return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+        <span class="mono" style="font-size:13px;font-weight:600;color:${it.overdue?'var(--danger)':'var(--accent)'}">${t}</span>
+        <div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:600">${esc(name)}</div>
+          <div class="dim" style="font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc([it.address,it.city].filter(Boolean).join(', '))}</div></div>
+        <button class="btn btn-sm" data-ccall="${esc(it.phone||'')}">Call</button>
+      </div>`;
+    }).join('')+'</div>').join('');
+  el.querySelectorAll('[data-ccall]').forEach(b=>b.onclick=()=>prefillDial(b.dataset.ccall));
+}
+
+// Load a number into the dialpad ready to fire.
+function prefillDial(phone){
+  if(!phone) return;
+  $('padNum').value=phone;
+  $('padWrap').classList.remove('hidden');
+  if(!callerIds.length) loadCallerIds();
+  toast('Number loaded — press Call','ok');
+}
+
 async function loadProductivity(quiet){
   const el=$('prodBody'); if(!el) return;
   if(!quiet && !el.dataset.loaded) el.innerHTML='<div class="empty">Loading…</div>';
@@ -1269,8 +1470,23 @@ async function loadProductivity(quiet){
     <div class="prodStat"><span class="pl">Wrap-up duration</span><span class="pv">${prodDur(d.wrap)}</span></div>
     <div class="prodStat"><span class="pl">Wait duration</span><span class="pv">${prodDur(d.wait)}</span></div>
     <div class="prodStat"><span class="pl">Avg wait between calls</span><span class="pv">${prodDur(d.calls?(d.wait||0)/d.calls:0)}</span></div>
-    <div class="prodStat"><span class="pl">Calls handled</span><span class="pv">${d.calls||0}</span></div></div>`;
-  el.innerHTML=grp('Today','',j.today||{})+grp('Overall','Resets at the start of each month',j.month||{});
+    <div class="prodStat"><span class="pl">Calls handled</span><span class="pv">${d.calls||0}</span></div>
+    <div class="prodStat"><span class="pl">Sales / appts</span><span class="pv">${d.sales||0}</span></div></div>`;
+  // Daily goal tracker: progress bars fill through the shift, gold → green at 100%.
+  const goalBar=(label,cur,target)=>{
+    const pct=Math.min(100,Math.round(cur/target*100));
+    const col=pct>=100?'var(--ok)':'var(--accent)';
+    return `<div style="padding:7px 0">
+      <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:5px">
+        <span class="dim">${label}</span><span class="mono" style="color:${col};font-weight:600">${cur} / ${target}</span></div>
+      <div style="height:7px;border-radius:5px;background:var(--surface-2);overflow:hidden">
+        <div style="height:100%;width:${pct}%;border-radius:5px;background:${col};transition:width .4s"></div></div></div>`;
+  };
+  const gl=j.goals||{}, t=j.today||{};
+  const goalsHtml=(gl.calls||gl.sales)?`<div class="prodGroup"><h3>Today's goals</h3>`+
+    (gl.calls?goalBar('Calls handled',t.calls||0,gl.calls):'')+
+    (gl.sales?goalBar('Sales / appts',t.sales||0,gl.sales):'')+`</div>`:'';
+  el.innerHTML=goalsHtml+grp('Today','',t)+grp('Overall','Resets at the start of each month',j.month||{});
 }
 function renderHistory(h){
   if(!h.length){ $('history').className='empty'; $('history').textContent='No previous contact.'; return; }
@@ -1405,6 +1621,23 @@ $('padCall').onclick=async()=>{
   finally{ $('padCall').disabled=false; }
 };
 $('padNum').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); $('padCall').click(); } });
+
+// ── Warm transfer to a closer ──
+$('cXfer').onclick=async()=>{
+  const menu=$('xferMenu');
+  if(!menu.classList.contains('hidden')){ menu.classList.add('hidden'); return; }
+  menu.innerHTML='<button disabled>Loading closers…</button>'; menu.classList.remove('hidden');
+  let j; try{ j=await apiJson('/api/agent/closers'); }
+  catch(e){ menu.classList.add('hidden'); toast(e.message,'err'); return; }
+  if(!j.closers.length){ menu.innerHTML='<button disabled>No closers available right now</button>'; return; }
+  menu.innerHTML=j.closers.map(c=>`<button data-xfer="${c.id}"><span class="dot dot--ok"></span> ${esc(c.name)}</button>`).join('');
+  menu.querySelectorAll('[data-xfer]').forEach(b=>b.onclick=async()=>{
+    b.disabled=true; b.textContent='Transferring…';
+    try{ await apiJson('/api/agent/transfer','POST',{closer_id:b.dataset.xfer});
+      menu.classList.add('hidden'); toast('Call transferred ✓','ok'); }
+    catch(e){ menu.classList.add('hidden'); toast(e.message,'err'); }
+  });
+};
 
 // Save a standalone note on the current contact (shows up in History as NOTE).
 $('notesSave').onclick=async()=>{
@@ -1618,7 +1851,40 @@ function renderScriptAdmin(){
       <p class="dim" style="font-size:13px;margin-top:-4px">Sample lead data shown in <span class="mf">accent</span>.</p>
       <div id="scPrev" class="mt2" style="white-space:pre-wrap;line-height:1.6;font-size:14px">${scriptPreviewHtml(c.script)}</div>
     </div>
+  </div>
+  <div class="card mt">
+    <h2>Objection rebuttals — ${esc(c.name||'')}</h2>
+    <p class="dim" style="font-size:13px;margin-top:-4px">Shown to agents under the script as a tap-to-open cheat sheet. Objection on the left, comeback on the right.</p>
+    <div id="rbRows" class="mt2"></div>
+    <div class="row mt2">
+      <button id="rbAdd" class="btn">＋ Add objection</button>
+      <button id="rbSave" class="btn btn-primary">Save rebuttals</button>
+    </div>
   </div>`;
+  const rbRow=(q,a)=>{ const d=document.createElement('div');
+    d.style.cssText='display:flex;gap:8px;margin-bottom:8px;align-items:flex-start';
+    d.innerHTML=`<input class="field" data-rq placeholder="“It's not for sale”" value="${esc(q||'')}" style="flex:1">
+      <textarea class="field" data-ra placeholder="Totally understand — most owners we buy from weren't listing either…" style="flex:2;min-height:38px">${esc(a||'')}</textarea>
+      <button class="btn btn-sm btn-danger" data-rx style="margin-top:3px">✕</button>`;
+    d.querySelector('[data-rx]').onclick=()=>d.remove();
+    return d; };
+  (async()=>{
+    try{ const cj=await apiJson('/api/admin/coaching');
+      const items=(cj.rebuttals&&cj.rebuttals[ldCampId])||[];
+      const wrap=$('rbRows');
+      if(items.length) items.forEach(it=>wrap.appendChild(rbRow(it.q,it.a)));
+      else wrap.appendChild(rbRow('',''));
+    }catch(e){ toast(e.message,'err'); }
+  })();
+  $('rbAdd').onclick=()=>$('rbRows').appendChild(rbRow('',''));
+  $('rbSave').onclick=async()=>{
+    const items=[...$('rbRows').children].map(d=>({q:d.querySelector('[data-rq]').value,a:d.querySelector('[data-ra]').value}))
+      .filter(x=>x.q.trim()&&x.a.trim());
+    const b=$('rbSave'); b.disabled=true;
+    try{ await apiJson('/api/admin/coaching/rebuttals','POST',{campaign_id:ldCampId,items}); toast('Rebuttals saved'); }
+    catch(e){ toast(e.message,'err'); }
+    finally{ b.disabled=false; }
+  };
   const ta=$('scEdit'), prev=$('scPrev');
   ta.oninput=()=>{ prev.innerHTML=scriptPreviewHtml(ta.value); };
   $('ldBody').querySelectorAll('[data-mf]').forEach(b=>b.onclick=()=>{
@@ -1794,6 +2060,16 @@ async function initUsers(){
   sync();
   const btn=$('btnCreateUser');
   if(btn && !btn._wired){ btn._wired=true; btn.onclick=createUser; }
+  const gs=$('glSave');
+  if(gs && !gs._wired){ gs._wired=true;
+    apiJson('/api/admin/coaching').then(c=>{ $('glCalls').value=c.goals.calls||''; $('glSales').value=c.goals.sales||''; }).catch(()=>{});
+    gs.onclick=async()=>{
+      gs.disabled=true;
+      try{ await apiJson('/api/admin/coaching/goals','POST',{calls:+$('glCalls').value||0,sales:+$('glSales').value||0}); toast('Goals saved'); }
+      catch(e){ toast(e.message,'err'); }
+      finally{ gs.disabled=false; }
+    };
+  }
   await loadUmUsers();
 }
 async function loadUmUsers(){
@@ -2189,8 +2465,27 @@ async function renderMap(){
   try{ const j=await apiJson('/api/admin/floor'); floorAgents=j.agents; }
   catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
   $('repBody').innerHTML=`<p class="dim" style="font-size:12px;margin:0 0 12px">Drag an agent onto the floor to place their desk; drag off to unseat. Positions are saved.</p>
+    <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+      <input id="fmText" class="field" placeholder="Message the floor… (shows as a banner on agent screens)" style="flex:1">
+      <select id="fmTarget" class="field" style="width:180px">
+        <option value="">Everyone</option>
+        ${floorAgents.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}
+      </select>
+      <button id="fmSend" class="btn btn-primary" style="white-space:nowrap">📣 Send</button>
+    </div>
     <div class="floorwrap" id="floor"></div>
     <div class="lbl mt3">Unseated agents</div><div class="benchwrap" id="bench"></div>`;
+  $('fmSend').onclick=async()=>{
+    const text=$('fmText').value.trim();
+    if(!text){ toast('Type a message first','warn'); return; }
+    const b=$('fmSend'); b.disabled=true;
+    try{ const r=await apiJson('/api/admin/floor/message','POST',{text,agent_id:$('fmTarget').value||null});
+      toast(r.delivered?`Delivered to ${r.delivered} console${r.delivered>1?'s':''}`:'No consoles connected','ok');
+      $('fmText').value=''; }
+    catch(e){ toast(e.message,'err'); }
+    finally{ b.disabled=false; }
+  };
+  $('fmText').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); $('fmSend').click(); } });
   drawFloor(); openAdminWs(); ensureFloorTimer();
 }
 function stateLabel(s){ return ({AVAILABLE:'Waiting',DIALING:'Waiting',CLAIMING:'Waiting',ON_CALL:'On call',WRAP_UP:'Wrap up',BREAK:'Break',CONNECTING:'Connecting',OFFLINE:'Offline'})[s]||s; }

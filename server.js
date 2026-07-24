@@ -301,6 +301,28 @@ async function loadCallerLocks() {
   } catch (e) { console.error('[callerLocks:load]', e.message); }
 }
 
+// ── Coaching config: daily agent goals + per-campaign rebuttal cheat-sheet ────
+// Both admin-edited, both pushed into the agent console (goals in Productivity,
+// rebuttals under the script). Persisted in app_settings like the caller locks.
+let AGENT_GOALS = { calls: 0, sales: 0 };   // 0 = no target set
+let REBUTTALS = {};                          // campaignId -> [{q, a}]
+function saveSetting(key, value) {
+  if (!SB_HOST) return;
+  sbReq('POST', 'app_settings?on_conflict=key',
+    { key, value, updated_at: new Date().toISOString() },
+    'resolution=merge-duplicates,return=minimal')
+    .catch(e => console.error(`[settings:${key}]`, e.message));
+}
+async function loadCoachCfg() {
+  try {
+    const rows = await sbSelect('app_settings', 'key=in.(agent_goals,rebuttals)&select=key,value');
+    for (const r of rows || []) {
+      if (r.key === 'agent_goals' && r.value) AGENT_GOALS = { calls: +r.value.calls || 0, sales: +r.value.sales || 0 };
+      if (r.key === 'rebuttals' && r.value && typeof r.value === 'object') REBUTTALS = r.value;
+    }
+  } catch (e) { console.error('[coachCfg:load]', e.message); }
+}
+
 // Per-state lead-local calling window (ReadyMode-style compliance). Each US state
 // maps to its own timezone; the admin can disable a state entirely or override its
 // start/end time, else it inherits the queue-default window. Cached from
@@ -2910,10 +2932,22 @@ app.get('/api/agent/market-value', auth, async (req, res) => {
       beds: c.bedrooms ?? null, baths: c.bathrooms ?? null,
       sqft: c.squareFootage ?? null, distance: c.distance ?? null,
     }));
+    // Subject attributes (sqft drives the repair estimate in the offer calc).
+    // One extra RentCast credit; non-fatal if the record is missing.
+    let subject = null;
+    try {
+      const p = await rentcast('/properties', { address });
+      const rec = Array.isArray(p) ? p[0] : p;
+      if (rec) subject = { sqft: rec.squareFootage || null, beds: rec.bedrooms ?? null,
+        baths: rec.bathrooms ?? null, year: rec.yearBuilt ?? null };
+    } catch (_e) { /* calc falls back to manual sqft entry */ }
     res.json({
       address, found: true,
       estimate: v.price, low: v.priceRangeLow ?? null, high: v.priceRangeHigh ?? null,
-      comps,
+      comps, subject,
+      // Karim's offer rules (same as the ARV tool): repairs $/sqft by condition,
+      // MAO = ARV x 70% - repairs, opening offer = 93% of MAO.
+      calc: { mao_pct: 0.70, opening_pct: 0.93, repair_presets: { light: 15, medium: 30, heavy: 55 } },
       note: 'RentCast AVM — an as-is estimate (like a Zestimate). Zillow / Redfin / Realtor are shown as quick links below.',
     });
   } catch (e) {
@@ -2921,6 +2955,48 @@ app.get('/api/agent/market-value', auth, async (req, res) => {
     if (e.status === 429) return res.status(502).json({ error: 'RentCast credit/rate limit hit this month.' });
     res.status(502).json({ error: e.message });
   }
+});
+
+// ── Coaching admin: daily goals + rebuttal cheat-sheets ──────────────────────
+app.get('/api/admin/coaching', auth, adminOnly, (_req, res) => {
+  res.json({ goals: AGENT_GOALS, rebuttals: REBUTTALS });
+});
+app.post('/api/admin/coaching/goals', auth, adminOnly, (req, res) => {
+  const b = req.body || {};
+  AGENT_GOALS = { calls: Math.max(0, +b.calls || 0), sales: Math.max(0, +b.sales || 0) };
+  saveSetting('agent_goals', AGENT_GOALS);
+  audit(req.user, 'EDIT_GOALS', { target_type: 'settings', meta: AGENT_GOALS });
+  res.json({ ok: true, goals: AGENT_GOALS });
+});
+app.post('/api/admin/coaching/rebuttals', auth, adminOnly, (req, res) => {
+  const { campaign_id, items } = req.body || {};
+  if (!campaign_id) return res.status(400).json({ error: 'campaign_id required' });
+  const clean = (Array.isArray(items) ? items : []).slice(0, 40)
+    .map(x => ({ q: String((x && x.q) || '').trim().slice(0, 160), a: String((x && x.a) || '').trim().slice(0, 1200) }))
+    .filter(x => x.q && x.a);
+  REBUTTALS[campaign_id] = clean;
+  saveSetting('rebuttals', REBUTTALS);
+  audit(req.user, 'EDIT_REBUTTALS', { target_type: 'campaign', target_id: campaign_id, meta: { count: clean.length } });
+  res.json({ ok: true, items: clean });
+});
+
+// Floor messaging: supervisor broadcasts a banner to every connected agent and
+// closer console, or nudges one agent. Delivery is WS-only (no storage) — it's
+// a "listen up" tool, not a chat log. Path is under /floor so a support user
+// with the Office map grant can use it.
+app.post('/api/admin/floor/message', auth, adminOnly, (req, res) => {
+  const text = String((req.body && req.body.text) || '').trim().slice(0, 300);
+  const target = (req.body && req.body.agent_id) || null;
+  if (!text) return res.status(400).json({ error: 'message text required' });
+  const msg = { type: 'floor.msg', text, from: req.user.name || 'Supervisor', at: Date.now() };
+  let delivered = 0;
+  for (const c of wsClients) {
+    if (c.role === 'admin' || c.role === 'support') continue;
+    if (target && c.userId !== target) continue;
+    wsSend(c.ws, msg); delivered++;
+  }
+  audit(req.user, 'FLOOR_MESSAGE', { target_type: 'agent', target_id: target, meta: { text, delivered } });
+  res.json({ ok: true, delivered });
 });
 
 // Supervisor action: kick an agent off the dialer. Drops any live lead leg, drops
@@ -3124,6 +3200,106 @@ app.post('/api/agent/manual-dial', auth, async (req, res) => {
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
+// ── Warm transfer: hand a live call to an available closer ───────────────────
+// The lead's leg leaves the agent's conference and joins the closer's; the
+// seller never hears a click of dead air. The leg's client_state is re-stamped
+// with the closer's identity FIRST so every later webhook (hangup, etc.)
+// resolves to the closer, not the original agent.
+app.get('/api/agent/closers', auth, async (req, res) => {
+  try {
+    const rows = await sbSelect('agents', 'role=eq.closer&active=eq.true&select=id,name');
+    const closers = (rows || []).filter(a => {
+      const s = rt[a.id];
+      return a.id !== req.user.id && s && s.state === 'AVAILABLE' && s.conferenceId && !s.leadLeg;
+    }).map(a => ({ id: a.id, name: a.name }));
+    res.json({ closers });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/agent/transfer', auth, async (req, res) => {
+  const st = rt[req.user.id];
+  const to = req.body && req.body.closer_id;
+  if (!to) return res.status(400).json({ error: 'closer_id required' });
+  if (!st || !st.leadLeg || st.state !== 'ON_CALL') return res.status(409).json({ error: 'no live call to transfer' });
+  const tgt = rt[to];
+  if (!tgt || tgt.state !== 'AVAILABLE' || !tgt.conferenceId || tgt.leadLeg)
+    return res.status(409).json({ error: 'that closer is no longer available' });
+  const ccid = st.leadLeg;
+  const leadId = st.leadId, leadNumber = st.leadNumber, fromNumber = st.fromNumber;
+  try {
+    await telnyx('POST', `/calls/${ccid}/actions/client_state_update`, {
+      client_state: enc({ role: 'lead', agentId: to, conf: tgt.conferenceId,
+        leadId: leadId || null, campaignId: null, cid: crypto.randomUUID(), amd: 'disabled', transferred: true }),
+    });
+    await telnyx('POST', `/conferences/${st.conferenceId}/actions/leave`, { call_control_id: ccid });
+    await telnyx('POST', `/conferences/${tgt.conferenceId}/actions/join`, { call_control_id: ccid });
+    // Hand over runtime ownership: closer goes live, agent drops to wrap-up.
+    tgt.leadLeg = ccid; tgt.leadId = leadId; tgt.leadNumber = leadNumber;
+    tgt.fromNumber = fromNumber; tgt.onCallSince = Date.now();
+    st.leadLeg = null; st.leadId = null; st.leadNumber = null; st.fromNumber = null;
+    st.onCallSince = null; st.awaitingDisp = false;
+    await setAgentState(to, 'ON_CALL');
+    await setAgentState(req.user.id, 'WRAP_UP');
+    scheduleWrapReturn(req.user.id, WRAP_SHORT_SEC);
+    pushLeadContext(to, null);
+    audit(req.user, 'TRANSFER_CALL', { target_type: 'agent', target_id: to, meta: { phone: leadNumber, lead_id: leadId } });
+    res.json({ ok: true });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+// ── Closer deal pipeline ─────────────────────────────────────────────────────
+// A lead dispositioned as a positive outcome (sale/appt/lead) is auto-enrolled
+// as a deal (stored on leads.custom.deal — no schema change). Closers move
+// deals through stages and drop timestamped notes.
+const DEAL_STAGES = ['NEW', 'OFFER_MADE', 'FOLLOW_UP', 'UNDER_CONTRACT', 'CLOSED', 'DEAD'];
+function closerOrAdmin(req, res, next) {
+  const c = permCache.get(req.user && req.user.id);
+  const role = c ? c.role : (req.user && req.user.role);
+  return (role === 'closer' || role === 'admin') ? next() : res.sendStatus(403);
+}
+app.get('/api/agent/deals', auth, closerOrAdmin, async (_req, res) => {
+  try {
+    const rows = await sbSelect('leads',
+      'custom->deal=not.is.null&select=id,first_name,last_name,phone,address,city,state,zip,custom,campaign_id,created_at&order=created_at.desc&limit=500');
+    const deals = (rows || []).map(l => ({
+      id: l.id, first_name: l.first_name, last_name: l.last_name, phone: l.phone,
+      address: l.address, city: l.city, state: l.state, zip: l.zip,
+      deal: (l.custom && l.custom.deal) || {},
+    }));
+    res.json({ stages: DEAL_STAGES, deals });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/agent/deals/:id', auth, closerOrAdmin, async (req, res) => {
+  const { stage, note } = req.body || {};
+  if (stage && !DEAL_STAGES.includes(stage)) return res.status(400).json({ error: 'invalid stage' });
+  try {
+    const [lead] = await sbSelect('leads', `id=eq.${req.params.id}&select=id,custom`);
+    if (!lead || !lead.custom || !lead.custom.deal) return res.status(404).json({ error: 'deal not found' });
+    const deal = lead.custom.deal;
+    if (stage) deal.stage = stage;
+    if (note && String(note).trim()) {
+      deal.notes = (deal.notes || []).slice(-49);
+      deal.notes.push({ by: req.user.name || '', text: String(note).trim().slice(0, 500), at: new Date().toISOString() });
+    }
+    deal.closer_id = deal.closer_id || req.user.id;
+    deal.updated_at = new Date().toISOString();
+    await sbUpdate('leads', `id=eq.${req.params.id}`, { custom: { ...lead.custom, deal } });
+    audit(req.user, 'DEAL_UPDATE', { target_type: 'lead', target_id: req.params.id, meta: { stage: deal.stage, noted: !!note } });
+    res.json({ ok: true, deal });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Closer calendar: this user's scheduled callbacks, next 14 days + overdue ──
+app.get('/api/agent/calendar', auth, async (req, res) => {
+  try {
+    const horizon = new Date(Date.now() + 14 * 86400e3).toISOString();
+    const rows = await sbSelect('leads',
+      `assigned_agent_id=eq.${req.user.id}&status=eq.CALLBACK&next_callback_at=not.is.null` +
+      `&next_callback_at=lte.${encodeURIComponent(horizon)}` +
+      '&select=id,first_name,last_name,phone,address,city,state,next_callback_at&order=next_callback_at.asc&limit=500');
+    res.json({ items: rows || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // AUX status switch: Ready (AVAILABLE) / Wrap up (WRAP_UP) / Break (BREAK).
 // The softphone stays in-conference the whole time, so switching is instant and
 // no re-dial is needed. The pacer only feeds AVAILABLE agents, so WRAP_UP/BREAK
@@ -3224,11 +3400,23 @@ app.get('/api/agent/productivity', auth, async (req, res) => {
     const d = new Date();
     const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
     const monthStart = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
-    const [today, month] = await Promise.all([
+    const [today, month, disps] = await Promise.all([
       productivityWindow(req.user.id, dayStart, now),
       productivityWindow(req.user.id, monthStart, now),
+      // Positive outcomes (sale/appt/lead) for the goal tracker, month window.
+      sbSelect('dispositions',
+        `agent_id=eq.${req.user.id}&created_at=gte.${new Date(monthStart).toISOString()}` +
+        `&select=code,created_at&limit=10000`).catch(() => []),
     ]);
-    res.json({ today, month });
+    const dayIso = new Date(dayStart).toISOString();
+    let salesDay = 0, salesMonth = 0;
+    for (const d of disps || []) {
+      if (!LONG_WRAP_RE.test(d.code || '')) continue;
+      salesMonth++;
+      if (d.created_at >= dayIso) salesDay++;
+    }
+    today.sales = salesDay; month.sales = salesMonth;
+    res.json({ today, month, goals: AGENT_GOALS });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3270,7 +3458,8 @@ async function pushLeadContext(agentId, leadRow) {
       onCallSince: st.onCallSince || null,
       campaign: cfg ? { id: cfg.id, name: cfg.name, wrap_seconds: cfg.wrap_seconds,
         dispositions: (cfg.dispositions || []).filter(d => !d.system && !AGENT_HIDDEN_DISPOSITIONS.has(d.code)),
-        script: cfg.script, script_merged: mergeScript(cfg.script, lead) } : null,
+        script: cfg.script, script_merged: mergeScript(cfg.script, lead),
+        rebuttals: REBUTTALS[lead.campaign_id] || [] } : null,
     });
   } catch (e) { console.error('[pushLeadContext]', e.message); }
 }
@@ -3301,7 +3490,8 @@ app.get('/api/agent/context', auth, async (req, res) => {
       caller_id: st.fromNumber || null,
       campaign: cfg ? { id: cfg.id, name: cfg.name, wrap_seconds: cfg.wrap_seconds,
         dispositions: (cfg.dispositions || []).filter(d => !d.system && !AGENT_HIDDEN_DISPOSITIONS.has(d.code)),
-        script: cfg.script, script_merged: mergeScript(cfg.script, lead) } : null,
+        script: cfg.script, script_merged: mergeScript(cfg.script, lead),
+        rebuttals: REBUTTALS[lead.campaign_id] || [] } : null,
       history,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -3340,6 +3530,10 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
       // Sale / appointment / lead → converted, DNC for 90 days then auto-removed.
       patch.status = disp.outcome || 'DONE'; patch.dnc = true;
       dncTemporary(lead.phone, POLICY.positive_dnc_days, 'converted');
+      // Auto-enroll in the closer deal pipeline (idempotent — keeps an existing deal).
+      patch.custom = { ...(lead.custom || {}),
+        deal: (lead.custom && lead.custom.deal) || { stage: 'NEW', created_at: new Date().toISOString(),
+          source_agent_id: req.user.id, closer_id: null, notes: [] } };
     } else if (disp.is_callback) {
       patch.status = 'CALLBACK';
       patch.next_callback_at = callback_at || new Date(Date.now() + 3600e3).toISOString();
@@ -5123,6 +5317,7 @@ server.listen(PORT, async () => {
   await loadDialerConfig();
   await loadPlaylistStats();
   await loadCallerLocks();
+  await loadCoachCfg();
   await loadCallPolicy();
   await loadRecycle();   // after call-policy: owns positive_dnc_days
   await loadAiConfig();
