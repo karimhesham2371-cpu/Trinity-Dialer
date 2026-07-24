@@ -1228,15 +1228,15 @@ app.get('/api/admin/users', auth, adminOnly, async (_req, res) => {
 app.post('/api/admin/users', auth, adminOnly, adminRoleOnly, async (req, res) => {
   const { name, email, password, role: rawRole, permissions } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: 'name, email, password required' });
-  const role = ['admin', 'support', 'agent'].includes(rawRole) ? rawRole : 'agent';
+  const role = ['admin', 'support', 'agent', 'closer'].includes(rawRole) ? rawRole : 'agent';
   const perms = role === 'support' ? normPerms(permissions) : [];
   try {
     const existing = await sbSelect('agents', `email=eq.${encodeURIComponent(email)}&select=id`);
     if (existing.length) return res.status(409).json({ error: 'email already exists' });
 
-    // Only agents take calls, so only agents get a Telnyx WebRTC credential.
+    // Agents and closers take calls, so both get a Telnyx WebRTC credential.
     let credId = null, sip = null;
-    if (role === 'agent' && TELNYX_KEY) {
+    if ((role === 'agent' || role === 'closer') && TELNYX_KEY) {
       const cred = await telnyx('POST', '/telephony_credentials', {
         connection_id: CRED_CONNECTION_ID, name: `trinity-${String(email).replace(/[^a-z0-9]/gi, '')}`,
       });
@@ -1268,7 +1268,7 @@ app.patch('/api/admin/users/:id', auth, adminOnly, adminRoleOnly, async (req, re
   if (active != null) patch.active = !!active;
   let newRole = null;
   if (role != null) {
-    newRole = ['admin', 'support', 'agent'].includes(role) ? role : 'agent';
+    newRole = ['admin', 'support', 'agent', 'closer'].includes(role) ? role : 'agent';
     patch.role = newRole;
     // A non-support user holds no permissions; clear them on role change.
     if (newRole !== 'support') patch.permissions = [];
@@ -2874,6 +2874,53 @@ app.post('/api/admin/floor/seat', auth, adminOnly, async (req, res) => {
   const patch = { seat_x: x == null ? null : Number(x), seat_y: y == null ? null : Number(y) };
   try { await sbUpdate('agents', `id=eq.${agent_id}`, patch); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Closer market-value lookup (RentCast AVM) ────────────────────────────────
+// Closers type a property address and get an as-is market value estimate + range
+// + a few recent comparable sales. Zillow/Redfin/Realtor block server-side calls,
+// so we source one reliable AVM from RentCast (same data path as the ARV tool).
+// Requires RENTCAST_API_KEY on the server; returns a clear error if unset.
+const RENTCAST_KEY = env('RENTCAST_API_KEY') || '';
+async function rentcast(endpoint, params) {
+  const url = new URL('https://api.rentcast.io/v1' + endpoint);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
+  }
+  const r = await fetch(url, { headers: { 'X-Api-Key': RENTCAST_KEY, Accept: 'application/json' } });
+  if (r.status === 404) return null;
+  if (!r.ok) {
+    const body = await r.text().catch(() => '');
+    const err = new Error(`RentCast ${endpoint} -> HTTP ${r.status} ${body.slice(0, 160)}`);
+    err.status = r.status;
+    throw err;
+  }
+  return r.json();
+}
+app.get('/api/agent/market-value', auth, async (req, res) => {
+  const address = String(req.query.address || '').trim();
+  if (!address) return res.status(400).json({ error: 'enter a property address' });
+  if (!RENTCAST_KEY) return res.status(503).json({ error: 'Market value is not configured yet — RENTCAST_API_KEY is missing on the server.' });
+  try {
+    const v = await rentcast('/avm/value', { address, compCount: 5 });
+    if (!v || !v.price) return res.json({ address, found: false });
+    const comps = (v.comparables || []).slice(0, 5).map(c => ({
+      address: c.formattedAddress || c.addressLine1 || '',
+      price: c.price ?? c.lastSalePrice ?? null,
+      beds: c.bedrooms ?? null, baths: c.bathrooms ?? null,
+      sqft: c.squareFootage ?? null, distance: c.distance ?? null,
+    }));
+    res.json({
+      address, found: true,
+      estimate: v.price, low: v.priceRangeLow ?? null, high: v.priceRangeHigh ?? null,
+      comps,
+      note: 'RentCast AVM — an as-is estimate (like a Zestimate). Zillow / Redfin / Realtor are shown as quick links below.',
+    });
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) return res.status(502).json({ error: 'RentCast API key rejected — check RENTCAST_API_KEY.' });
+    if (e.status === 429) return res.status(502).json({ error: 'RentCast credit/rate limit hit this month.' });
+    res.status(502).json({ error: e.message });
+  }
 });
 
 // Supervisor action: kick an agent off the dialer. Drops any live lead leg, drops

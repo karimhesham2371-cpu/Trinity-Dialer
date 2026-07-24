@@ -373,9 +373,18 @@
         <div class="ltabs">
           <button id="ltScript" class="ltab active" onclick="agLeftTab('script')">Script</button>
           <button id="ltProd" class="ltab" onclick="agLeftTab('prod')">Productivity</button>
+          <button id="ltMarket" class="ltab hidden" onclick="agLeftTab('market')">Market Value</button>
         </div>
         <div id="scriptBody" class="empty">No active call.</div>
         <div id="prodBody" class="hidden"></div>
+        <div id="mvBody" class="hidden">
+          <p class="dim" style="font-size:12px;margin-bottom:8px">Enter a property address to pull its estimated market value and recent comparable sales.</p>
+          <div style="display:flex;gap:6px;margin-bottom:10px">
+            <input id="mvAddr" class="field" placeholder="123 Main St, City, ST 00000" style="flex:1">
+            <button id="mvGo" class="btn btn-primary" style="white-space:nowrap">Look up</button>
+          </div>
+          <div id="mvResult"></div>
+        </div>
       </div>
     </div>
 
@@ -559,7 +568,7 @@
         <div class="row"><input id="nuName" class="field" placeholder="Full name" /><input id="nuEmail" class="field" placeholder="Email or username" /></div>
         <div class="row mt3">
           <input id="nuPass" class="field" type="password" placeholder="Password" />
-          <select id="nuRole" class="field"><option value="agent">Agent</option><option value="support">Support</option><option value="admin">Admin</option></select>
+          <select id="nuRole" class="field"><option value="agent">Agent</option><option value="closer">Closer</option><option value="support">Support</option><option value="admin">Admin</option></select>
         </div>
         <div id="nuPermsWrap" class="mt3 hidden">
           <span class="lbl">Support access — grant only what this user needs</span>
@@ -739,7 +748,10 @@ $('liPass').addEventListener('keydown', e=>{ if(e.key==='Enter') $('btnLogin').c
 function route(){
   if(!TOKEN||!USER){ show('login'); return; }
   if(USER.role==='admin'||USER.role==='support'){ show('admin'); $('adWho').textContent=USER.name+' · '+USER.email; loadAdmin(); }
-  else { show('agent'); $('agWho').textContent=USER.name; initAudioSettings(); startAgent(); }
+  else { show('agent'); $('agWho').textContent=USER.name; initAudioSettings();
+    // Closers get the same calling console plus a Market Value tab.
+    $('ltMarket').classList.toggle('hidden', USER.role!=='closer');
+    startAgent(); }
 }
 
 // ═══════════ AGENT ═══════════
@@ -774,7 +786,7 @@ function openWs(){
     if(sock._intentional) return;      // we replaced it on purpose
     if(sock!==ws) return;              // a newer socket already took over
     log('ws closed code='+(ev&&ev.code)+' reason='+((ev&&ev.reason)||'(none)'));
-    if(TOKEN&&USER&&USER.role==='agent'){
+    if(TOKEN&&USER&&(USER.role==='agent'||USER.role==='closer')){
       $('reconnBanner').classList.remove('hidden');
       if(wsReconnTimer) clearTimeout(wsReconnTimer);
       wsReconnTimer=setTimeout(openWs, 2500);
@@ -1025,12 +1037,52 @@ let prodPollT=null;
 function prodDur(sec){ sec=Math.max(0,Math.round(sec||0)); const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;
   if(h) return h+'h '+m+'m'; if(m) return m+'m '+s+'s'; return s+'s'; }
 function agLeftTab(which){
-  const isScript=which==='script';
-  $('ltScript').classList.toggle('active',isScript); $('ltProd').classList.toggle('active',!isScript);
-  $('scriptBody').classList.toggle('hidden',!isScript); $('prodBody').classList.toggle('hidden',isScript);
-  if(isScript){ if(prodPollT){ clearInterval(prodPollT); prodPollT=null; } }
-  else { loadProductivity(); if(!prodPollT) prodPollT=setInterval(()=>{ const p=$('prodBody'); if(!p||p.classList.contains('hidden')||$('viewAgent').classList.contains('hidden')){ clearInterval(prodPollT); prodPollT=null; return; } loadProductivity(true); },5000); }
+  $('ltScript').classList.toggle('active',which==='script');
+  $('ltProd').classList.toggle('active',which==='prod');
+  $('ltMarket').classList.toggle('active',which==='market');
+  $('scriptBody').classList.toggle('hidden',which!=='script');
+  $('prodBody').classList.toggle('hidden',which!=='prod');
+  $('mvBody').classList.toggle('hidden',which!=='market');
+  if(which==='prod'){
+    loadProductivity();
+    if(!prodPollT) prodPollT=setInterval(()=>{ const p=$('prodBody'); if(!p||p.classList.contains('hidden')||$('viewAgent').classList.contains('hidden')){ clearInterval(prodPollT); prodPollT=null; return; } loadProductivity(true); },5000);
+  } else if(prodPollT){ clearInterval(prodPollT); prodPollT=null; }
 }
+
+// ── Closer Market Value lookup (RentCast AVM + external quick-links) ──
+const mvMoney=(n)=> n==null||isNaN(n) ? '—' : '$'+Math.round(n).toLocaleString();
+async function mvLookup(){
+  const addr=$('mvAddr').value.trim();
+  if(!addr){ toast('Enter an address','warn'); return; }
+  const btn=$('mvGo'); btn.disabled=true; btn.textContent='…';
+  $('mvResult').innerHTML='<div class="empty">Looking up…</div>';
+  try{
+    const j=await apiJson('/api/agent/market-value?address='+encodeURIComponent(addr));
+    const q=encodeURIComponent(addr);
+    const links=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+      <a class="btn btn-sm" target="_blank" rel="noopener" href="https://www.zillow.com/homes/${q}_rb/">Zillow ↗</a>
+      <a class="btn btn-sm" target="_blank" rel="noopener" href="https://www.redfin.com/stingray/do/location-autocomplete?location=${q}&v=2">Redfin ↗</a>
+      <a class="btn btn-sm" target="_blank" rel="noopener" href="https://www.realtor.com/realestateandhomes-search/${q}">Realtor ↗</a>
+    </div>`;
+    if(!j.found){
+      $('mvResult').innerHTML='<div class="empty">No estimate found for that address. Try the site links below.</div>'+links;
+      return;
+    }
+    const comps=(j.comps||[]).map(c=>`<div class="prodStat"><span class="pl">${esc(c.address||'—')}${c.beds!=null?` · ${c.beds}bd/${c.baths??'—'}ba`:''}${c.sqft?` · ${c.sqft.toLocaleString()} sqft`:''}</span><span class="pv">${mvMoney(c.price)}</span></div>`).join('');
+    $('mvResult').innerHTML=
+      `<div class="prodGroup"><h3>Estimated market value</h3>
+        <div class="prodStat"><span class="pl">Estimate (as-is)</span><span class="pv">${mvMoney(j.estimate)}</span></div>
+        <div class="prodStat"><span class="pl">Range</span><span class="pv">${mvMoney(j.low)} – ${mvMoney(j.high)}</span></div>
+      </div>`+
+      (comps?`<div class="prodGroup"><h3>Recent comparable sales</h3>${comps}</div>`:'')+
+      (j.note?`<p class="dim" style="font-size:11px;margin-top:8px">${esc(j.note)}</p>`:'')+
+      links;
+  }catch(e){
+    $('mvResult').innerHTML='<div class="empty">'+esc(e.message)+'</div>';
+  }finally{ btn.disabled=false; btn.textContent='Look up'; }
+}
+$('mvGo').onclick=mvLookup;
+$('mvAddr').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); mvLookup(); } });
 async function loadProductivity(quiet){
   const el=$('prodBody'); if(!el) return;
   if(!quiet && !el.dataset.loaded) el.innerHTML='<div class="empty">Loading…</div>';
@@ -1586,7 +1638,7 @@ function renderUmUsers(){
     tr.innerHTML=
       `<td>${esc(u.name)}${self?' <span class="dim">(you)</span>':''}</td>`+
       `<td class="dim">${esc(u.email||'')}</td>`+
-      `<td><span class="pill pill--${u.role==='admin'?'info':(u.role==='support'?'warn':'faint')}">${u.role}</span></td>`+
+      `<td><span class="pill pill--${u.role==='admin'?'info':(u.role==='support'?'warn':(u.role==='closer'?'ok':'faint'))}">${u.role}</span></td>`+
       `<td><span class="pill pill--${active?'ok':'danger'}">${active?'active':'inactive'}</span></td>`+
       `<td><span class="pill pill--${dotc}"><span class="dot dot--${dotc}"></span> ${st}</span></td>`+
       `<td style="text-align:right;white-space:nowrap">`+
@@ -1626,7 +1678,7 @@ async function umResetPw(u){
 }
 async function umEdit(u){
   await loadPermRegistry();
-  const roleOpts=[['agent','Agent'],['support','Support'],['admin','Admin']]
+  const roleOpts=[['agent','Agent'],['closer','Closer'],['support','Support'],['admin','Admin']]
     .map(([v,l])=>`<option value="${v}"${u.role===v?' selected':''}>${l}</option>`).join('');
   const body=`
     <span class="lbl">Name</span><input id="ueName" class="field" value="${esc(u.name||'')}">
