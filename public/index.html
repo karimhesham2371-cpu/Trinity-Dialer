@@ -500,6 +500,25 @@
   @media(prefers-reduced-motion:reduce){
     body[data-agstate] .callBanner{animation:none!important}
   }
+
+  /* ═══ DIALER GUIDE ═══ */
+  .gsec{border:1px solid var(--border);border-radius:12px;margin-bottom:10px;overflow:hidden;background:linear-gradient(180deg,#121828,#0E131E)}
+  .gsec>summary{padding:13px 16px;cursor:pointer;font:600 14px var(--font-disp);color:var(--text);list-style:none;display:flex;align-items:center;gap:10px}
+  .gsec>summary::-webkit-details-marker{display:none}
+  .gsec>summary::before{content:'▸';color:var(--accent);font-size:12px;transition:transform .15s}
+  .gsec[open]>summary::before{transform:rotate(90deg)}
+  .gsec[open]>summary{border-bottom:1px solid var(--border)}
+  .gbody{padding:14px 16px 16px;font-size:13.5px;line-height:1.65;color:var(--text-dim)}
+  .gbody b{color:var(--text)}
+  .gbody h4{font:600 12px var(--font-ui);text-transform:uppercase;letter-spacing:.05em;color:var(--accent);margin:14px 0 6px}
+  .gbody h4:first-child{margin-top:0}
+  .gbody ul{margin:6px 0;padding-left:20px}
+  .gbody li{margin-bottom:5px}
+  .gtag{display:inline-block;font:600 10px var(--font-ui);text-transform:uppercase;letter-spacing:.05em;padding:2px 8px;border-radius:999px;margin-left:auto}
+  .gtag--admin{background:var(--info-tint);color:var(--info)}
+  .gtag--all{background:var(--ok-tint);color:var(--ok)}
+  .gtag--closer{background:var(--warn-tint);color:var(--warn)}
+  kbd{font:600 11px var(--font-mono);background:var(--surface-2);border:1px solid var(--border-strong);border-radius:5px;padding:1px 6px;color:var(--text)}
 </style>
 </head>
 <body>
@@ -550,6 +569,7 @@
           <button id="ltMarket" class="ltab hidden" onclick="agLeftTab('market')">Market Value</button>
           <button id="ltDeals" class="ltab hidden" onclick="agLeftTab('deals')">Deals</button>
           <button id="ltCal" class="ltab hidden" onclick="agLeftTab('cal')">Calendar</button>
+          <button id="ltGuide" class="ltab hidden" onclick="agLeftTab('guide')">Guide</button>
         </div>
         <div id="scriptWrap">
           <div id="scriptBody" class="empty">No active call.</div>
@@ -558,6 +578,7 @@
         <div id="prodBody" class="hidden"></div>
         <div id="dealsBody" class="hidden"></div>
         <div id="calBody" class="hidden"></div>
+        <div id="guideBodyAg" class="hidden"></div>
         <div id="mvBody" class="hidden">
           <p class="dim" style="font-size:12px;margin-bottom:8px">Enter a property address to pull its estimated market value and recent comparable sales.</p>
           <div style="display:flex;gap:6px;margin-bottom:10px">
@@ -671,6 +692,7 @@
       <button id="tabUsers" class="navtab" onclick="adminTab('users')">User management</button>
       <button id="tabReports" class="navtab" onclick="adminTab('reports')">Reports</button>
       <button id="tabAi" class="navtab" onclick="adminTab('ai')">AI Caller</button>
+      <button id="tabGuide" class="navtab" onclick="adminTab('guide')">Dialer Guide</button>
     </div>
     <div class="sp"></div>
     <span class="who" id="adWho"></span>
@@ -744,6 +766,10 @@
       <button class="navtab" data-at="results" onclick="aiTab('results')">Call results</button>
     </div>
     <div id="aiBody"></div>
+  </div>
+
+  <div id="adminGuide" class="wrap hidden" style="max-width:860px">
+    <div id="guideBody"></div>
   </div>
 
   <div id="adminUsers" class="wrap wide hidden">
@@ -946,6 +972,7 @@ function route(){
     $('ltMarket').classList.toggle('hidden', !closer);
     $('ltDeals').classList.toggle('hidden', !closer);
     $('ltCal').classList.toggle('hidden', !closer);
+    $('ltGuide').classList.toggle('hidden', !closer);   // guide: everyone except agents
     startAgent(); }
 }
 
@@ -1254,8 +1281,8 @@ let prodPollT=null;
 function prodDur(sec){ sec=Math.max(0,Math.round(sec||0)); const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;
   if(h) return h+'h '+m+'m'; if(m) return m+'m '+s+'s'; return s+'s'; }
 function agLeftTab(which){
-  const tabs={script:'ltScript',prod:'ltProd',market:'ltMarket',deals:'ltDeals',cal:'ltCal'};
-  const bodies={script:'scriptWrap',prod:'prodBody',market:'mvBody',deals:'dealsBody',cal:'calBody'};
+  const tabs={script:'ltScript',prod:'ltProd',market:'ltMarket',deals:'ltDeals',cal:'ltCal',guide:'ltGuide'};
+  const bodies={script:'scriptWrap',prod:'prodBody',market:'mvBody',deals:'dealsBody',cal:'calBody',guide:'guideBodyAg'};
   for(const k of Object.keys(tabs)){
     $(tabs[k]).classList.toggle('active',k===which);
     $(bodies[k]).classList.toggle('hidden',k!==which);
@@ -1266,6 +1293,7 @@ function agLeftTab(which){
   } else if(prodPollT){ clearInterval(prodPollT); prodPollT=null; }
   if(which==='deals') loadDeals();
   if(which==='cal') loadCalendar();
+  if(which==='guide'){ const g=$('guideBodyAg'); if(!g.dataset.loaded){ g.innerHTML=dialerGuideHtml('closer'); g.dataset.loaded='1'; } }
 }
 
 // ── Closer Market Value lookup (RentCast AVM + external quick-links) ──
@@ -1969,17 +1997,137 @@ function anCard(s){
 let adminWs=null, floorAgents=[], agentRepRows=[];
 const REPTITLES={audit:'Audit logs',calls:'Call logs',agent:'Agent report',research:'Research calls',map:'Office map',wallboard:'Wallboard'};
 
+// ═══════════ DIALER GUIDE — full feature manual (everyone except agents) ═══════════
+function dialerGuideHtml(role){
+  const sec=(title,tag,body)=>'<details class="gsec"><summary>'+title+
+    (tag?'<span class="gtag gtag--'+tag[0]+'">'+tag[1]+'</span>':'')+'</summary><div class="gbody">'+body+'</div></details>';
+  const intro = role==='closer'
+    ? 'Everything the dialer can do, in one place. Sections tagged <span class="gtag gtag--admin">Admin</span> are managed by your admin — the rest is yours to use.'
+    : 'The complete manual for Trinity Dialer — every feature, who it is for, and how to run it. Open a section to read it.';
+  return '<h2 style="font:600 20px var(--font-disp);margin:0 0 4px">Dialer Guide</h2>'+
+  '<p class="dim" style="font-size:13px;margin:0 0 18px">'+intro+'</p>'+
+
+  sec('Roles &amp; who sees what',['all','Everyone'],
+    '<ul>'+
+    '<li><b>Admin</b> — full console: campaigns, leads, numbers, reports, users, AI caller, this guide.</li>'+
+    '<li><b>Support</b> — the admin console limited to the permissions the admin checks on their user (reports, office map, live monitor, kick, floor messaging). No user management.</li>'+
+    '<li><b>Agent</b> — the calling console only: auto-fed calls, script, dispositions, dialpad.</li>'+
+    '<li><b>Closer</b> — the agent console <i>plus</i> Market Value, Deals, Calendar and this guide. Closers mostly dial manually and receive warm transfers.</li>'+
+    '</ul>Create users in <b>User management</b>; agents and closers get their softphone (Telnyx WebRTC credential) automatically on creation.')+
+
+  sec('Going on shift: states &amp; the Aux button',['all','Everyone'],
+    '<h4>Sign in → Go Available</h4>The softphone connects automatically. Use the <b>Aux button</b> (top right) to switch between <b>Ready</b> and <b>Break</b>.'+
+    '<h4>What the colors mean</h4><ul>'+
+    '<li><b style="color:var(--info)">Blue</b> — Waiting: the system is hunting calls for you (you hear nothing until a human answers).</li>'+
+    '<li><b style="color:var(--ok)">Green</b> — On a live call. The whole console shifts green.</li>'+
+    '<li><b style="color:var(--warn)">Amber</b> — Wrap-up: a short cooldown after each call (3s, or 3 min after a Sale/Appt so you can finish paperwork).</li>'+
+    '<li><b style="color:#E07A45">Ember</b> — Break: counts up until YOU press Ready. It never flips back on its own.</li>'+
+    '</ul>Break is allowed even while Waiting — pending dials are cancelled and their leads requeued.')+
+
+  sec('Taking a call: lead card, script, dispositions',['all','Everyone'],
+    '<h4>Lead card</h4>Appears instantly when a call bridges: name, phone, address, custom CSV fields, attempts, and which caller ID the call went out on. <b>Notes</b> save to the contact history; <b>History</b> shows every previous touch.'+
+    '<h4>Script</h4>The campaign script with the lead\'s real data merged into the {{fields}}. Under it, <b>Objections</b> — tap an objection to see the comeback (admin writes these per campaign).'+
+    '<h4>Dispositions</h4>Every connected call must be coded before the next one. Buttons have hotkeys (<kbd>1</kbd>–<kbd>7</kbd>). <b>Callback</b> asks for a date/time and routes the lead back to you at that time. <b>Sale / Appt / Lead</b> gives the long wrap and enrolls the lead in the closer Deal pipeline automatically. <b>DNC</b> permanently blocks the number.')+
+
+  sec('Call controls &amp; the dialpad',['all','Everyone'],
+    '<ul>'+
+    '<li><b>Mute / Hold</b> — live-call only.</li>'+
+    '<li><b>Dialpad</b> — during a call it sends touch-tones (IVRs, extensions). Off-call it becomes the manual dialer.</li>'+
+    '<li><b>Hang up</b> — ends the live call, or cancels ringing background dials while Waiting.</li>'+
+    '</ul>'+
+    '<h4>Manual outbound calls</h4>Open the dialpad while not on a call: pick a <b>Caller ID</b> from the dropdown (every number the dialer owns), press <b>Lock it</b>, type the number, press <b>Call</b>. The locked caller ID sticks for your whole session — across calls and even redeploys — until you press <b>Change</b>. DNC numbers are refused. If the number matches a known lead, the call attaches to that lead so history and dispositions work.')+
+
+  sec('Productivity &amp; daily goals',['all','Everyone'],
+    'The <b>Productivity</b> tab live-updates every 5 seconds: hours logged in, break / wrap / wait durations, average wait between calls, calls handled (only calls that actually reached you), and sales/appts.'+
+    '<h4>Goals</h4>If the admin sets daily targets (User management → Daily agent goals), progress bars appear at the top — gold while in progress, green at 100%.')+
+
+  sec('Warm transfer: agent → closer',['all','Everyone'],
+    'On a live call, press <b>⇄ Transfer to closer</b> (under the call controls). Pick from the list of closers currently on Ready — the seller\'s line moves into that closer\'s conference with no dead air. The closer\'s screen goes green with the full lead card; you drop into wrap-up. If no closers are Ready the list says so — set a callback instead.')+
+
+  sec('Closer: Market Value &amp; the offer calculator',['closer','Closer'],
+    '<h4>Look up</h4>Type any property address → estimated as-is value, value range, and recent comparable sales (RentCast data), plus Zillow / Redfin / Realtor quick-links that open the property on each site.'+
+    '<h4>Offer calculator</h4>ARV and sqft prefill from the lookup (both editable). Pick the condition: light $15/sqft, medium $30, heavy $55. It computes:<ul>'+
+    '<li><b>Repair estimate</b> = $/sqft × sqft (rounded to $500)</li>'+
+    '<li><b>MAO</b> = ARV × 70% − repairs</li>'+
+    '<li><b>Opening offer</b> = 93% of MAO</li></ul>'+
+    '<h4>Offer sheet</h4>The 🖨 button opens a clean printable summary (value, range, repairs, offer, comps) — print it or save as PDF for the seller. Allow popups if the browser blocks it.')+
+
+  sec('Closer: Deals pipeline',['closer','Closer'],
+    'Every lead dispositioned <b>Sale / Appt / Lead</b> lands here automatically. Deals are grouped by stage: <b>New → Offer made → Follow-up → Under contract → Closed</b> (or Dead). Use the dropdown to move stages, <b>＋ Note</b> for timestamped notes, and <b>Call</b> to load the number into the dialpad ready to fire.')+
+
+  sec('Closer: Calendar',['closer','Closer'],
+    'Your scheduled callbacks for the next 14 days, grouped by day — <b style="color:var(--danger)">overdue ones pinned to the top in red</b>. Each row has a Call button. Callbacks book themselves whenever you (or an agent) disposition a call as Callback with a time.')+
+
+  sec('Campaigns, scripts &amp; rebuttals',['admin','Admin'],
+    '<h4>Campaigns</h4>Created in Leads → Import. Start / Pause / Stop / Reset control the pacing engine. Each campaign carries its own script, dispositions, wrap timing and recycle rules.'+
+    '<h4>Script editor</h4>Leads → Script. Insert merge fields like {{first_name}} or {{custom.any_csv_column}} — agents see the lead\'s real data. Live preview on the right.'+
+    '<h4>Objection rebuttals</h4>Same page, below the script: objection + comeback pairs that appear on the agent screen as the tap-to-open cheat sheet.')+
+
+  sec('Leads: import, playlists, folders, custom fields',['admin','Admin'],
+    '<h4>Import</h4>Upload a CSV (drag &amp; drop). Phones are normalized, invalid rows skipped, DNC-listed numbers blocked — you get a result popup with counts and a rejects file.'+
+    '<h4>Playlists</h4>Bundle lead lists and assign agents to them — this is what the pacing engine feeds from, and what Live stats reports on.'+
+    '<h4>Action folders</h4>Saved lead filters for working subsets (e.g. hot states).'+
+    '<h4>Custom fields</h4>Any extra CSV column rides along on the lead and can be merged into scripts.'+
+    '<h4>DNC list</h4>Numbers blocked before every single dial. Agents add via the DNC disposition; 4 negative strikes auto-DNC a number; positive outcomes DNC it for 90 days.'+
+    '<h4>Calling window</h4>Per-state legal calling hours in the lead\'s local timezone — disable states or override hours; the pacer respects it automatically.')+
+
+  sec('The dialing engine: power vs predictive',['admin','Admin'],
+    '<h4>Power (default)</h4>One line per available agent — zero abandoned calls.'+
+    '<h4>Predictive</h4>Per-campaign opt-in. Dials several lines per agent (<b>Calls per agent</b> = CPA), machine-detects in the background, and bridges only humans. An FCC guardrail keeps abandonment ≤3% over 30 days and auto-clamps pacing at 2.5%.'+
+    '<h4>Live stats</h4>Leads → Live stats: per-playlist <b>Calls / Ans / MD / Drop / Abd% / Dial</b> in real time. If Abd% climbs, lower that playlist\'s CPA. Counters persist across deploys; reset from the same screen.'+
+    '<h4>Ring time</h4>How long a number rings before counting as no-answer.')+
+
+  sec('Numbers &amp; inbound calls',['admin','Admin'],
+    '<h4>Numbers</h4>Leads → Numbers: see every Telnyx number, buy new ones by area code, and assign each DID to a campaign.'+
+    '<h4>Outbound caller ID</h4>Auto-rotated per call matching the lead\'s area code where possible; agents can lock a specific one for manual dialing.'+
+    '<h4>Inbound</h4>A caller ringing any of your numbers is routed to a <b>random Ready agent</b> on that number\'s campaign (ReadyMode-style rotation). Nobody Ready → voicemail box: recorded, transcribed, and queued as a callback.')+
+
+  sec('Analytics &amp; Reports',['admin','Admin'],
+    '<ul>'+
+    '<li><b>Analytics</b> — per-campaign dials, talk time, disposition breakdown, filterable by day.</li>'+
+    '<li><b>Call logs</b> — every call with recording playback, duration/result/agent filters, CSV export, and <b>QA</b>: star-score, flag and annotate recordings.</li>'+
+    '<li><b>Agent report</b> — logged-in / talk / wrap / break time per agent.</li>'+
+    '<li><b>Research</b> — look up every call ever made to one phone number.</li>'+
+    '<li><b>Office map</b> — live floor: drag agents onto desks, see state + how long they\'ve been in it, <b>listen in</b> on live calls, <b>kick</b> a stuck agent, and the <b>📣 message bar</b> (next section).</li>'+
+    '<li><b>Wallboard</b> — TV dashboard: dials, contact rate, sales, per-agent status.</li>'+
+    '</ul>')+
+
+  sec('Floor messaging',['admin','Admin'],
+    'Office map → the bar at the top. Type a message, choose <b>Everyone</b> or one agent, press <b>📣 Send</b>. It appears instantly as a blue banner across the top of their console with a chime; they click it to dismiss. Support users need the Office map permission. Messages are fire-and-forget — nothing is stored.')+
+
+  sec('User management, goals &amp; permissions',['admin','Admin'],
+    '<h4>Create users</h4>Name, email/username, password, role. Agents &amp; closers get their softphone credential automatically. Deleting a user cleans up their credential; you can\'t delete yourself or the last admin.'+
+    '<h4>Support permissions</h4>Checkbox list shown when role = Support — grant only what they need (each report, live monitor, kick, export…). Changes apply immediately.'+
+    '<h4>Daily agent goals</h4>Calls handled and Sales/Appts per day — drives the progress bars every agent sees. 0 disables a bar.')+
+
+  sec('AI Caller',['admin','Admin'],
+    'A separate lane where an AI assistant makes the calls (no human agent): pick campaigns, concurrency, voice and the transfer-target agents in <b>AI Caller → Controller</b>; watch results, listen live and hang up calls in <b>Call results</b>. Uses the same numbers and DNC rules as the human lanes. Currently parked in favor of the human dialer — a cheaper self-hosted pipeline is planned.')+
+
+  sec('Troubleshooting',['all','Everyone'],
+    '<ul>'+
+    '<li><b>UI looks stale after an update</b> — hard refresh: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd>.</li>'+
+    '<li><b>"Softphone not connected"</b> — the console reconnects itself; if stuck, sign out and back in.</li>'+
+    '<li><b>Session expired banner</b> — finish the call, then click the banner to sign in again.</li>'+
+    '<li><b>Offer sheet doesn\'t open</b> — allow popups for the dialer site.</li>'+
+    '<li><b>No Market Value results</b> — the RentCast key is missing on the server (admin: set RENTCAST_API_KEY on Render).</li>'+
+    '<li><b>Agent stuck in a state</b> — Office map → open their seat → Kick; they log back in clean.</li>'+
+    '</ul>');
+}
+
 function adminTab(which){
   $('adminConsole').classList.toggle('hidden', which!=='console');
   $('adminLeads').classList.toggle('hidden', which!=='leads');
   $('adminUsers').classList.toggle('hidden', which!=='users');
   $('adminReports').classList.toggle('hidden', which!=='reports');
   $('adminAi').classList.toggle('hidden', which!=='ai');
+  $('adminGuide').classList.toggle('hidden', which!=='guide');
   $('tabConsole').classList.toggle('active', which==='console');
   $('tabLeads').classList.toggle('active', which==='leads');
   $('tabUsers').classList.toggle('active', which==='users');
   $('tabReports').classList.toggle('active', which==='reports');
   $('tabAi').classList.toggle('active', which==='ai');
+  $('tabGuide').classList.toggle('active', which==='guide');
+  if(which==='guide'){ const g=$('guideBody'); if(!g.dataset.loaded){ g.innerHTML=dialerGuideHtml(USER&&USER.role||'admin'); g.dataset.loaded='1'; } }
   if(which==='reports') closeReport(); else closeAdminWs();
   if(which!=='ai') stopAiResultsPoll();
   if(which==='console') initAnalytics();
@@ -2018,6 +2166,7 @@ function applyNavAccess(){
   setTab('tabUsers', isAdmin);
   setTab('tabAi', isAdmin);
   setTab('tabReports', isAdmin || canAnyReport());
+  setTab('tabGuide', true);   // the guide is documentation — every admin/support user sees it
   // Report landing tiles
   const setTile=(id,ok)=>{ const el=$(id); if(el) el.classList.toggle('hidden', !ok); };
   setTile('rtile-audit', isAdmin);
