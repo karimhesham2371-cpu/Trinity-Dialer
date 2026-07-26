@@ -1300,10 +1300,23 @@ function renderLead(l, callerId){
   const cell=(k,v,wide)=>`<div class="ciCell${wide?' ciCell--wide':''}"><span class="cl">${esc(k)}</span><span class="cv" title="${v!=null&&v!==''?esc(v):''}">${v!=null&&v!==''?esc(v):'<span class="faint">—</span>'}</span></div>`;
   const emailKey=Object.keys(custom).find(k=>/^e-?mail(_?address)?$/i.test(k)&&custom[k]);
   const email=l.email||(emailKey?custom[emailKey]:'');
-  // Full property address for the one-tap Google search — standard columns
-  // first, else any bulk "address"-ish custom CSV column.
-  const addrKey=Object.keys(custom).find(k=>/address/i.test(k)&&custom[k]&&typeof custom[k]==='string');
-  const fullAddr=[l.address,l.city,l.state,l.zip].filter(Boolean).join(', ')||(addrKey?custom[addrKey]:'');
+  // Full property address for the one-tap Google search. Handles both list
+  // shapes: split columns (Address / City / State / Zip) and a single bulk
+  // column ("123 Mark Ave, Tampa, FL 29282") that may live in the address
+  // field itself OR in a custom CSV column. Property/situs columns win over
+  // generic ones; mailing/owner/email columns are never used.
+  const cVal=(re,ex)=>{ const k=Object.keys(custom).find(k=>re.test(k)&&!(ex||/e-?mail/i).test(k)&&custom[k]&&typeof custom[k]==='string'&&String(custom[k]).trim());
+    return k?String(custom[k]).trim():''; };
+  const street=(l.address||'').trim()
+    ||cVal(/(property|situs|site|full)[ _-]?address/i,/mail|owner|e-?mail/i)
+    ||cVal(/(street[ _-]?address|^address$|^address[ _-]?1$|address[ _-]?in[ _-]?bulk)/i,/mail|owner|e-?mail/i)
+    ||cVal(/address/i,/mail|owner|e-?mail/i);
+  // If the street value is already a full bulk address (has a comma), don't
+  // append city/state again — Google handles it as-is.
+  const fullAddr=street.includes(',')?street:
+    [street, (l.city||'').trim()||cVal(/^(property[ _-]?)?city$/i),
+     (l.state||'').trim()||cVal(/^(property[ _-]?)?state$/i),
+     (l.zip||'').trim()||cVal(/^zip|postal/i)].filter(Boolean).join(', ');
   const extra=Object.keys(custom).filter(k=>k!==emailKey&&k!=='ai'&&k!=='deal'&&custom[k]!=null&&custom[k]!==''&&typeof custom[k]!=='object').map(k=>cell(k,custom[k])).join('');
   $('leadCard').classList.remove('empty');
   $('leadCard').innerHTML=`
