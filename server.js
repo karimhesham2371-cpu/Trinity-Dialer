@@ -323,6 +323,93 @@ async function loadCoachCfg() {
   } catch (e) { console.error('[coachCfg:load]', e.message); }
 }
 
+// ── AI wrap pipeline (Telnyx AI inference — same API key, no extra vendor) ────
+// On every recorded, bridged agent call: transcribe the recording, have an LLM
+// write a wrap summary + suggest a disposition + extract seller-motivation
+// signals. Summary lands in the lead's history as a 🤖 note, motivation data is
+// stored on leads.custom.ai, and the agent's console gets a live push so the
+// note box pre-fills while they're still in wrap-up.
+const AI_WRAP_ON = env('AI_WRAP', '1') !== '0';
+const AI_WRAP_MODEL = env('AI_WRAP_MODEL', 'anthropic/claude-haiku-4-5');
+const AI_STT_MODEL = env('AI_STT_MODEL', 'distil-whisper/distil-large-v2');
+async function telnyxAIChat(messages, maxTokens) {
+  const r = await fetch('https://api.telnyx.com/v2/ai/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${TELNYX_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: AI_WRAP_MODEL, messages, max_tokens: maxTokens || 700 }),
+  });
+  if (!r.ok) throw new Error(`ai chat HTTP ${r.status}: ${(await r.text().catch(() => '')).slice(0, 120)}`);
+  const j = await r.json();
+  return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+}
+async function telnyxTranscribe(fileUrl) {
+  const form = new FormData();
+  form.append('model', AI_STT_MODEL);
+  form.append('file_url', fileUrl);
+  const r = await fetch('https://api.telnyx.com/v2/ai/audio/transcriptions', {
+    method: 'POST', headers: { Authorization: `Bearer ${TELNYX_KEY}` }, body: form,
+  });
+  if (!r.ok) throw new Error(`transcribe HTTP ${r.status}: ${(await r.text().catch(() => '')).slice(0, 120)}`);
+  const j = await r.json();
+  return (j.text || '').trim();
+}
+// Models sometimes fence JSON in ``` — cut from first { to last } and parse.
+function parseAIJson(text) {
+  const a = text.indexOf('{'), b = text.lastIndexOf('}');
+  if (a < 0 || b <= a) return null;
+  try { return JSON.parse(text.slice(a, b + 1)); } catch { return null; }
+}
+async function aiWrapAnalyze(ccid, recUrl) {
+  const [call] = await sbSelect('calls',
+    `telnyx_call_control_id=eq.${encodeURIComponent(ccid)}&select=id,agent_id,lead_id,campaign_id,bridged_at,ended_at`);
+  // Agent-lane connected calls only: the AI lane (agent_id null), voicemail box,
+  // and never-bridged legs (pure ring/machine recordings) are skipped.
+  if (!call || !call.agent_id || !call.lead_id || !call.bridged_at) return;
+  const talkSec = call.ended_at ? (new Date(call.ended_at) - new Date(call.bridged_at)) / 1000 : null;
+  if (talkSec != null && talkSec < 12) return;   // too short to contain a conversation
+  const transcript = (await telnyxTranscribe(recUrl)).slice(0, 9000);
+  if (transcript.length < 60) return;
+  const cfg = await campaignConfig(call.campaign_id).catch(() => null);
+  const codes = ((cfg && cfg.dispositions) || DEFAULT_DISPOSITIONS)
+    .filter(d => !d.system && !AGENT_HIDDEN_DISPOSITIONS.has(d.code))
+    .map(d => `${d.code} = ${d.label || d.code}`).join('; ');
+  const out = parseAIJson(await telnyxAIChat([{ role: 'user', content:
+`You analyze a cold call from a real-estate investing company to a homeowner about buying their property. Transcript below (may include both voices mixed).
+
+Reply with ONLY this JSON, no other text:
+{"summary":"2-3 short factual lines: who answered, what was said, agreed next step","disposition":"one code from: ${codes}","motivation_score":0-100 or null,"tags":["short motivation signals like pre-foreclosure, divorce, vacant, inherited, tired-landlord, price-flexible, wants-fast-close"],"facts":{"asking_price":"$ or null","timeline":"or null","reason_for_selling":"or null","condition":"or null","occupancy":"owner/tenant/vacant or null","decision_maker":"yes/no/unknown"}}
+
+motivation_score: null unless the OWNER actually discussed selling; 0-30 = refused/hostile, 40-60 = open but lukewarm, 70+ = motivated (distress signals, timeline, named a price).
+
+TRANSCRIPT:
+${transcript}` }]));
+  if (!out || !out.summary) return;
+  // 1) File the summary into the lead's contact history as a bot note.
+  sbWrite('POST', 'dispositions', { lead_id: call.lead_id, agent_id: call.agent_id,
+    campaign_id: call.campaign_id, code: 'NOTE', notes: '🤖 ' + String(out.summary).slice(0, 900),
+    telnyx_call_control_id: ccid }, 'return=minimal', 'ai-wrap-note');
+  // 2) Persist motivation onto the lead (merge — keep prior facts the new call didn't cover).
+  try {
+    const [lead] = await sbSelect('leads', `id=eq.${call.lead_id}&select=custom`);
+    if (lead) {
+      const prev = (lead.custom && lead.custom.ai) || {};
+      const facts = { ...(prev.facts || {}) };
+      for (const [k, v] of Object.entries(out.facts || {}))
+        if (v != null && v !== '' && String(v).toLowerCase() !== 'null' && String(v).toLowerCase() !== 'unknown') facts[k] = String(v).slice(0, 120);
+      const ai = { score: out.motivation_score != null ? Math.max(0, Math.min(100, +out.motivation_score || 0)) : (prev.score != null ? prev.score : null),
+        tags: [...new Set([...(prev.tags || []), ...(Array.isArray(out.tags) ? out.tags.map(t => String(t).slice(0, 40)) : [])])].slice(0, 10),
+        facts, summary: String(out.summary).slice(0, 900), at: new Date().toISOString() };
+      await sbUpdate('leads', `id=eq.${call.lead_id}`, { custom: { ...(lead.custom || {}), ai } });
+    }
+  } catch (e) { console.error('[ai-wrap:lead]', e.message); }
+  // 3) Live push — pre-fills the agent's note box + highlights the suggested disposition.
+  wsToAgent(call.agent_id, { type: 'ai.wrap', lead_id: call.lead_id,
+    summary: String(out.summary).slice(0, 900), disposition: out.disposition || null,
+    motivation: { score: out.motivation_score != null ? +out.motivation_score : null,
+      tags: Array.isArray(out.tags) ? out.tags.slice(0, 8) : [], facts: out.facts || {} } });
+  console.log(`[ai-wrap] ${ccid.slice(-8)} summarized (${transcript.length} chars, score ${out.motivation_score})`);
+}
+
 // Per-state lead-local calling window (ReadyMode-style compliance). Each US state
 // maps to its own timezone; the admin can disable a state entirely or override its
 // start/end time, else it inherits the queue-default window. Cached from
@@ -3292,10 +3379,28 @@ app.post('/api/agent/transfer', auth, async (req, res) => {
     await setAgentState(req.user.id, 'WRAP_UP');
     scheduleWrapReturn(req.user.id, WRAP_SHORT_SEC);
     pushLeadContext(to, null);
+    sendTransferBrief(req.user, to, leadId).catch(e => console.error('[xfer-brief]', e.message));
     audit(req.user, 'TRANSFER_CALL', { target_type: 'agent', target_id: to, meta: { phone: leadNumber, lead_id: leadId } });
     res.json({ ok: true });
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
+
+// Warm-transfer briefing: everything the AI has learned about this seller,
+// pushed to the closer's console the instant the call lands — motivation score,
+// extracted facts, and the last few notes/summaries. Zero added latency: it's
+// assembled from data the wrap pipeline already stored.
+async function sendTransferBrief(fromUser, closerId, leadId) {
+  if (!leadId) return;
+  const [[lead], hist] = await Promise.all([
+    sbSelect('leads', `id=eq.${leadId}&select=first_name,last_name,custom`),
+    sbSelect('dispositions',
+      `lead_id=eq.${leadId}&select=code,notes,created_at&order=created_at.desc&limit=6`).catch(() => []),
+  ]);
+  wsToAgent(closerId, { type: 'transfer.brief', lead_id: leadId,
+    from: (fromUser && fromUser.name) || 'Agent',
+    ai: (lead && lead.custom && lead.custom.ai) || null,
+    history: (hist || []).filter(h => h.notes) });
+}
 
 // ── Closer deal pipeline ─────────────────────────────────────────────────────
 // A lead dispositioned as a positive outcome (sale/appt/lead) is auto-enrolled
@@ -4566,6 +4671,12 @@ app.post('/webhooks/telnyx', async (req, res) => {
         archiveCallRecording(ccid, recId, url, false)
           .then(r => console.log(`[rec-archive] ${ccid.slice(-8)} -> ${recId} (${r.bytes}B)`))
           .catch(e => console.error(`[rec-archive] ${ccid.slice(-8)}: ${e.message}`));
+      }
+      // AI wrap: transcribe + summarize while the presigned URL is still fresh.
+      // Small delay lets the call-ended/bridged fields land on the calls row first.
+      if (ccid && url && AI_WRAP_ON && TELNYX_KEY && !vmboxRt[ccid]) {
+        setTimeout(() => aiWrapAnalyze(ccid, url)
+          .catch(e => console.error(`[ai-wrap] ${ccid.slice(-8)}: ${e.message}`)), 4000);
       }
       // Voicemail-box recording → file it into the callback queue (spec §4).
       if (ccid && vmboxRt[ccid]) {

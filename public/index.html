@@ -519,6 +519,12 @@
   .gtag--all{background:var(--ok-tint);color:var(--ok)}
   .gtag--closer{background:var(--warn-tint);color:var(--warn)}
   kbd{font:600 11px var(--font-mono);background:var(--surface-2);border:1px solid var(--border-strong);border-radius:5px;padding:1px 6px;color:var(--text)}
+
+  /* ═══ AI WRAP ═══ */
+  .dispBtn.aiSuggest{border-color:var(--accent);box-shadow:0 0 14px rgba(239,182,60,.28);position:relative}
+  .dispBtn.aiSuggest::after{content:'AI';position:absolute;top:-7px;right:-6px;font:700 9px var(--font-ui);
+    letter-spacing:.05em;background:linear-gradient(180deg,#F5C24E,#E0A62F);color:var(--accent-ink);
+    padding:1px 6px;border-radius:999px;box-shadow:0 2px 8px rgba(239,182,60,.35)}
 </style>
 </head>
 <body>
@@ -1004,6 +1010,15 @@ function openWs(){
         renderScript(m.campaign);
         renderDispositions(m.campaign&&m.campaign.dispositions||[]); }
     }
+    else if(m.type==='ai.wrap'){
+      if(m.lead_id===curLeadId){
+        if(!$('notes').value.trim()) $('notes').value=m.summary;
+        if(m.disposition) aiSuggestDispo(m.disposition);
+        renderAiBox(m.motivation, m.summary);
+        toast('🤖 Call summarized','ok');
+      }
+    }
+    else if(m.type==='transfer.brief'){ renderTransferBrief(m); }
     else if(m.type==='floor.msg'){
       const fb=$('floorMsg');
       fb.textContent='📣 '+m.from+': '+m.text;
@@ -1238,7 +1253,7 @@ function renderLead(l, callerId){
   const cell=(k,v,wide)=>`<div class="ciCell${wide?' ciCell--wide':''}"><span class="cl">${esc(k)}</span><span class="cv" title="${v!=null&&v!==''?esc(v):''}">${v!=null&&v!==''?esc(v):'<span class="faint">—</span>'}</span></div>`;
   const emailKey=Object.keys(custom).find(k=>/^e-?mail(_?address)?$/i.test(k)&&custom[k]);
   const email=l.email||(emailKey?custom[emailKey]:'');
-  const extra=Object.keys(custom).filter(k=>k!==emailKey&&custom[k]!=null&&custom[k]!=='').map(k=>cell(k,custom[k])).join('');
+  const extra=Object.keys(custom).filter(k=>k!==emailKey&&k!=='ai'&&k!=='deal'&&custom[k]!=null&&custom[k]!==''&&typeof custom[k]!=='object').map(k=>cell(k,custom[k])).join('');
   $('leadCard').classList.remove('empty');
   $('leadCard').innerHTML=`
     <div style="display:flex;align-items:flex-start;gap:8px">
@@ -1263,6 +1278,8 @@ function renderLead(l, callerId){
       </div>
     </div>`;
   $('leadEdit').onclick=()=>renderLeadEdit();
+  // Persisted seller intel from prior calls renders the moment the card lands.
+  if(custom.ai&&(custom.ai.score!=null||custom.ai.summary)) renderAiBox(custom.ai, custom.ai.summary);
   // Only clear notes when a NEW lead lands — the instant WS push and the
   // loadContext refresh both render the same lead, and the second render must
   // not wipe what the agent already typed.
@@ -1666,11 +1683,73 @@ function renderDispositions(list){
   dispositions=list||[];
   const g=$('dispGrid'); g.innerHTML='';
   dispositions.forEach(d=>{
-    const b=document.createElement('button'); b.className='dispBtn';
+    const b=document.createElement('button'); b.className='dispBtn'; b.dataset.code=d.code;
     b.innerHTML=`<span class="sw" style="background:${d.color||'var(--text-dim)'}"></span>${esc(d.label||d.code)}${d.hotkey?`<span class="hk">${esc(d.hotkey)}</span>`:''}`;
     b.onclick=()=>chooseDisposition(d);
     g.appendChild(b);
   });
+}
+
+// ── AI wrap rendering ──
+// Highlight the disposition the AI suggests (agent still confirms it).
+function aiSuggestDispo(code){
+  $('dispGrid').querySelectorAll('.dispBtn').forEach(b=>{
+    b.classList.toggle('aiSuggest', b.dataset.code===code);
+  });
+}
+function motivChip(score){
+  if(score==null) return '';
+  const s=Math.round(score);
+  const [col,label]= s>=70?['var(--ok)','HOT'] : s>=40?['var(--warn)','WARM'] : ['var(--text-faint)','COLD'];
+  return `<span class="pill" style="background:transparent;border:1px solid ${col};color:${col}">${label} · ${s}</span>`;
+}
+// Motivation + summary box shown under the lead card after the AI analyzes a call.
+function renderAiBox(mot, summary){
+  const old=$('aiBox'); if(old) old.remove();
+  if(!mot&&!summary) return;
+  const div=document.createElement('div'); div.id='aiBox'; div.className='mt';
+  const tags=(mot&&mot.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join('');
+  const f=mot&&mot.facts||{};
+  const factRow=(k,v)=> v&&String(v).toLowerCase()!=='null'&&String(v).toLowerCase()!=='unknown'
+    ? `<div class="prodStat" style="padding:4px 0"><span class="pl">${k}</span><span class="pv" style="font-size:13px">${esc(v)}</span></div>` : '';
+  div.innerHTML=`<div class="ciPanel">
+    <div class="ciHead" style="display:flex;align-items:center;gap:8px">🤖 Seller read ${mot?motivChip(mot.score):''}</div>
+    <div style="padding:10px 12px">
+      ${summary?`<div style="font-size:13px;line-height:1.55;white-space:pre-wrap;margin-bottom:${tags||''?'8px':'0'}">${esc(summary)}</div>`:''}
+      ${tags?`<div class="chips" style="margin-bottom:6px">${tags}</div>`:''}
+      ${factRow('Asking price',f.asking_price)}${factRow('Timeline',f.timeline)}
+      ${factRow('Reason',f.reason_for_selling)}${factRow('Condition',f.condition)}
+      ${factRow('Occupancy',f.occupancy)}${factRow('Decision maker',f.decision_maker)}
+    </div></div>`;
+  const anchor=$('leadRecs')||$('leadCard');
+  anchor.after(div);
+}
+// Warm-transfer briefing card for the receiving closer.
+function renderTransferBrief(m){
+  const old=$('xferBrief'); if(old) old.remove();
+  const div=document.createElement('div'); div.id='xferBrief'; div.className='card';
+  div.style.cssText='border-color:var(--accent);box-shadow:0 0 24px rgba(239,182,60,.18)';
+  const ai=m.ai||null;
+  const f=ai&&ai.facts||{};
+  const factCell=(k,v)=> v&&String(v).toLowerCase()!=='null'&&String(v).toLowerCase()!=='unknown'
+    ? `<div class="ciCell"><span class="cl">${k}</span><span class="cv">${esc(v)}</span></div>` : '';
+  const facts=factCell('Asking price',f.asking_price)+factCell('Timeline',f.timeline)+
+    factCell('Reason',f.reason_for_selling)+factCell('Condition',f.condition)+
+    factCell('Occupancy',f.occupancy)+factCell('Decision maker',f.decision_maker);
+  const hist=(m.history||[]).slice(0,4).map(h=>
+    `<div style="padding:5px 0;border-top:1px solid var(--border);font-size:12px" class="dim">${esc(h.notes)}</div>`).join('');
+  div.innerHTML=`
+    <p class="panelTitle" style="margin-bottom:10px">⚡ Transfer brief <span class="dim" style="font-weight:400;font-size:12px">from ${esc(m.from)}</span>
+      ${ai?motivChip(ai.score):''}
+      <button class="btn btn-sm" style="margin-left:auto" onclick="this.closest('#xferBrief').remove()">✕</button></p>
+    ${ai&&ai.summary?`<div style="font-size:13px;line-height:1.55;margin-bottom:10px">${esc(ai.summary)}</div>`:''}
+    ${ai&&(ai.tags||[]).length?`<div class="chips" style="margin-bottom:10px">${ai.tags.map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</div>`:''}
+    ${facts?`<div class="ciPanel"><div class="ciGrid">${facts}</div></div>`:''}
+    ${hist?`<div class="lbl" style="margin:10px 0 2px">Recent notes</div>${hist}`:''}
+    ${!ai&&!hist?'<div class="dim" style="font-size:12.5px">First conversation with this seller — no prior intel yet.</div>':''}`;
+  const cb=$('callBanner');
+  cb.parentElement.insertBefore(div, cb.nextSibling);
+  try{ beep(); }catch{}
 }
 
 async function chooseDisposition(d){
@@ -1727,6 +1806,8 @@ function beep(){
 function clearLead(){
   curLeadId=null; renderedLeadId=null; curLeadObj=null;
   const lr=$('leadRecs'); if(lr) lr.remove();
+  const ab=$('aiBox'); if(ab) ab.remove();
+  const xb=$('xferBrief'); if(xb) xb.remove();
   $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
   $('scriptBody').className='empty'; $('scriptBody').textContent='No active call.';
   $('history').className='empty'; $('history').textContent='No previous contact.';
@@ -2176,7 +2257,8 @@ function dialerGuideHtml(role){
     '<h4>Script</h4>The campaign script with the lead\'s real data merged into the {{fields}}. Under it, <b>Objections</b> — tap an objection to see the comeback (admin writes these per campaign).'+
     '<h4>Dispositions</h4>Every connected call must be coded before the next one. Buttons have hotkeys (<kbd>1</kbd>–<kbd>7</kbd>). <b>Callback</b> asks for a date/time and routes the lead back to you at that time. <b>Sale / Appt / Lead</b> gives the long wrap and enrolls the lead in the closer Deal pipeline automatically. <b>DNC</b> permanently blocks the number.'+
     '<h4>Fixing bad data</h4>Press <b>✎ Edit</b> on the lead card to correct name, address or email mid-call — saves straight to the lead.'+
-    '<h4>Raise hand</h4>The <b>🖐</b> button (top bar) pings every supervisor console and lights your seat up on the office map when you need help.')+
+    '<h4>Raise hand</h4>The <b>🖐</b> button (top bar) pings every supervisor console and lights your seat up on the office map when you need help.'+
+    '<h4>🤖 AI wrap assistant</h4>Seconds after a connected call ends, the AI transcribes it and: pre-fills your note box with a summary (if you haven\'t typed one), highlights the disposition it suggests with a gold <b>AI</b> tag (you still confirm it), and files a 🤖 note into the lead\'s history. It also builds a <b>Seller read</b> box under the lead card — a HOT/WARM/COLD motivation score with extracted facts (asking price, timeline, reason, condition) that reappears automatically on every future call with that seller.')+
 
   sec('Call controls &amp; the dialpad',['all','Everyone'],
     '<ul>'+
@@ -2191,7 +2273,8 @@ function dialerGuideHtml(role){
     '<h4>Goals</h4>If the admin sets daily targets (User management → Daily agent goals), progress bars appear at the top — gold while in progress, green at 100%.')+
 
   sec('Warm transfer: agent → closer',['all','Everyone'],
-    'On a live call, press <b>⇄ Transfer to closer</b> (under the call controls). Pick from the list of closers currently on Ready — the seller\'s line moves into that closer\'s conference with no dead air. The closer\'s screen goes green with the full lead card; you drop into wrap-up. If no closers are Ready the list says so — set a callback instead.')+
+    'On a live call, press <b>⇄ Transfer to closer</b> (under the call controls). Pick from the list of closers currently on Ready — the seller\'s line moves into that closer\'s conference with no dead air. The closer\'s screen goes green with the full lead card; you drop into wrap-up. If no closers are Ready the list says so — set a callback instead.'+
+    '<h4>⚡ Transfer brief</h4>The closer simultaneously gets a gold briefing card: the seller\'s motivation score, everything the AI has extracted from prior calls (asking price, timeline, reason, condition), and the last few notes — so they never walk into a transfer blind.')+
 
   sec('Closer: Market Value &amp; the offer calculator',['closer','Closer'],
     '<h4>Look up</h4>Type any property address → estimated as-is value, value range, and recent comparable sales (RentCast data), plus Zillow / Redfin / Realtor quick-links that open the property on each site.'+
