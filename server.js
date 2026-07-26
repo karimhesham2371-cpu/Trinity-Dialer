@@ -323,6 +323,18 @@ async function loadCoachCfg() {
   } catch (e) { console.error('[coachCfg:load]', e.message); }
 }
 
+// ── Team chat ────────────────────────────────────────────────────────────────
+// One shared room for the whole floor (agents, closers, support, admins).
+// Last 200 messages persist in app_settings; delivery is WS push + light polling.
+let TEAM_CHAT = [];
+async function loadTeamChat() {
+  try {
+    const rows = await sbSelect('app_settings', 'key=eq.team_chat&select=value');
+    const v = rows && rows[0] && rows[0].value;
+    if (v && Array.isArray(v.messages)) TEAM_CHAT = v.messages;
+  } catch (e) { console.error('[chat:load]', e.message); }
+}
+
 // ── AI wrap pipeline (Telnyx AI inference — same API key, no extra vendor) ────
 // On every recorded, bridged agent call: transcribe the recording, have an LLM
 // write a wrap summary + suggest a disposition + extract seller-motivation
@@ -3379,6 +3391,7 @@ app.post('/api/agent/transfer', auth, async (req, res) => {
     await setAgentState(req.user.id, 'WRAP_UP');
     scheduleWrapReturn(req.user.id, WRAP_SHORT_SEC);
     pushLeadContext(to, null);
+    startCaptionsIfWanted(to, ccid);
     sendTransferBrief(req.user, to, leadId).catch(e => console.error('[xfer-brief]', e.message));
     audit(req.user, 'TRANSFER_CALL', { target_type: 'agent', target_id: to, meta: { phone: leadNumber, lead_id: leadId } });
     res.json({ ok: true });
@@ -3484,6 +3497,52 @@ app.post('/api/agent/raise-hand', auth, (req, res) => {
   audit(req.user, 'RAISE_HAND', { target_type: 'agent', target_id: req.user.id, meta: { state: st.state || 'OFFLINE' } });
   res.json({ ok: true });
 });
+
+// ── Team chat: one floor-wide room, everyone can post and read ───────────────
+app.get('/api/chat', auth, (req, res) => {
+  const after = +req.query.after || 0;
+  res.json({ messages: TEAM_CHAT.filter(m => m.at > after).slice(-100) });
+});
+app.post('/api/chat', auth, (req, res) => {
+  const text = String((req.body && req.body.text) || '').trim().slice(0, 500);
+  if (!text) return res.status(400).json({ error: 'empty message' });
+  const c = permCache.get(req.user.id);
+  const msg = { id: crypto.randomUUID(), user_id: req.user.id,
+    name: req.user.name || '?', role: (c && c.role) || req.user.role || 'agent',
+    text, at: Date.now() };
+  TEAM_CHAT.push(msg);
+  if (TEAM_CHAT.length > 200) TEAM_CHAT = TEAM_CHAT.slice(-200);
+  saveSetting('team_chat', { messages: TEAM_CHAT });
+  for (const cl of wsClients) wsSend(cl.ws, { type: 'chat.msg', msg });
+  res.json({ ok: true, msg });
+});
+
+// ── Live captions toggle ─────────────────────────────────────────────────────
+// Per-agent preference held in rt; when ON, live transcription starts on the
+// lead leg at bridge time (both audio tracks) and `call.transcription` webhook
+// segments stream to the agent's console. Mid-call toggling starts/stops the
+// transcription on the spot.
+app.post('/api/agent/captions', auth, async (req, res) => {
+  const st = rt[req.user.id];
+  const on = !!(req.body && req.body.on);
+  if (!st) return res.status(409).json({ error: 'softphone not connected' });
+  st.captions = on;
+  try {
+    if (st.leadLeg) {
+      if (on) await telnyx('POST', `/calls/${st.leadLeg}/actions/transcription_start`,
+        { language: 'en', transcription_engine: 'B', transcription_tracks: 'both' });
+      else await telnyx('POST', `/calls/${st.leadLeg}/actions/transcription_stop`, {}).catch(() => {});
+    }
+    res.json({ ok: true, on });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+function startCaptionsIfWanted(agentId, ccid) {
+  const st = rt[agentId];
+  if (!st || !st.captions || !ccid) return;
+  telnyx('POST', `/calls/${ccid}/actions/transcription_start`,
+    { language: 'en', transcription_engine: 'B', transcription_tracks: 'both' })
+    .catch(e => console.error('[captions]', e.message));
+}
 
 // ── Closer calendar: this user's scheduled callbacks, next 14 days + overdue ──
 app.get('/api/agent/calendar', auth, async (req, res) => {
@@ -3967,6 +4026,7 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
   st.onCallSince = Date.now();
   st.state = 'ON_CALL';
   pushLeadContext(agentId, info.lead || null);   // fire-and-forget: card renders before the join lands
+  startCaptionsIfWanted(agentId, ccid);
   await telnyx('POST', `/conferences/${conf}/actions/join`, { call_control_id: ccid, start_conference_on_enter: true, mute: false });
   await setAgentState(agentId, 'ON_CALL');
   plStat(st.leadPlaylistId).ans++;
@@ -4453,6 +4513,7 @@ async function engineBridgeToAgent(agentId, ccid, info) {
     st.onCallSince = Date.now();
     st.state = 'ON_CALL';
     pushLeadContext(agentId, info.lead || null);
+    startCaptionsIfWanted(agentId, ccid);
     plStat('c:' + info.campaignId).ans++;
     await setAgentState(agentId, 'ON_CALL');
     info.phase = 'BRIDGED';
@@ -4657,6 +4718,18 @@ app.post('/webhooks/telnyx', async (req, res) => {
   sbWrite('POST', 'call_events', { event_type: event, telnyx_call_control_id: ccid, client_state: cs, payload }, 'return=minimal', 'call_events');
 
   try {
+    // Live caption segment → stream to the owning agent/closer console. The
+    // owner resolves via client_state (re-stamped on transfer) or the leg map,
+    // so captions follow the call wherever it goes.
+    if (event === 'call.transcription') {
+      const td = payload.transcription_data || {};
+      const text = (td.transcript || '').trim();
+      const owner = agentId || findAgentByLeg(ccid);
+      if (owner && text) wsToAgent(owner, { type: 'caption', text,
+        final: td.is_final !== false, track: td.transcription_track || td.track || '' });
+      return;
+    }
+
     // Recording saved -> archive the audio into Supabase Storage so it stays
     // playable forever. Telnyx's public URLs are presigned and die after 10 min,
     // so we can't just store one. We first write the ephemeral URL (so a call you
@@ -4971,6 +5044,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         st.leadLeg = ccid; st.inbound = true; st.leadId = null;
         st.onCallSince = Date.now(); st.state = 'ON_CALL';
         await setAgentState(agentId, 'ON_CALL');
+        startCaptionsIfWanted(agentId, ccid);
         saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString() }, 'call-bridged-inbound');
         console.log(`[inbound] agent ${agentId.slice(0, 8)} ON_CALL (bridged inbound)`);
       }
@@ -5521,6 +5595,7 @@ server.listen(PORT, async () => {
   await loadPlaylistStats();
   await loadCallerLocks();
   await loadCoachCfg();
+  await loadTeamChat();
   await loadCallPolicy();
   await loadRecycle();   // after call-policy: owns positive_dnc_days
   await loadAiConfig();

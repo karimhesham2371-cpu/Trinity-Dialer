@@ -520,6 +520,32 @@
   .gtag--closer{background:var(--warn-tint);color:var(--warn)}
   kbd{font:600 11px var(--font-mono);background:var(--surface-2);border:1px solid var(--border-strong);border-radius:5px;padding:1px 6px;color:var(--text)}
 
+  /* ═══ TEAM CHAT ═══ */
+  #chatFab{position:fixed;bottom:18px;left:18px;z-index:190;width:46px;height:46px;border-radius:50%;
+    border:1px solid rgba(148,163,190,.25);background:linear-gradient(180deg,#161C2A,#10151F);color:var(--text);
+    font-size:19px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center}
+  #chatFab:hover{border-color:rgba(239,182,60,.5)}
+  #chatBadge{position:absolute;top:-4px;right:-4px;min-width:18px;height:18px;border-radius:999px;
+    background:var(--danger);color:#fff;font:700 10px var(--font-ui);display:flex;align-items:center;justify-content:center;padding:0 4px}
+  #chatPanel{position:fixed;bottom:74px;left:18px;z-index:190;width:320px;height:420px;max-height:70vh;
+    display:flex;flex-direction:column;border-radius:14px;border:1px solid rgba(148,163,190,.2);
+    background:linear-gradient(180deg,#121828,#0E131E);box-shadow:0 18px 48px rgba(0,0,0,.55)}
+  .chatHead{display:flex;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);font:600 13px var(--font-disp)}
+  #chatMsgs{flex:1;overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+  .chatMsg{font-size:12.5px;line-height:1.45}
+  .chatMsg .cm-who{font-weight:600;margin-right:6px}
+  .chatMsg .cm-t{color:var(--text-faint);font-size:10px;margin-left:6px}
+  .chatMsg .cm-body{color:var(--text);word-wrap:break-word}
+  .chatFoot{display:flex;gap:6px;padding:10px;border-top:1px solid var(--border)}
+  .chatFoot .field{flex:1;height:32px}
+
+  /* ═══ LIVE CAPTIONS ═══ */
+  #capBox{border:1px solid rgba(148,163,190,.16);border-radius:12px;background:rgba(8,12,20,.85);
+    padding:8px 12px;font-size:13px;line-height:1.5;max-height:118px;overflow-y:auto}
+  #capBox .cap-line{margin-bottom:3px}
+  #capBox .cap-who{font-weight:600;margin-right:6px}
+  #capBox .cap-interim{opacity:.55;font-style:italic}
+
   /* ═══ AI WRAP ═══ */
   .dispBtn.aiSuggest{border-color:var(--accent);box-shadow:0 0 14px rgba(239,182,60,.28);position:relative}
   .dispBtn.aiSuggest::after{content:'AI';position:absolute;top:-7px;right:-6px;font:700 9px var(--font-ui);
@@ -606,6 +632,7 @@
         <span id="recInd" class="hidden" style="display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--danger);margin-right:12px"><span class="dot dot--danger dot--pulse"></span>REC</span>
         <div id="timer" class="timer hidden">00:00</div>
       </div>
+      <div id="capBox" class="hidden"></div>
 
       <div class="card" style="flex:1">
         <p class="panelTitle">Lead</p>
@@ -636,6 +663,9 @@
           <button id="cPad"  class="btn ctrlBtn" disabled><span class="ic">⌨</span><span>Dialpad</span></button>
           <button id="cHang" class="btn ctrlBtn danger" disabled><span class="ic">☎</span><span>Hang up</span></button>
         </div>
+        <label id="capWrap" class="mt2" style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-dim);cursor:pointer">
+          <input type="checkbox" id="capToggle" style="cursor:pointer"> Live captions <span class="dim" style="font-size:10.5px;margin-left:auto">CC</span>
+        </label>
         <div id="xferWrap" class="mt2 hidden" style="position:relative">
           <button id="cXfer" class="btn btn-block">⇄ Transfer to closer</button>
           <div id="xferMenu" class="auxMenu hidden" style="left:0;right:0;top:calc(100% + 6px)"></div>
@@ -820,6 +850,18 @@
 </div>
 
 <audio id="remoteAudio" autoplay></audio>
+<!-- ═══ TEAM CHAT (all roles) ═══ -->
+<button id="chatFab" class="hidden" title="Team chat">💬<span id="chatBadge" class="hidden">0</span></button>
+<div id="chatPanel" class="hidden">
+  <div class="chatHead">Team chat<span class="dim" style="font-weight:400;font-size:11px;margin-left:8px">everyone on the floor</span>
+    <button class="btn btn-sm" style="margin-left:auto" onclick="chatToggle(false)">✕</button></div>
+  <div id="chatMsgs"></div>
+  <div class="chatFoot">
+    <input id="chatIn" class="field" placeholder="Message the team…" maxlength="500">
+    <button id="chatSend" class="btn btn-primary btn-sm">Send</button>
+  </div>
+</div>
+
 <div id="toasts"></div>
 <div id="modalBack" class="hidden"></div>
 <script src="https://unpkg.com/@telnyx/webrtc/lib/bundle.js"></script>
@@ -972,7 +1014,8 @@ $('btnLogin').onclick = async () => {
 $('liPass').addEventListener('keydown', e=>{ if(e.key==='Enter') $('btnLogin').click(); });
 
 function route(){
-  if(!TOKEN||!USER){ show('login'); return; }
+  if(!TOKEN||!USER){ show('login'); $('chatFab').classList.add('hidden'); $('chatPanel').classList.add('hidden'); return; }
+  chatInit();   // team chat is available to every logged-in role
   if(USER.role==='admin'||USER.role==='support'){ show('admin'); $('adWho').textContent=USER.name+' · '+USER.email; loadAdmin(); }
   else { show('agent'); $('agWho').textContent=USER.name; initAudioSettings();
     // Closers get the same calling console plus Market Value / Deals / Calendar.
@@ -998,7 +1041,9 @@ function openWs(){
   const proto = location.protocol==='https:' ? 'wss' : 'ws';
   const sock = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
   ws = sock;
-  sock.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); log('ws open ✓'); };
+  sock.onopen = ()=>{ $('reconnBanner').classList.add('hidden'); log('ws open ✓');
+    // Re-sync the captions preference — server-side rt state resets on reconnect.
+    if(capOn()) apiJson('/api/agent/captions','POST',{on:true}).catch(()=>{}); };
   sock.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
     if(m.type==='agent.state'){ lastServerState=m.state; applyState(m.state, m); }
     else if(m.type==='lead.context'){
@@ -1019,6 +1064,8 @@ function openWs(){
       }
     }
     else if(m.type==='transfer.brief'){ renderTransferBrief(m); }
+    else if(m.type==='chat.msg'){ addChatMsg(m.msg); }
+    else if(m.type==='caption'){ renderCaption(m); }
     else if(m.type==='floor.msg'){
       const fb=$('floorMsg');
       fb.textContent='📣 '+m.from+': '+m.text;
@@ -1068,7 +1115,7 @@ function applyState(s, snap){
   $('padDialRow').classList.toggle('hidden',live);
   $('padCall').classList.toggle('hidden',live);
   $('xferWrap').classList.toggle('hidden',!live);
-  if(!live) $('xferMenu').classList.add('hidden');
+  if(!live){ $('xferMenu').classList.add('hidden'); clearCaptions(); }
   $('cHang').disabled=!(s==='ON_CALL'||s==='DIALING'||s==='CLAIMING');
   if(snap&&snap.onCallSince) onCallSince=snap.onCallSince;
   if(snap&&snap.wrapUntil) serverWrapUntil=snap.wrapUntil;
@@ -1253,11 +1300,16 @@ function renderLead(l, callerId){
   const cell=(k,v,wide)=>`<div class="ciCell${wide?' ciCell--wide':''}"><span class="cl">${esc(k)}</span><span class="cv" title="${v!=null&&v!==''?esc(v):''}">${v!=null&&v!==''?esc(v):'<span class="faint">—</span>'}</span></div>`;
   const emailKey=Object.keys(custom).find(k=>/^e-?mail(_?address)?$/i.test(k)&&custom[k]);
   const email=l.email||(emailKey?custom[emailKey]:'');
+  // Full property address for the one-tap Google search — standard columns
+  // first, else any bulk "address"-ish custom CSV column.
+  const addrKey=Object.keys(custom).find(k=>/address/i.test(k)&&custom[k]&&typeof custom[k]==='string');
+  const fullAddr=[l.address,l.city,l.state,l.zip].filter(Boolean).join(', ')||(addrKey?custom[addrKey]:'');
   const extra=Object.keys(custom).filter(k=>k!==emailKey&&k!=='ai'&&k!=='deal'&&custom[k]!=null&&custom[k]!==''&&typeof custom[k]!=='object').map(k=>cell(k,custom[k])).join('');
   $('leadCard').classList.remove('empty');
   $('leadCard').innerHTML=`
     <div style="display:flex;align-items:flex-start;gap:8px">
       <h3 class="leadName" style="flex:1">${esc(name)}</h3>
+      ${fullAddr?`<a class="btn btn-sm" target="_blank" rel="noopener" title="Google this property" href="https://www.google.com/search?q=${encodeURIComponent(fullAddr)}">🔍</a>`:''}
       <button id="leadEdit" class="btn btn-sm" title="Fix wrong contact data">✎ Edit</button>
     </div>
     <div class="leadPhone mt2">${esc(l.phone||'')}</div>
@@ -1878,6 +1930,84 @@ $('handBtn').onclick=async()=>{
   catch(e){ toast(e.message,'err'); }
 };
 
+// ── Team chat (all roles; agents get WS-instant, everyone polls as fallback) ──
+const CHAT_ROLE_COLORS={admin:'var(--accent)',support:'var(--info)',closer:'var(--ok)',agent:'var(--text-dim)'};
+let chatOpen=false, chatLastAt=0, chatUnread=0, chatPollT=null;
+const chatSeen=new Set();
+function chatInit(){
+  $('chatFab').classList.remove('hidden');
+  if(!chatPollT) chatPollT=setInterval(()=>{ if(TOKEN) chatLoad(); }, chatOpen?6000:12000);
+  chatLoad();
+}
+function chatToggle(open){
+  chatOpen=open!==undefined?open:!chatOpen;
+  $('chatPanel').classList.toggle('hidden',!chatOpen);
+  if(chatOpen){ chatUnread=0; renderChatBadge(); chatLoad(); setTimeout(()=>{ $('chatIn').focus(); chatScroll(); },50); }
+}
+function renderChatBadge(){
+  const b=$('chatBadge');
+  b.classList.toggle('hidden',!chatUnread);
+  b.textContent=chatUnread>9?'9+':chatUnread;
+}
+function chatScroll(){ const m=$('chatMsgs'); m.scrollTop=m.scrollHeight; }
+function addChatMsg(m){
+  if(!m||chatSeen.has(m.id)) return;
+  chatSeen.add(m.id); chatLastAt=Math.max(chatLastAt,m.at);
+  const div=document.createElement('div'); div.className='chatMsg';
+  const col=CHAT_ROLE_COLORS[m.role]||'var(--text-dim)';
+  const t=new Date(m.at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false});
+  div.innerHTML=`<span class="cm-who" style="color:${col}">${esc(m.name)}</span><span class="cm-t">${t}</span><div class="cm-body">${esc(m.text)}</div>`;
+  $('chatMsgs').appendChild(div);
+  while($('chatMsgs').children.length>200) $('chatMsgs').firstChild.remove();
+  if(chatOpen) chatScroll();
+  else if(USER&&m.user_id!==USER.id){ chatUnread++; renderChatBadge(); }
+}
+async function chatLoad(){
+  try{ const j=await apiJson('/api/chat?after='+chatLastAt);
+    (j.messages||[]).forEach(addChatMsg);
+  }catch(e){ /* transient */ }
+}
+async function chatSendMsg(){
+  const text=$('chatIn').value.trim();
+  if(!text) return;
+  $('chatIn').value='';
+  try{ const j=await apiJson('/api/chat','POST',{text}); addChatMsg(j.msg); }
+  catch(e){ toast(e.message,'err'); $('chatIn').value=text; }
+}
+$('chatFab').onclick=()=>chatToggle();
+$('chatSend').onclick=chatSendMsg;
+$('chatIn').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); chatSendMsg(); } });
+
+// ── Live captions ──
+const capOn=()=>localStorage.getItem('trinity_captions')==='1';
+$('capToggle').checked=capOn();
+$('capToggle').onchange=async()=>{
+  const on=$('capToggle').checked;
+  localStorage.setItem('trinity_captions',on?'1':'0');
+  if(!on){ $('capBox').classList.add('hidden'); $('capBox').innerHTML=''; }
+  try{ await apiJson('/api/agent/captions','POST',{on}); toast(on?'Live captions on':'Live captions off','ok'); }
+  catch(e){ /* not connected yet — synced on next ws open */ }
+};
+let capInterimEl=null;
+function renderCaption(m){
+  if(!capOn()||serverState!=='ON_CALL') return;
+  const box=$('capBox'); box.classList.remove('hidden');
+  const who=m.track==='inbound'?'Seller':'You';
+  const col=m.track==='inbound'?'var(--accent)':'var(--text-dim)';
+  if(!m.final){
+    if(!capInterimEl){ capInterimEl=document.createElement('div'); capInterimEl.className='cap-line cap-interim'; box.appendChild(capInterimEl); }
+    capInterimEl.innerHTML=`<span class="cap-who" style="color:${col}">${who}</span>${esc(m.text)}`;
+  } else {
+    if(capInterimEl){ capInterimEl.remove(); capInterimEl=null; }
+    const div=document.createElement('div'); div.className='cap-line';
+    div.innerHTML=`<span class="cap-who" style="color:${col}">${who}</span>${esc(m.text)}`;
+    box.appendChild(div);
+    while(box.querySelectorAll('.cap-line').length>8) box.firstChild.remove();
+  }
+  box.scrollTop=box.scrollHeight;
+}
+function clearCaptions(){ capInterimEl=null; $('capBox').classList.add('hidden'); $('capBox').innerHTML=''; }
+
 // ── Warm transfer to a closer ──
 $('cXfer').onclick=async()=>{
   const menu=$('xferMenu');
@@ -2257,6 +2387,7 @@ function dialerGuideHtml(role){
     '<h4>Script</h4>The campaign script with the lead\'s real data merged into the {{fields}}. Under it, <b>Objections</b> — tap an objection to see the comeback (admin writes these per campaign).'+
     '<h4>Dispositions</h4>Every connected call must be coded before the next one. Buttons have hotkeys (<kbd>1</kbd>–<kbd>7</kbd>). <b>Callback</b> asks for a date/time and routes the lead back to you at that time. <b>Sale / Appt / Lead</b> gives the long wrap and enrolls the lead in the closer Deal pipeline automatically. <b>DNC</b> permanently blocks the number.'+
     '<h4>Fixing bad data</h4>Press <b>✎ Edit</b> on the lead card to correct name, address or email mid-call — saves straight to the lead.'+
+    '<h4>🔍 Property search</h4>The magnifier next to the seller\'s name opens a Google search for the full property address in a new tab — works with Address/City/State/Zip columns or a single bulk-address column.'+
     '<h4>Raise hand</h4>The <b>🖐</b> button (top bar) pings every supervisor console and lights your seat up on the office map when you need help.'+
     '<h4>🤖 AI wrap assistant</h4>Seconds after a connected call ends, the AI transcribes it and: pre-fills your note box with a summary (if you haven\'t typed one), highlights the disposition it suggests with a gold <b>AI</b> tag (you still confirm it), and files a 🤖 note into the lead\'s history. It also builds a <b>Seller read</b> box under the lead card — a HOT/WARM/COLD motivation score with extracted facts (asking price, timeline, reason, condition) that reappears automatically on every future call with that seller.')+
 
@@ -2327,6 +2458,12 @@ function dialerGuideHtml(role){
     '<li><b>Wallboard</b> — TV dashboard: dials, contact rate, sales, per-agent status.</li>'+
     '<li><b>Attendance</b> — first clock-in / last clock-out / hours per agent per day, with late flags against your shift start time.</li>'+
     '</ul>')+
+
+  sec('Team chat',['all','Everyone'],
+    'The <b>💬</b> button (bottom-left, every role) opens one shared room for the whole floor. Agents ask for help, closers coordinate, support and admins answer — messages show each person\'s name colored by role, with an unread badge when the panel is closed. The last 200 messages persist across sessions.')+
+
+  sec('Live captions',['all','Everyone'],
+    'Tick <b>Live captions</b> in the Call controls card and every call gets real-time subtitles under the state banner — <b>Seller</b> lines in gold, <b>You</b> in gray, with the in-progress sentence shown italic until it finalizes. The preference sticks per browser and follows warm transfers. Turn it off any time (captions are transcribed by Telnyx and billed per minute while on).')+
 
   sec('Floor messaging',['admin','Admin'],
     'Office map → the bar at the top. Type a message, choose <b>Everyone</b> or one agent, press <b>📣 Send</b>. It appears instantly as a blue banner across the top of their console with a chime; they click it to dismiss. Support users need the Office map permission. Messages are fire-and-forget — nothing is stored.')+
