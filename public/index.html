@@ -1036,8 +1036,26 @@ function getTelnyxRTC(){ const g=window.TelnyxWebRTC||window.telnyxWebRTC||windo
 // is actually live; unmute fires on both the state push and the lead-context
 // push so the seller's first word is never clipped.
 function syncRemoteMute(){
-  const a=$('remoteAudio'); if(!a) return;
-  a.muted = serverState!=='ON_CALL';
+  const mute = serverState!=='ON_CALL';
+  const a=$('remoteAudio'); if(a) a.muted=mute;
+  // Element mute alone can miss audio the SDK routes through its own element,
+  // so also disable the WebRTC audio track itself — silences the stream at the
+  // source regardless of how it's being played.
+  try{
+    const rs = agentCall && (agentCall.remoteStream || (agentCall.peer && agentCall.peer.remoteStream));
+    if(rs) rs.getAudioTracks().forEach(t=>{ t.enabled=!mute; });
+  }catch(e){}
+  // And any stray SDK-created <audio> elements (never our recording players).
+  document.querySelectorAll('audio').forEach(el=>{ if(el.id!=='remoteAudio'&&!el.classList.contains('mini')) el.muted=mute; });
+}
+// Hard-open every audio path — used at bridge time and as the WS-down failsafe.
+function openAudioNow(){
+  const a=$('remoteAudio'); if(a) a.muted=false;
+  try{
+    const rs = agentCall && (agentCall.remoteStream || (agentCall.peer && agentCall.peer.remoteStream));
+    if(rs) rs.getAudioTracks().forEach(t=>{ t.enabled=true; });
+  }catch(e){}
+  document.querySelectorAll('audio').forEach(el=>{ if(!el.classList.contains('mini')) el.muted=false; });
 }
 
 let wsReconnTimer=null;
@@ -1059,7 +1077,7 @@ function openWs(){
     else if(m.type==='lead.context'){
       // Bridge is happening — open the speaker NOW (this push can beat the
       // agent.state push by a beat; never clip the seller's "hello").
-      $('remoteAudio').muted=false;
+      openAudioNow();
       // Server pushes the full lead profile at bridge time — render instantly
       // instead of waiting for the loadContext HTTP round trip (which still
       // runs on ON_CALL and fills in call history).
@@ -1096,7 +1114,7 @@ function openWs(){
     if(TOKEN&&USER&&(USER.role==='agent'||USER.role==='closer')){
       // Fail open: with the socket down we can't know when a call bridges, so
       // unmute — a moment of idle hiss beats a silent live seller.
-      $('remoteAudio').muted=false;
+      openAudioNow();
       $('reconnBanner').classList.remove('hidden');
       if(wsReconnTimer) clearTimeout(wsReconnTimer);
       wsReconnTimer=setTimeout(openWs, 2500);
@@ -1241,7 +1259,12 @@ async function startAgent(){
       if(n.type==='callUpdate' && n.call){
         const st=n.call.state;
         if(st==='ringing' && n.call.direction==='inbound' && n.call!==agentCall){ log('auto-answering agent leg'); agentCall=n.call; n.call.answer(); }
-        if(st==='active' && n.call.direction==='inbound'){ agentCall=n.call; }
+        if(st==='active' && n.call.direction==='inbound'){
+          agentCall=n.call;
+          // The remote stream attaches around 'active' — re-apply the idle mute
+          // now and again shortly after, so the empty-bridge hiss never leaks.
+          syncRemoteMute(); setTimeout(syncRemoteMute,300); setTimeout(syncRemoteMute,1200);
+        }
         if(st==='hangup' && n.call===agentCall){ agentCall=null; }
       }
     });
