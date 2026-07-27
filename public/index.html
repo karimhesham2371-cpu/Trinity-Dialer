@@ -672,7 +672,7 @@
         </div>
         <div id="padWrap" class="mt3 hidden">
           <div id="padDialRow" style="margin-bottom:8px">
-            <div style="display:flex;gap:6px;margin-bottom:6px">
+            <div id="padFromRow" style="display:flex;gap:6px;margin-bottom:6px">
               <select id="padFrom" class="field" style="flex:1;font-family:var(--font-mono)"></select>
               <button id="padLock" class="btn btn-sm" style="white-space:nowrap">Lock it</button>
             </div>
@@ -1024,6 +1024,9 @@ function route(){
     $('ltDeals').classList.toggle('hidden', !closer);
     $('ltCal').classList.toggle('hidden', !closer);
     $('ltGuide').classList.toggle('hidden', !closer);   // guide: everyone except agents
+    // Caller-ID choice is a closer privilege — agents get auto-rotated DIDs
+    // (ReadyMode-style); their manual dials are assigned a number server-side.
+    $('padFromRow').classList.toggle('hidden', !closer);
     startAgent(); }
 }
 
@@ -1753,7 +1756,7 @@ function prefillDial(phone){
   if(!phone) return;
   $('padNum').value=phone;
   $('padWrap').classList.remove('hidden');
-  if(!callerIds.length) loadCallerIds();
+  if(!callerIds.length&&USER&&USER.role==='closer') loadCallerIds();
   toast('Number loaded — press Call','ok');
 }
 
@@ -1938,7 +1941,7 @@ function toggleMute(){ if(!agentCall) return; muted=!muted; try{ muted?agentCall
   $('cMute').classList.toggle('active',muted); $('cMute').querySelector('span:last-child').textContent=muted?'Unmute':'Mute'; }
 $('cHold').onclick=async()=>{ held=!held; try{ await apiJson('/api/agent/hold','POST',{on:held}); }catch(e){ held=!held; toast(e.message,'err'); return; }
   $('cHold').classList.toggle('active',held); $('cHold').querySelector('span:last-child').textContent=held?'Resume':'Hold'; };
-$('cPad').onclick=()=>{ $('padWrap').classList.toggle('hidden'); if(!$('padWrap').classList.contains('hidden')&&!callerIds.length) loadCallerIds(); };
+$('cPad').onclick=()=>{ $('padWrap').classList.toggle('hidden'); if(!$('padWrap').classList.contains('hidden')&&!callerIds.length&&USER&&USER.role==='closer') loadCallerIds(); };
 
 // Manual-dial caller ID: agents pick a number, press "Lock it", and every manual
 // call goes out from it until they press Change and lock another one.
@@ -1977,7 +1980,9 @@ $('padCall').onclick=async()=>{
   const raw=$('padNum').value.trim();
   const digits=raw.replace(/[^\d+]/g,'');
   if(digits.replace(/\D/g,'').length<10){ toast('Enter a valid phone number','warn'); return; }
-  if(!lockedFrom){ toast('Pick a caller ID and press Lock it first','warn'); return; }
+  // Only closers pick their own caller ID; agents dial out on an auto-assigned
+  // rotating number, so no lock is required for them.
+  if(USER&&USER.role==='closer'&&!lockedFrom){ toast('Pick a caller ID and press Lock it first','warn'); return; }
   $('padCall').disabled=true;
   try{
     await apiJson('/api/agent/manual-dial','POST',{phone:digits});
@@ -2463,7 +2468,8 @@ function dialerGuideHtml(role){
     '<li><b>Dialpad</b> — during a call it sends touch-tones (IVRs, extensions). Off-call it becomes the manual dialer.</li>'+
     '<li><b>Hang up</b> — ends the live call, or cancels ringing background dials while Waiting.</li>'+
     '</ul>'+
-    '<h4>Manual outbound calls</h4>Open the dialpad while not on a call: pick a <b>Caller ID</b> from the dropdown (every number the dialer owns), press <b>Lock it</b>, type the number, press <b>Call</b>. The locked caller ID sticks for your whole session — across calls and even redeploys — until you press <b>Change</b>. DNC numbers are refused. If the number matches a known lead, the call attaches to that lead so history and dispositions work.')+
+    '<h4>Manual outbound calls</h4>Open the dialpad while not on a call, type the number, press <b>Call</b>. DNC numbers are refused, and if the number matches a known lead the call attaches to that lead so history and dispositions work.'+
+    '<h4>Caller ID</h4><b>Agents</b> never pick a number — the dialer auto-assigns a rotating caller ID matched to the lead\'s area code, on manual dials too (ReadyMode-style). <b>Closers</b> get a Caller ID dropdown on the dialpad: pick a number, press <b>Lock it</b>, and every manual call goes out from it — across calls and even redeploys — until they press <b>Change</b>.')+
 
   sec('Productivity &amp; daily goals',['all','Everyone'],
     'The <b>Productivity</b> tab live-updates every 5 seconds: hours logged in, break / wrap / wait durations, average wait between calls, calls handled (only calls that actually reached you), and sales/appts.'+

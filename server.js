@@ -3267,7 +3267,7 @@ app.post('/api/agent/hangup', auth, async (req, res) => {
 // Every number the dialer owns, for the manual-dial "call from" picker: the live
 // Telnyx caller pool merged with the imported DID list (covers env-pinned pools
 // that hide some owned numbers). Also returns this agent's current lock.
-app.get('/api/agent/caller-ids', auth, async (req, res) => {
+app.get('/api/agent/caller-ids', auth, closerOrAdmin, async (req, res) => {
   try {
     const dids = await sbSelect('dids', 'select=phone_number').catch(() => []);
     const all = [...new Set([...CALLER_POOL, ...(dids || []).map(d => d.phone_number).filter(Boolean)])].sort();
@@ -3278,7 +3278,7 @@ app.get('/api/agent/caller-ids', auth, async (req, res) => {
 // Lock (or clear, with number:null) the caller ID this agent dials manually from.
 // The lock sticks for the whole dialing session — across calls and redeploys —
 // until the agent changes it.
-app.post('/api/agent/caller-id', auth, async (req, res) => {
+app.post('/api/agent/caller-id', auth, closerOrAdmin, async (req, res) => {
   const num = req.body && req.body.number ? normPhone(String(req.body.number)) : null;
   if (num) {
     const dids = await sbSelect('dids', 'select=phone_number').catch(() => []);
@@ -3323,9 +3323,12 @@ app.post('/api/agent/manual-dial', auth, async (req, res) => {
     clearWrapTimer(st);
     const [lead] = await sbSelect('leads',
       `phone=eq.${encodeURIComponent(phone)}&select=*&order=created_at.desc&limit=1`).catch(() => []);
-    // Manual calls go out from the agent's locked caller ID (chosen + locked on
-    // the dialpad); fall back to the area-code match only if nothing is locked.
-    const from = CALLER_LOCKS[id] || pickCallerId(areaCodeOf(phone));
+    // Caller ID: closers dial from their locked number; agents always get the
+    // auto-rotated pool pick (area-code match), same as system dials — any
+    // stale lock from before the role split is ignored for them.
+    const cRole = permCache.get(id);
+    const role = (cRole && cRole.role) || req.user.role;
+    const from = (role !== 'agent' && CALLER_LOCKS[id]) || pickCallerId(areaCodeOf(phone));
     const cid = crypto.randomUUID();
     const result = await telnyx('POST', '/calls', {
       connection_id: CONNECTION_ID, to: phone, from,
