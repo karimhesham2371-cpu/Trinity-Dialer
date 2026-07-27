@@ -1048,6 +1048,19 @@ function syncRemoteMute(){
   // And any stray SDK-created <audio> elements (never our recording players).
   document.querySelectorAll('audio').forEach(el=>{ if(el.id!=='remoteAudio'&&!el.classList.contains('mini')) el.muted=mute; });
 }
+// Continuous enforcement: the SDK can attach its stream (or spawn an audio
+// element) seconds after our event-driven sweeps ran, leaking hiss until the
+// next state change. Re-apply the idle mute every second — but never while a
+// call is live, and never while the WS is down (state could be stale; the
+// fail-open in onclose owns that case).
+setInterval(()=>{
+  if(!TOKEN||!USER) return;
+  if(USER.role!=='agent'&&USER.role!=='closer') return;
+  if(serverState==='ON_CALL') return;
+  if(!$('reconnBanner').classList.contains('hidden')) return;   // ws down → fail-open owns audio
+  syncRemoteMute();
+},1000);
+
 // Hard-open every audio path — used at bridge time and as the WS-down failsafe.
 function openAudioNow(){
   const a=$('remoteAudio'); if(a) a.muted=false;
