@@ -1402,14 +1402,35 @@ app.patch('/api/admin/users/:id', auth, adminOnly, adminRoleOnly, async (req, re
   }
   if (password) patch.password_hash = await bcrypt.hash(password, 10);
   try {
+    const [target] = await sbSelect('agents',
+      `id=eq.${req.params.id}&select=id,role,email,telnyx_credential_id`);
+    if (!target) return res.status(404).json({ error: 'user not found' });
+    // Never demote (or deactivate) the last active admin — mirrors the delete guard.
+    if ((newRole && target.role === 'admin' && newRole !== 'admin') ||
+        (active === false && target.role === 'admin')) {
+      const admins = await sbSelect('agents', `role=eq.admin&active=eq.true&select=id`);
+      if (admins.length <= 1) return res.status(400).json({ error: 'cannot demote or deactivate the last active admin' });
+    }
+    // Promoting into a calling role (agent/closer) provisions the softphone
+    // credential the create path would have made — without it they can't dial.
+    let sipNote = null;
+    if ((newRole === 'agent' || newRole === 'closer') && !target.telnyx_credential_id && TELNYX_KEY) {
+      const cred = await telnyx('POST', '/telephony_credentials', {
+        connection_id: CRED_CONNECTION_ID, name: `trinity-${String(target.email || target.id).replace(/[^a-z0-9]/gi, '')}`,
+      });
+      patch.telnyx_credential_id = cred.data && cred.data.id;
+      patch.sip_username = cred.data && cred.data.sip_username;
+      sipNote = patch.sip_username;
+    }
     await sbUpdate('agents', `id=eq.${req.params.id}`, patch);
     // Refresh the live permission cache so revocation/grant is immediate.
     const [fresh] = await sbSelect('agents', `id=eq.${req.params.id}&select=id,role,permissions`);
     if (fresh) cacheUser(fresh);
     const meta = { ...patch }; delete meta.password_hash;
     if (password) meta.password = 'reset';
+    if (sipNote) meta.softphone_provisioned = true;
     audit(req.user, 'UPDATE_AGENT', { target_type: 'agent', target_id: req.params.id, meta });
-    res.json({ ok: true });
+    res.json({ ok: true, softphone_provisioned: !!sipNote });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
