@@ -849,7 +849,7 @@
   </div>
 </div>
 
-<audio id="remoteAudio" autoplay></audio>
+<audio id="remoteAudio" autoplay muted></audio>
 <!-- ═══ TEAM CHAT (all roles) ═══ -->
 <button id="chatFab" class="hidden" title="Team chat">💬<span id="chatBadge" class="hidden">0</span></button>
 <div id="chatPanel" class="hidden">
@@ -1030,6 +1030,16 @@ function route(){
 // ═══════════ AGENT ═══════════
 function getTelnyxRTC(){ const g=window.TelnyxWebRTC||window.telnyxWebRTC||window.TelnyxRTC||window.telnyx; if(!g)return null; return g.TelnyxRTC||(g.default&&g.default.TelnyxRTC)||g; }
 
+// Hush the empty bridge: while Waiting, the agent sits alone in their Telnyx
+// conference, whose comfort-noise/silence frames some audio stacks render as
+// static ("TV on the wrong input"). Incoming audio stays muted unless a call
+// is actually live; unmute fires on both the state push and the lead-context
+// push so the seller's first word is never clipped.
+function syncRemoteMute(){
+  const a=$('remoteAudio'); if(!a) return;
+  a.muted = serverState!=='ON_CALL';
+}
+
 let wsReconnTimer=null;
 function openWs(){
   // Replace any existing socket, but flag the close as intentional so its
@@ -1047,6 +1057,9 @@ function openWs(){
   sock.onmessage = (ev)=>{ let m; try{m=JSON.parse(ev.data);}catch{return;}
     if(m.type==='agent.state'){ lastServerState=m.state; applyState(m.state, m); }
     else if(m.type==='lead.context'){
+      // Bridge is happening — open the speaker NOW (this push can beat the
+      // agent.state push by a beat; never clip the seller's "hello").
+      $('remoteAudio').muted=false;
       // Server pushes the full lead profile at bridge time — render instantly
       // instead of waiting for the loadContext HTTP round trip (which still
       // runs on ON_CALL and fills in call history).
@@ -1081,6 +1094,9 @@ function openWs(){
     if(sock!==ws) return;              // a newer socket already took over
     log('ws closed code='+(ev&&ev.code)+' reason='+((ev&&ev.reason)||'(none)'));
     if(TOKEN&&USER&&(USER.role==='agent'||USER.role==='closer')){
+      // Fail open: with the socket down we can't know when a call bridges, so
+      // unmute — a moment of idle hiss beats a silent live seller.
+      $('remoteAudio').muted=false;
       $('reconnBanner').classList.remove('hidden');
       if(wsReconnTimer) clearTimeout(wsReconnTimer);
       wsReconnTimer=setTimeout(openWs, 2500);
@@ -1101,6 +1117,7 @@ const STATE_UI = {
 function applyState(s, snap){
   const prev=serverState; serverState=s;
   document.body.setAttribute('data-agstate', s);   // drives the state-colored theme
+  syncRemoteMute();
   if(s!=='OFFLINE'){ const kb=$('kickBanner'); if(kb) kb.classList.add('hidden'); }
   const u=STATE_UI[s]||{dot:'faint',pulse:false,txt:'—'};
   const dotHtml=`<span class="dot dot--${u.dot}${u.pulse?' dot--pulse':''}"></span>`;
