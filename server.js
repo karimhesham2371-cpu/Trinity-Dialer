@@ -1337,7 +1337,15 @@ app.post('/api/login', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/me', auth, (req, res) => res.json({ user: req.user }));
+// Fresh identity: role + permissions come from the DB (not the JWT snapshot),
+// so a support console picks up newly-granted access without re-login.
+app.get('/api/me', auth, async (req, res) => {
+  try {
+    const [u] = await sbSelect('agents', `id=eq.${req.user.id}&select=id,name,email,role,permissions,active`);
+    if (!u || u.active === false) return res.status(401).json({ error: 'account disabled' });
+    res.json({ id: u.id, name: u.name, email: u.email, role: u.role, permissions: normPerms(u.permissions) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
@@ -3615,16 +3623,6 @@ app.post('/api/agent/raise-hand', auth, (req, res) => {
     state: st.state || 'OFFLINE', at: Date.now() });
   audit(req.user, 'RAISE_HAND', { target_type: 'agent', target_id: req.user.id, meta: { state: st.state || 'OFFLINE' } });
   res.json({ ok: true });
-});
-
-// Fresh identity for the logged-in user — role + permissions straight from the
-// DB, so a support console can pick up newly-granted access without re-login.
-app.get('/api/me', auth, async (req, res) => {
-  try {
-    const [u] = await sbSelect('agents', `id=eq.${req.user.id}&select=id,name,email,role,permissions,active`);
-    if (!u || u.active === false) return res.status(401).json({ error: 'account disabled' });
-    res.json({ id: u.id, name: u.name, email: u.email, role: u.role, permissions: normPerms(u.permissions) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Team chat: one floor-wide room, everyone can post and read ───────────────
