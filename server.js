@@ -3617,6 +3617,16 @@ app.post('/api/agent/raise-hand', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// Fresh identity for the logged-in user — role + permissions straight from the
+// DB, so a support console can pick up newly-granted access without re-login.
+app.get('/api/me', auth, async (req, res) => {
+  try {
+    const [u] = await sbSelect('agents', `id=eq.${req.user.id}&select=id,name,email,role,permissions,active`);
+    if (!u || u.active === false) return res.status(401).json({ error: 'account disabled' });
+    res.json({ id: u.id, name: u.name, email: u.email, role: u.role, permissions: normPerms(u.permissions) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Team chat: one floor-wide room, everyone can post and read ───────────────
 app.get('/api/chat', auth, (req, res) => {
   const after = +req.query.after || 0;

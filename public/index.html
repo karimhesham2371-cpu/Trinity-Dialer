@@ -2212,7 +2212,22 @@ document.addEventListener('keydown', e=>{
 });
 
 // ═══════════ ADMIN ═══════════
+// Pull fresh role+permissions from the server so an admin's permission edits
+// reach a logged-in support console without a re-login. Runs on admin-view load
+// and every 60s after; re-applies nav access when anything changed.
+let meRefreshT=null;
+async function refreshMe(){
+  try{
+    const me=await apiJson('/api/me');
+    const changed=JSON.stringify(me.permissions)!==JSON.stringify(USER.permissions)||me.role!==USER.role;
+    USER={...USER,...me};
+    localStorage.setItem('trinity_user',JSON.stringify(USER));
+    if(changed){ applyNavAccess(); toast('Your access was updated','ok'); }
+  }catch(e){ /* transient */ }
+}
 async function loadAdmin(){
+  await refreshMe();
+  if(!meRefreshT) meRefreshT=setInterval(()=>{ if(TOKEN&&USER&&$('viewAdmin')&&!$('viewAdmin').classList.contains('hidden')) refreshMe(); },60000);
   applyNavAccess();
   if(USER && USER.role==='admin'){ await loadUsers(); adminTab('console'); return; }
   // Support: land on the first report area they're allowed to see; analytics,
