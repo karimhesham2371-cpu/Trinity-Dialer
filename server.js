@@ -3117,14 +3117,16 @@ app.get('/api/admin/floor/agent-stats', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Office map: supervisor changes an agent's aux (Ready/Break) from their seat
-// panel — same rules as the agent's own aux switch: never during a live call;
-// forcing Break mid-dial cancels the in-flight legs and requeues their leads.
+// Office map: supervisor changes an agent's aux from their seat panel — same
+// rules as the agent's own aux switch: never during a live call; forcing Break
+// or Meeting mid-dial cancels the in-flight legs and requeues their leads.
+// MEETING is supervisor-only: agents can't self-select it (their own aux menu
+// stays Ready/Break) but can leave it by pressing Ready.
 app.post('/api/admin/floor/aux', auth, adminOnly, async (req, res) => {
   const { agent_id } = req.body || {};
   const want = String((req.body && req.body.state) || '').toUpperCase();
-  if (!agent_id || !['AVAILABLE', 'BREAK'].includes(want))
-    return res.status(400).json({ error: 'agent_id and state (AVAILABLE|BREAK) required' });
+  if (!agent_id || !['AVAILABLE', 'BREAK', 'MEETING'].includes(want))
+    return res.status(400).json({ error: 'agent_id and state (AVAILABLE|BREAK|MEETING) required' });
   const st = rt[agent_id];
   if (!st || !st.conferenceId) return res.status(409).json({ error: 'agent softphone not connected' });
   if (st.state === 'ON_CALL') return res.status(409).json({ error: 'agent is on a live call' });
@@ -3738,7 +3740,7 @@ app.get('/api/agent/status', auth, (req, res) => {
 
 // Agent-facing productivity: logged-in / break / wrap durations + calls handled,
 // for two windows — today (local midnight) and this month (resets on the 1st).
-const PROD_LOGGED = new Set(['CONNECTING', 'AVAILABLE', 'CLAIMING', 'DIALING', 'ON_CALL', 'WRAP_UP', 'BREAK']);
+const PROD_LOGGED = new Set(['CONNECTING', 'AVAILABLE', 'CLAIMING', 'DIALING', 'ON_CALL', 'WRAP_UP', 'BREAK', 'MEETING']);
 async function productivityWindow(agentId, fromMs, toMs) {
   const fromIso = new Date(fromMs).toISOString(), toIso = new Date(toMs).toISOString();
   const [spans, calls] = await Promise.all([
@@ -3752,7 +3754,7 @@ async function productivityWindow(agentId, fromMs, toMs) {
       `agent_id=eq.${agentId}&bridged_at=not.is.null&created_at=gte.${encodeURIComponent(fromIso)}` +
       `&created_at=lte.${encodeURIComponent(toIso)}&select=id&limit=100000`),
   ]);
-  const out = { logged_in: 0, break: 0, wrap: 0, wait: 0, calls: (calls || []).length };
+  const out = { logged_in: 0, break: 0, wrap: 0, wait: 0, meeting: 0, calls: (calls || []).length };
   for (const s of spans || []) {
     const start = new Date(s.started_at).getTime();
     const end = s.ended_at ? new Date(s.ended_at).getTime() : Date.now();
@@ -3760,11 +3762,12 @@ async function productivityWindow(agentId, fromMs, toMs) {
     if (dur <= 0) continue;
     if (PROD_LOGGED.has(s.state)) out.logged_in += dur;
     if (s.state === 'BREAK') out.break += dur;
+    else if (s.state === 'MEETING') out.meeting += dur;
     else if (s.state === 'WRAP_UP') out.wrap += dur;
     // Waiting between calls: available + background dialing (agent hears nothing yet).
     else if (s.state === 'AVAILABLE' || s.state === 'DIALING' || s.state === 'CLAIMING') out.wait += dur;
   }
-  for (const k of ['logged_in', 'break', 'wrap', 'wait']) out[k] = Math.round(out[k]);
+  for (const k of ['logged_in', 'break', 'wrap', 'wait', 'meeting']) out[k] = Math.round(out[k]);
   return out;
 }
 app.get('/api/agent/productivity', auth, async (req, res) => {

@@ -456,6 +456,7 @@
   body[data-agstate="ON_CALL"]{--st:#34C77B;--st-tint:rgba(52,199,123,.15);--st-glow:rgba(52,199,123,.30)}
   body[data-agstate="WRAP_UP"]{--st:#E8A13D;--st-tint:rgba(232,161,61,.14);--st-glow:rgba(232,161,61,.26)}
   body[data-agstate="BREAK"]{--st:#E07A45;--st-tint:rgba(224,122,69,.13);--st-glow:rgba(224,122,69,.22)}
+  body[data-agstate="MEETING"]{--st:#A371F7;--st-tint:rgba(163,113,247,.13);--st-glow:rgba(163,113,247,.22)}
 
   /* Ambient wash: the page itself breathes the state color from the top */
   body[data-agstate="ON_CALL"]{background:
@@ -471,6 +472,9 @@
   body[data-agstate="BREAK"]{background:
       radial-gradient(1200px 600px at 50% -12%, rgba(224,122,69,.10), transparent 62%),
       linear-gradient(180deg,#100906,#06080F 70%)}
+  body[data-agstate="MEETING"]{background:
+      radial-gradient(1200px 600px at 50% -12%, rgba(163,113,247,.10), transparent 62%),
+      linear-gradient(180deg,#0C0812,#06080F 70%)}
 
   /* Appbar: state-colored hairline across the very top of the console */
   body[data-agstate] .appbar{box-shadow:inset 0 2px 0 var(--st)}
@@ -494,8 +498,8 @@
   /* State-tinted chrome details */
   body[data-agstate] #agState{box-shadow:0 0 14px var(--st-glow)}
   body[data-agstate="ON_CALL"] .ctrlBtn:not(:disabled){border-color:color-mix(in srgb, var(--st) 30%, transparent)}
-  body[data-agstate="BREAK"] .agentGrid{opacity:.88;filter:saturate(.85);transition:opacity .5s,filter .5s}
-  body:not([data-agstate="BREAK"]) .agentGrid{opacity:1;filter:none;transition:opacity .5s,filter .5s}
+  body:is([data-agstate="BREAK"],[data-agstate="MEETING"]) .agentGrid{opacity:.88;filter:saturate(.85);transition:opacity .5s,filter .5s}
+  body:not([data-agstate="BREAK"]):not([data-agstate="MEETING"]) .agentGrid{opacity:1;filter:none;transition:opacity .5s,filter .5s}
 
   @media(prefers-reduced-motion:reduce){
     body[data-agstate] .callBanner{animation:none!important}
@@ -1147,6 +1151,7 @@ const STATE_UI = {
   ON_CALL:   {dot:'ok',    pulse:true,  txt:'On call'},
   WRAP_UP:   {dot:'warn',  pulse:false, txt:'Wrap-up'},
   BREAK:     {dot:'warn',  pulse:false, txt:'Break'},
+  MEETING:   {dot:'info',  pulse:false, txt:'Meeting'},
 };
 function applyState(s, snap){
   const prev=serverState; serverState=s;
@@ -1769,6 +1774,7 @@ async function loadProductivity(quiet){
   const grp=(title,sub,d)=>`<div class="prodGroup"><h3>${title}</h3>${sub?`<p class="sub">${sub}</p>`:''}
     <div class="prodStat"><span class="pl">Hours logged in</span><span class="pv">${prodDur(d.logged_in)}</span></div>
     <div class="prodStat"><span class="pl">Break duration</span><span class="pv">${prodDur(d.break)}</span></div>
+    <div class="prodStat"><span class="pl">Meeting duration</span><span class="pv">${prodDur(d.meeting)}</span></div>
     <div class="prodStat"><span class="pl">Wrap-up duration</span><span class="pv">${prodDur(d.wrap)}</span></div>
     <div class="prodStat"><span class="pl">Wait duration</span><span class="pv">${prodDur(d.wait)}</span></div>
     <div class="prodStat"><span class="pl">Avg wait between calls</span><span class="pv">${prodDur(d.calls?(d.wait||0)/d.calls:0)}</span></div>
@@ -2153,6 +2159,7 @@ function renderAuxBtn(s){
   if(s==='ON_CALL'){ b.textContent='On call'; b.className='btn btn-sm'; return; }
   if(s==='WRAP_UP'){ b.textContent='Wrap up '+fmtMS(auxRemainMs()); b.className='btn btn-sm btn-warn'; return; }
   if(s==='BREAK'){ b.textContent='Break '+fmtMS(Math.max(0,Date.now()-(breakSince||Date.now()))); b.className='btn btn-sm btn-warn'; return; }
+  if(s==='MEETING'){ b.textContent='In meeting'; b.className='btn btn-sm'; return; }   // supervisor-set; agent leaves via Ready
   // Waiting between calls (AVAILABLE, or background DIALING/CLAIMING) — show a
   // live count-up of how long the agent has been waiting for the next call.
   const waitTxt='<span style="display:block;font-size:10px;line-height:1.1;opacity:.65;font-variant-numeric:tabular-nums">'+fmtMS(Math.max(0,Date.now()-(waitSince||Date.now())))+'</span>';
@@ -2219,7 +2226,7 @@ async function loadUsers(){
   const tb=$('usersTbl'); if(!tb) return;   // console no longer renders an agents table
   const body=tb.querySelector('tbody'); if(!body) return; body.innerHTML='';
   j.users.forEach(u=>{ const tr=document.createElement('tr');
-    const st=u.state||'OFFLINE'; const dotc={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',WRAP_UP:'warn',BREAK:'warn'}[st]||'faint';
+    const st=u.state||'OFFLINE'; const dotc={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',WRAP_UP:'warn',BREAK:'warn',MEETING:'info'}[st]||'faint';
     tr.innerHTML=`<td>${esc(u.name)}</td><td class="dim">${esc(u.email||'')}</td><td>${u.role}</td><td><span class="pill pill--${dotc}"><span class="dot dot--${dotc}"></span> ${st}</span></td>`;
     body.appendChild(tr); });
 }
@@ -2451,6 +2458,7 @@ function dialerGuideHtml(role){
     '<li><b style="color:var(--ok)">Green</b> — On a live call. The whole console shifts green.</li>'+
     '<li><b style="color:var(--warn)">Amber</b> — Wrap-up: a short cooldown after each call (3s, or 3 min after a Sale/Appt so you can finish paperwork).</li>'+
     '<li><b style="color:#E07A45">Ember</b> — Break: counts up until YOU press Ready. It never flips back on its own.</li>'+
+    '<li><b style="color:#A371F7">Purple</b> — Meeting: set by a supervisor from the office map (you can\'t pick it yourself). Press Ready when the meeting ends.</li>'+
     '</ul>Break is allowed even while Waiting — pending dials are cancelled and their leads requeued.')+
 
   sec('Taking a call: lead card, script, dispositions',['all','Everyone'],
@@ -2526,7 +2534,7 @@ function dialerGuideHtml(role){
     '<li><b>Call logs</b> — every call with recording playback, duration/result/agent filters, CSV export, and <b>QA</b>: star-score, flag and annotate recordings.</li>'+
     '<li><b>Agent report</b> — logged-in / talk / wrap / break time per agent.</li>'+
     '<li><b>Research</b> — look up every call ever made to one phone number.</li>'+
-    '<li><b>Office map</b> — live floor: drag agents onto desks, see state + how long they\'ve been in it. Click a seat for the agent panel: their <b>day stats</b> (logged-in at, hours, break, wrap-up, calls handled, sales), <b>remote aux control</b> (set them Ready or on Break — locked during live calls), <b>listen in</b> on live calls, and <b>kick</b> a stuck agent. Plus the <b>📣 message bar</b> (next section).</li>'+
+    '<li><b>Office map</b> — live floor: drag agents onto desks, see state + how long they\'ve been in it. Click a seat for the agent panel: their <b>day stats</b> (logged-in at, hours, break, meeting, wrap-up, calls handled, sales), <b>remote aux control</b> (set them Ready, on Break, or pull them into a <b>Meeting</b> — a supervisor-only aux agents can\'t self-select; locked during live calls), <b>listen in</b> on live calls, and <b>kick</b> a stuck agent. Plus the <b>📣 message bar</b> (next section).</li>'+
     '<li><b>Wallboard</b> — TV dashboard: dials, contact rate, sales, per-agent status.</li>'+
     '<li><b>Attendance</b> — first clock-in / last clock-out / hours per agent per day, with late flags against your shift start time.</li>'+
     '</ul>')+
@@ -2676,7 +2684,7 @@ function renderUmUsers(){
   if(!umUsers.length){ tb.innerHTML='<tr><td colspan="6" class="dim">No users yet.</td></tr>'; return; }
   umUsers.forEach(u=>{
     const st=u.state||'OFFLINE';
-    const dotc={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',WRAP_UP:'warn',BREAK:'warn'}[st]||'faint';
+    const dotc={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',WRAP_UP:'warn',BREAK:'warn',MEETING:'info'}[st]||'faint';
     const active=u.active!==false;
     const self=USER&&u.id===USER.id;
     const tr=document.createElement('tr');
@@ -2764,7 +2772,7 @@ function fmtTime(iso){ if(!iso) return '—'; const d=new Date(iso); const diff=
   return d.toLocaleString([], {hour12:false,month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); }
 function dstr(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
 function csvq(s){ s=String(s==null?'':s); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }
-function stateDot(s){ return {AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',CLAIMING:'info',WRAP_UP:'warn',BREAK:'warn'}[s]||'faint'; }
+function stateDot(s){ return {AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',CLAIMING:'info',WRAP_UP:'warn',BREAK:'warn',MEETING:'info'}[s]||'faint'; }
 
 // ── 1) Audit logs ──
 function initAudit(){
@@ -3123,7 +3131,7 @@ async function renderMap(){
   $('fmText').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); $('fmSend').click(); } });
   drawFloor(); openAdminWs(); ensureFloorTimer();
 }
-function stateLabel(s){ return ({AVAILABLE:'Waiting',DIALING:'Waiting',CLAIMING:'Waiting',ON_CALL:'On call',WRAP_UP:'Wrap up',BREAK:'Break',CONNECTING:'Connecting',OFFLINE:'Offline'})[s]||s; }
+function stateLabel(s){ return ({AVAILABLE:'Waiting',DIALING:'Waiting',CLAIMING:'Waiting',ON_CALL:'On call',WRAP_UP:'Wrap up',BREAK:'Break',MEETING:'Meeting',CONNECTING:'Connecting',OFFLINE:'Offline'})[s]||s; }
 function seatTimerTxt(a){ if(!a||!a.stateSince||a.state==='OFFLINE') return ''; return fmtMS(Math.max(0,Date.now()-a.stateSince)); }
 function seatEl(a){ const dc=stateDot(a.state); const el=document.createElement('div');
   el.className='seat seat--'+dc; el.dataset.aid=a.id;
@@ -3201,6 +3209,7 @@ async function openAgentPanel(agentId){
         <div style="display:flex;gap:8px">
           <button id="agpReady" class="btn btn-sm" style="flex:1" ${(!connected||onCall||state==='AVAILABLE')?'disabled':''}>● Ready</button>
           <button id="agpBreak" class="btn btn-sm btn-warn" style="flex:1" ${(!connected||onCall||state==='BREAK')?'disabled':''}>Break</button>
+          <button id="agpMeet" class="btn btn-sm" style="flex:1;color:var(--info)" ${(!connected||onCall||state==='MEETING')?'disabled':''}>Meeting</button>
         </div>
         <p class="dim" style="font-size:11px;margin:6px 0 0">${onCall?'Locked while they are on a live call.':connected?'Switches the agent\'s aux remotely — their console updates instantly.':'Agent is not connected.'}</p>
       </div>
@@ -3217,6 +3226,7 @@ async function openAgentPanel(agentId){
   if($('agpKick')) $('agpKick').onclick=()=>kickAgent(agentId);
   if($('agpReady')) $('agpReady').onclick=()=>forceAux(agentId,'AVAILABLE');
   if($('agpBreak')) $('agpBreak').onclick=()=>forceAux(agentId,'BREAK');
+  if($('agpMeet')) $('agpMeet').onclick=()=>forceAux(agentId,'MEETING');
   loadAgentPanelStats(agentId);
 }
 // ReadyMode-style per-agent day stats inside the seat panel.
@@ -3231,6 +3241,7 @@ async function loadAgentPanelStats(agentId){
     row('Logged in at', j.first_in?new Date(j.first_in).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false}):'—')+
     row('Hours logged', prodDur(j.logged_in))+
     row('Break', prodDur(j.break))+
+    row('Meeting', prodDur(j.meeting))+
     row('Wrap-up', prodDur(j.wrap))+
     row('Waiting', prodDur(j.wait))+
     row('Calls handled', j.calls||0)+
@@ -3240,7 +3251,7 @@ async function loadAgentPanelStats(agentId){
 async function forceAux(agentId, state){
   try{
     await apiJson('/api/admin/floor/aux','POST',{agent_id:agentId, state});
-    toast(state==='BREAK'?'Agent placed on Break':'Agent set to Ready','ok');
+    toast(state==='BREAK'?'Agent placed on Break':state==='MEETING'?'Agent pulled into Meeting':'Agent set to Ready','ok');
     const a=floorAgents.find(x=>x.id===agentId); if(a){ a.state=state; a.stateSince=Date.now(); updateSeatState(agentId,state); }
     openAgentPanel(agentId);
   }catch(e){ toast(e.message,'err'); }
@@ -3292,7 +3303,7 @@ function stopMonitor(){
 // ═══════════ ADMIN: WALLBOARD (live team dashboard) ═══════════
 let wbPollT=null;
 function stopWallboard(){ if(wbPollT){ clearInterval(wbPollT); wbPollT=null; } }
-const WB_STATEC={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',CLAIMING:'info',CONNECTING:'info',WRAP_UP:'warn',BREAK:'warn',OFFLINE:'faint'};
+const WB_STATEC={AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',CLAIMING:'info',CONNECTING:'info',WRAP_UP:'warn',BREAK:'warn',MEETING:'info',OFFLINE:'faint'};
 function wbDur(s){ s=Math.round(s||0); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
   return h?`${h}h ${m}m`:(m?`${m}m ${ss}s`:`${ss}s`); }
 async function initWallboard(){
