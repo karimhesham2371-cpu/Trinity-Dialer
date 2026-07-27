@@ -3032,6 +3032,57 @@ app.get('/api/admin/reports/attendance', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Office map: one agent's productivity today (panel shown on seat click) —
+// logged-in-at, hours logged, break / wrap durations, calls handled.
+app.get('/api/admin/floor/agent-stats', auth, adminOnly, async (req, res) => {
+  const id = req.query.agent_id;
+  if (!id) return res.status(400).json({ error: 'agent_id required' });
+  try {
+    const d = new Date();
+    const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const dayIso = new Date(dayStart).toISOString();
+    const [today, first, disps] = await Promise.all([
+      productivityWindow(id, dayStart, Date.now()),
+      sbSelect('agent_state_events',
+        `agent_id=eq.${id}&started_at=gte.${dayIso}&state=neq.OFFLINE` +
+        '&select=started_at&order=started_at.asc&limit=1').catch(() => []),
+      sbSelect('dispositions',
+        `agent_id=eq.${id}&created_at=gte.${dayIso}&select=code&limit=10000`).catch(() => []),
+    ]);
+    const sales = (disps || []).filter(d => LONG_WRAP_RE.test(d.code || '')).length;
+    res.json({ ...today, sales, first_in: (first && first[0] && first[0].started_at) || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Office map: supervisor changes an agent's aux (Ready/Break) from their seat
+// panel — same rules as the agent's own aux switch: never during a live call;
+// forcing Break mid-dial cancels the in-flight legs and requeues their leads.
+app.post('/api/admin/floor/aux', auth, adminOnly, async (req, res) => {
+  const { agent_id } = req.body || {};
+  const want = String((req.body && req.body.state) || '').toUpperCase();
+  if (!agent_id || !['AVAILABLE', 'BREAK'].includes(want))
+    return res.status(400).json({ error: 'agent_id and state (AVAILABLE|BREAK) required' });
+  const st = rt[agent_id];
+  if (!st || !st.conferenceId) return res.status(409).json({ error: 'agent softphone not connected' });
+  if (st.state === 'ON_CALL') return res.status(409).json({ error: 'agent is on a live call' });
+  if (['DIALING', 'CLAIMING'].includes(st.state)) {
+    if (want === 'AVAILABLE') return res.json({ ok: true, state: st.state });
+    if (st.pending) {
+      for (const cc of Object.keys(st.pending)) {
+        const pi = st.pending[cc];
+        telnyx('POST', `/calls/${cc}/actions/hangup`, {}).catch(() => {});
+        if (pi && pi.leadId && !pi.manual) sbUpdate('leads', `id=eq.${pi.leadId}`,
+          { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 5 * 60e3).toISOString() }).catch(() => {});
+      }
+      st.pending = {};
+    }
+  }
+  clearWrapTimer(st);
+  await setAgentState(agent_id, want);
+  audit(req.user, 'FORCE_AUX', { target_type: 'agent', target_id: agent_id, meta: { state: want } });
+  res.json({ ok: true, state: want });
+});
+
 // 5) Office Map — seats + live status. GET floor, POST a seat position.
 app.get('/api/admin/floor', auth, adminOnly, async (_req, res) => {
   try {

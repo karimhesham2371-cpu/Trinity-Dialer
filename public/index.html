@@ -2526,7 +2526,7 @@ function dialerGuideHtml(role){
     '<li><b>Call logs</b> — every call with recording playback, duration/result/agent filters, CSV export, and <b>QA</b>: star-score, flag and annotate recordings.</li>'+
     '<li><b>Agent report</b> — logged-in / talk / wrap / break time per agent.</li>'+
     '<li><b>Research</b> — look up every call ever made to one phone number.</li>'+
-    '<li><b>Office map</b> — live floor: drag agents onto desks, see state + how long they\'ve been in it, <b>listen in</b> on live calls, <b>kick</b> a stuck agent, and the <b>📣 message bar</b> (next section).</li>'+
+    '<li><b>Office map</b> — live floor: drag agents onto desks, see state + how long they\'ve been in it. Click a seat for the agent panel: their <b>day stats</b> (logged-in at, hours, break, wrap-up, calls handled, sales), <b>remote aux control</b> (set them Ready or on Break — locked during live calls), <b>listen in</b> on live calls, and <b>kick</b> a stuck agent. Plus the <b>📣 message bar</b> (next section).</li>'+
     '<li><b>Wallboard</b> — TV dashboard: dials, contact rate, sales, per-agent status.</li>'+
     '<li><b>Attendance</b> — first clock-in / last clock-out / hours per agent per day, with late flags against your shift start time.</li>'+
     '</ul>')+
@@ -3187,23 +3187,63 @@ async function openAgentPanel(agentId){
   p.dataset.aid=agentId;
   const state=(a.state||'OFFLINE');
   const monitoring = monListen && monListen.agentId===agentId;
+  const connected = !['OFFLINE','CONNECTING'].includes(state);
+  const onCall = state==='ON_CALL';
   p.innerHTML=`
     <div class="agp-head">
       <div><div class="agp-name">${esc(a.name||'—')}</div>
-        <div class="agp-state"><span class="dot dot--${stateDot(state)}"></span> ${esc(state)}</div></div>
+        <div class="agp-state"><span class="dot dot--${stateDot(state)}"></span> ${esc(stateLabel(state))}</div></div>
       <button class="agp-x" onclick="closeAgentPanel()">✕</button>
     </div>
-    <div class="agp-body">
-      ${can('floor.monitor')?`<button id="agpMon" class="btn ${monitoring?'btn-danger':'btn-primary'}" style="width:100%">${monitoring?'■ Stop monitoring':'▶ Live monitor'}</button>
+    <div class="agp-body" style="overflow-y:auto">
+      <div class="prodGroup"><h3>Today</h3><div id="agpStats" class="dim" style="font-size:12px">Loading…</div></div>
+      <div class="prodGroup"><h3>Agent mode</h3>
+        <div style="display:flex;gap:8px">
+          <button id="agpReady" class="btn btn-sm" style="flex:1" ${(!connected||onCall||state==='AVAILABLE')?'disabled':''}>● Ready</button>
+          <button id="agpBreak" class="btn btn-sm btn-warn" style="flex:1" ${(!connected||onCall||state==='BREAK')?'disabled':''}>Break</button>
+        </div>
+        <p class="dim" style="font-size:11px;margin:6px 0 0">${onCall?'Locked while they are on a live call.':connected?'Switches the agent\'s aux remotely — their console updates instantly.':'Agent is not connected.'}</p>
+      </div>
+      ${can('floor.monitor')?`<div style="height:1px;background:var(--border);margin:14px 0"></div>
+        <button id="agpMon" class="btn ${monitoring?'btn-danger':'btn-primary'}" style="width:100%">${monitoring?'■ Stop monitoring':'▶ Live monitor'}</button>
         <p class="dim" style="font-size:11px;margin:6px 0 0">Listen in on the live call. The agent and contact are not notified.</p>
         <div id="agpMonMsg" class="dim" style="font-size:12px;margin-top:6px"></div>`:''}
-      ${(can('floor.kick')&&can('floor.monitor'))?'<div style="height:1px;background:var(--border);margin:14px 0"></div>':''}
-      ${can('floor.kick')?`<button id="agpKick" class="btn btn-danger" style="width:100%">Kick off dialer</button>
+      ${can('floor.kick')?`<div style="height:1px;background:var(--border);margin:14px 0"></div>
+        <button id="agpKick" class="btn btn-danger" style="width:100%">Kick off dialer</button>
         <p class="dim" style="font-size:11px;margin:6px 0 0">Ends any live call and logs them out. They can rejoin by going Available.</p>`:''}
     </div>`;
   p.classList.add('open');
   if($('agpMon')) $('agpMon').onclick=()=>toggleMonitor(agentId);
   if($('agpKick')) $('agpKick').onclick=()=>kickAgent(agentId);
+  if($('agpReady')) $('agpReady').onclick=()=>forceAux(agentId,'AVAILABLE');
+  if($('agpBreak')) $('agpBreak').onclick=()=>forceAux(agentId,'BREAK');
+  loadAgentPanelStats(agentId);
+}
+// ReadyMode-style per-agent day stats inside the seat panel.
+async function loadAgentPanelStats(agentId){
+  const el=$('agpStats'); if(!el) return;
+  let j; try{ j=await apiJson('/api/admin/floor/agent-stats?agent_id='+encodeURIComponent(agentId)); }
+  catch(e){ el.textContent=e.message; return; }
+  if(!$('agPanel')||$('agPanel').dataset.aid!==agentId) return;   // panel moved on
+  const row=(k,v)=>`<div class="prodStat" style="padding:6px 0"><span class="pl">${k}</span><span class="pv" style="font-size:13.5px">${v}</span></div>`;
+  el.className=''; el.style.fontSize='';
+  el.innerHTML=
+    row('Logged in at', j.first_in?new Date(j.first_in).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false}):'—')+
+    row('Hours logged', prodDur(j.logged_in))+
+    row('Break', prodDur(j.break))+
+    row('Wrap-up', prodDur(j.wrap))+
+    row('Waiting', prodDur(j.wait))+
+    row('Calls handled', j.calls||0)+
+    row('Sales / appts', j.sales||0);
+}
+// Supervisor flips an agent's aux from the seat panel.
+async function forceAux(agentId, state){
+  try{
+    await apiJson('/api/admin/floor/aux','POST',{agent_id:agentId, state});
+    toast(state==='BREAK'?'Agent placed on Break':'Agent set to Ready','ok');
+    const a=floorAgents.find(x=>x.id===agentId); if(a){ a.state=state; a.stateSince=Date.now(); updateSeatState(agentId,state); }
+    openAgentPanel(agentId);
+  }catch(e){ toast(e.message,'err'); }
 }
 function closeAgentPanel(){ const p=$('agPanel'); if(p){ p.classList.remove('open'); } }
 async function kickAgent(agentId){
