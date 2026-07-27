@@ -253,6 +253,28 @@ function plStat(pid) {
   const k = pid || '__direct__';
   return PLAYLIST_STATS[k] || (PLAYLIST_STATS[k] = { calls: 0, ans: 0, md: 0, drop: 0 });
 }
+// Campaign → playlist resolver so the predictive engine's counters land on the
+// PLAYLIST row (where CPA is adjusted), not a synthetic campaign row. A campaign
+// in several active playlists attributes to the highest-priority one; a campaign
+// in no playlist falls back to the legacy 'c:<id>' key. Refreshed every 30s.
+let CAMP_PLAYLIST = {};
+async function refreshCampPlaylistMap() {
+  if (!SB_HOST) return;
+  try {
+    const [pls, pcs] = await Promise.all([
+      sbSelect('playlists', 'active=eq.true&select=id,priority'),
+      sbSelect('playlist_campaigns', 'select=playlist_id,campaign_id'),
+    ]);
+    const prio = new Map((pls || []).map(p => [p.id, p.priority != null ? p.priority : 0]));
+    const m = {};
+    for (const { playlist_id, campaign_id } of pcs || []) {
+      if (!prio.has(playlist_id)) continue;
+      if (!(campaign_id in m) || prio.get(playlist_id) < prio.get(m[campaign_id])) m[campaign_id] = playlist_id;
+    }
+    CAMP_PLAYLIST = m;
+  } catch (e) { console.error('[campPlaylist]', e.message); }
+}
+const plKeyForCampaign = (cid) => CAMP_PLAYLIST[cid] || ('c:' + cid);
 // Persist the wallboard counters (app_settings key 'playlist_stats') so a Render
 // redeploy doesn't zero the Live stats mid-shift. Saved every 15s when changed.
 let _plStatsSaved = '';
@@ -2857,12 +2879,26 @@ app.get('/api/admin/reports/wallboard', auth, adminOnly, async (_req, res) => {
 // reset; Dial is derived live from rt[*].pending.
 app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
   try {
-    const [playlists, camps] = await Promise.all([
+    const [playlists, camps, pcs, pas] = await Promise.all([
       sbSelect('playlists', 'select=id,name,priority,lines_per_agent,active').catch(() => []),
       sbSelect('campaigns', 'select=*').catch(() => []),
+      sbSelect('playlist_campaigns', 'select=playlist_id,campaign_id').catch(() => []),
+      sbSelect('playlist_agents', 'select=playlist_id,agent_id').catch(() => []),
     ]);
     const byId = Object.fromEntries((playlists || []).map(p => [p.id, p]));
     const campById = Object.fromEntries((camps || []).map(c => [c.id, c]));
+    // Per-playlist liveness: any RUNNING campaign attached + any assigned agent
+    // whose softphone is connected right now. A live playlist ALWAYS gets a row,
+    // zeros and all — it disappears when it's paused or its agents sign off.
+    const runningByPl = {}, onlineByPl = {};
+    for (const { playlist_id, campaign_id } of pcs || []) {
+      const c = campById[campaign_id];
+      if (c && c.status === 'RUNNING') runningByPl[playlist_id] = (runningByPl[playlist_id] || 0) + 1;
+    }
+    for (const { playlist_id, agent_id } of pas || []) {
+      const st = rt[agent_id];
+      if (st && st.conferenceId && st.state !== 'OFFLINE') onlineByPl[playlist_id] = (onlineByPl[playlist_id] || 0) + 1;
+    }
     // Live in-flight dials, grouped by the playlist that launched each leg.
     const liveDial = {};
     for (const id in rt) {
@@ -2872,14 +2908,18 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
         liveDial[k] = (liveDial[k] || 0) + 1;
       }
     }
-    // Predictive-engine legs still ringing/being classified count as live dials too.
+    // Predictive-engine legs still ringing/being classified count as live dials
+    // too — attributed to the campaign's playlist, same as their counters.
     for (const cc in dialerRt) {
       const i = dialerRt[cc];
-      if (i.phase === 'DIALING' || i.phase === 'DETECTING')
-        liveDial['c:' + i.campaignId] = (liveDial['c:' + i.campaignId] || 0) + 1;
+      if (i.phase === 'DIALING' || i.phase === 'DETECTING') {
+        const k = plKeyForCampaign(i.campaignId);
+        liveDial[k] = (liveDial[k] || 0) + 1;
+      }
     }
     const cpaOf = (pl) => { const n = pl && pl.lines_per_agent; return (n >= 1 && n <= 5) ? n : DIALER.lines_per_agent; };
-    const keys = new Set([...Object.keys(PLAYLIST_STATS), ...Object.keys(liveDial)]);
+    const liveKeys = (playlists || []).filter(p => p.active !== false && runningByPl[p.id] && onlineByPl[p.id]).map(p => p.id);
+    const keys = new Set([...Object.keys(PLAYLIST_STATS), ...Object.keys(liveDial), ...liveKeys]);
     const rows = [];
     for (const k of keys) {
       const s = PLAYLIST_STATS[k] || { calls: 0, ans: 0, md: 0, drop: 0 };
@@ -2906,6 +2946,8 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
         playlist_id: k === '__direct__' ? null : k,
         name: pl ? pl.name : (k === '__direct__' ? 'Direct (no playlist)' : '(deleted playlist)'),
         active: pl ? pl.active !== false : false,
+        live: !!(pl && pl.active !== false && runningByPl[k] && onlineByPl[k]),
+        agents_online: onlineByPl[k] || 0,
         cpa: cpaOf(pl), calls: s.calls, ans: s.ans, md: s.md, drop: s.drop,
         abd_pct: s.ans > 0 ? Math.round((s.drop / s.ans) * 1000) / 10 : 0,
         dial,
@@ -4532,7 +4574,7 @@ async function dialEngineLead(lead, acfg) {
   if (!ccid) return;
   dialerRt[ccid] = { ccid, campaignId: lead.campaign_id, leadId: lead.id, cid, phase: 'DIALING',
     amdMode: amdParam, from, to: lead.phone, at: Date.now(), answeredAt: null, reservedAgentId: null, lead };
-  plStat('c:' + lead.campaign_id).calls++;   // predictive lane rows keyed c:<campaignId>
+  plStat(plKeyForCampaign(lead.campaign_id)).calls++;   // engine dials land on the playlist row
   saveCall({ id: cid, lead_id: lead.id, campaign_id: lead.campaign_id, telnyx_call_control_id: ccid,
     from_number: from, to_number: lead.phone, direction: 'outbound' }, 'engine-open');
   saveCall({ telnyx_call_control_id: ccid, amd_mode: amdParam, call_phase: 'DIALING' }, 'engine-phase');
@@ -4589,7 +4631,7 @@ async function engineBridgeToAgent(agentId, ccid, info) {
     st.state = 'ON_CALL';
     pushLeadContext(agentId, info.lead || null);
     startCaptionsIfWanted(agentId, ccid);
-    plStat('c:' + info.campaignId).ans++;
+    plStat(plKeyForCampaign(info.campaignId)).ans++;
     await setAgentState(agentId, 'ON_CALL');
     info.phase = 'BRIDGED';
     delete dialerRt[ccid];   // ownership transferred to the agent lane
@@ -4963,7 +5005,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         noteAnswer(info.campaignId, treatAs === 'human');
 
         if (treatAs === 'machine') {
-          plStat('c:' + info.campaignId).md++;
+          plStat(plKeyForCampaign(info.campaignId)).md++;
           const wantVm = acfg && acfg.vmDrop && acfg.vmConsent && acfg.vmUrl;
           if (wantVm) { info.phase = 'WAIT_BEEP'; return; }   // hold for greeting.ended beep
           info.phase = 'MACHINE'; delete dialerRt[ccid];
@@ -4981,7 +5023,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
           // ABANDONED_HUMAN: no agent free. Play the FCC safe-harbor message
           // (company + callback, no solicitation), hang up, count the abandon.
           info.phase = 'ABANDONED'; delete dialerRt[ccid];
-          plStat('c:' + info.campaignId).drop++;
+          plStat(plKeyForCampaign(info.campaignId)).drop++;
           if (acfg && acfg.safeHarborUrl) {
             telnyx('POST', `/calls/${ccid}/actions/playback_start`, { audio_url: acfg.safeHarborUrl }).catch(() => {});
             setTimeout(() => { telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {}); }, 15000);
@@ -5671,6 +5713,8 @@ server.listen(PORT, async () => {
   await loadCallerLocks();
   await loadCoachCfg();
   await loadTeamChat();
+  await refreshCampPlaylistMap();
+  setInterval(refreshCampPlaylistMap, 30 * 1000);
   await loadCallPolicy();
   await loadRecycle();   // after call-policy: owns positive_dnc_days
   await loadAiConfig();

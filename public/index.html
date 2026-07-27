@@ -4288,17 +4288,17 @@ async function renderPlaylistStats(){
         <button class="btn" id="plsReset" style="flex:0 0 auto">Reset counters</button>
       </div>
     </div>
-    <p class="dim" style="font-size:13px;margin-top:6px"><b>CPA</b> lines/agent · <b>Calls</b> dialed · <b>Ans</b> answered by an agent · <b>MD</b> machine-detected · <b>Drop</b> answered with no free agent (abandoned) · <b>Abd%</b> = Drop ÷ Ans · <b>Dial</b> ringing now. Counters accumulate since the reset time; watch <b>Abd%</b> — if it climbs, lower the playlist CPA. Auto-refresh 3s.</p>
+    <p class="dim" style="font-size:13px;margin-top:6px"><b>CPA</b> lines/agent · <b>Calls</b> dialed · <b>Ans</b> answered by an agent · <b>MD</b> machine-detected · <b>Drop</b> answered with no free agent (abandoned) · <b>Abd%</b> = Drop ÷ Ans · <b>Dial</b> ringing now. Counters accumulate since the reset time; watch <b>Abd%</b> — if it climbs, lower the playlist CPA. Live playlists (green dot) appear the moment they have a running campaign and connected agents. Auto-refresh 1s.</p>
     <div id="plsMsg" class="dim mt3" style="font-size:12px"></div>
     <div class="tblwrap mt3"><div id="plsRoot"><p class="dim">Loading…</p></div></div></div>`;
   const abdColor=(p)=> p>=10?'var(--danger)':(p>=5?'var(--warn)':'var(--ok)');
   const render=(j)=>{
     const root=$('plsRoot'); if(!root) return;
     const rows=j.rows||[];
-    if(!rows.length){ root.innerHTML='<p class="dim">No calls dialed yet since the last reset. Start a running campaign with logged-in agents to see live numbers.</p>';
+    if(!rows.length){ root.innerHTML='<p class="dim">No playlist is live right now. A playlist appears here the moment it has a running campaign and connected agents — and stays until it\'s paused or the last agent signs off.</p>';
       if($('plsSince')) $('plsSince').textContent='since '+new Date(j.since).toLocaleTimeString([],{hour12:false}); return; }
     const body=rows.map(r=>`<tr>
-      <td>${esc(r.name)}${r.active?'':' <span class="dim" style="font-size:11px">(paused)</span>'}</td>
+      <td>${r.live?'<span class="dot dot--ok dot--pulse" style="margin-right:7px"></span>':''}${esc(r.name)}${r.active?'':' <span class="dim" style="font-size:11px">(paused)</span>'}${r.agents_online?` <span class="dim" style="font-size:11px">· ${r.agents_online} agent${r.agents_online>1?'s':''}</span>`:''}</td>
       <td style="text-align:right">${r.cpa}</td>
       <td style="text-align:right">${r.calls}</td>
       <td style="text-align:right">${r.ans}</td>
@@ -4335,7 +4335,7 @@ async function renderPlaylistStats(){
     catch(e){ $('plsMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
   await tick();
-  plStatsT=setInterval(tick,3000);
+  plStatsT=setInterval(tick,1000);
 }
 
 route();
