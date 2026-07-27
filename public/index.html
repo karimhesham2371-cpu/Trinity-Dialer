@@ -2752,11 +2752,27 @@ async function umEdit(u){
     <span class="lbl">Name</span><input id="ueName" class="field" value="${esc(u.name||'')}">
     <span class="lbl mt3">Email / username</span><input id="ueEmail" class="field" value="${esc(u.email||'')}">
     <span class="lbl mt3">Role</span><select id="ueRole" class="field">${roleOpts}</select>
-    <div id="uePermsWrap" class="mt3 hidden"><span class="lbl">Support access</span><div id="uePerms" class="permgrid"></div></div>`;
+    <div id="uePermsWrap" class="mt3 hidden"><span class="lbl">Support access</span><div id="uePerms" class="permgrid"></div>
+      <button id="uePermSave" class="btn btn-sm btn-primary mt2">Save permissions</button>
+      <span id="uePermMsg" class="dim" style="font-size:12px;margin-left:8px"></span></div>`;
   const close=showModal('Edit user', u.email||'', body, 'Save changes');
   renderPermChecks($('uePerms'), Array.isArray(u.permissions)?u.permissions:[]);
   const sync=()=>$('uePermsWrap').classList.toggle('hidden', $('ueRole').value!=='support');
   $('ueRole').addEventListener('change', sync); sync();
+  // Save just the permissions, without touching the rest of the form and
+  // without closing the dialog — the support console picks it up within 60s.
+  $('uePermSave').onclick=async()=>{
+    const perms=readPermChecks($('uePerms'));
+    if(!perms.length){ toast('Grant at least one access','err'); return; }
+    const b=$('uePermSave'); b.disabled=true; $('uePermMsg').textContent='Saving…';
+    try{
+      await apiJson('/api/admin/users/'+u.id,'PATCH',{role:'support',permissions:perms});
+      $('uePermMsg').innerHTML='<b style="color:var(--ok)">Saved ✓</b>';
+      toast('Permissions saved'); await loadUmUsers();
+      setTimeout(()=>{ if($('uePermMsg')) $('uePermMsg').textContent=''; },2500);
+    }catch(e){ $('uePermMsg').textContent=''; toast(e.message,'err'); }
+    finally{ b.disabled=false; }
+  };
   $('modalOk').onclick=async()=>{
     const role=$('ueRole').value;
     const patch={ name:$('ueName').value.trim(), email:$('ueEmail').value.trim(), role };
