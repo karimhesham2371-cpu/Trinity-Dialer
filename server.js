@@ -2657,34 +2657,41 @@ app.get('/api/admin/reports/agent', auth, adminOnly, async (req, res) => {
   const now = Date.now();
   const from = req.query.from ? new Date(req.query.from).getTime() : (now - 24 * 3600e3);
   const to   = req.query.to   ? new Date(req.query.to).getTime()   : now;
-  // Buckets that make up "logged in" time.
-  const LOGGED = new Set(['CONNECTING', 'AVAILABLE', 'CLAIMING', 'DIALING', 'ON_CALL', 'WRAP_UP', 'BREAK']);
   try {
-    // Any span overlapping the window: started before `to` AND (open OR ended after `from`).
-    const spans = await sbSelect('agent_state_events',
-      `started_at=lte.${encodeURIComponent(new Date(to).toISOString())}` +
-      `&or=(ended_at.is.null,ended_at.gte.${encodeURIComponent(new Date(from).toISOString())})` +
-      `&select=agent_id,state,started_at,ended_at&limit=100000`);
-    const names = await agentNameMap();
+    // Every calling-role user gets a row — zeros included — so the report is a
+    // complete sweep of the floor, not just whoever happened to log activity.
+    const [users, spans] = await Promise.all([
+      sbSelect('agents', 'role=in.(agent,closer)&active=eq.true&select=id,name,role&order=name.asc'),
+      // Any span overlapping the window: started before `to` AND (open OR ended after `from`).
+      sbSelect('agent_state_events',
+        `started_at=lte.${encodeURIComponent(new Date(to).toISOString())}` +
+        `&or=(ended_at.is.null,ended_at.gte.${encodeURIComponent(new Date(from).toISOString())})` +
+        `&select=agent_id,state,started_at,ended_at&limit=100000`),
+    ]);
     const acc = {};
-    for (const s of spans) {
+    const seed = (id, name, role) => acc[id] || (acc[id] = { agent_id: id, name: name || '—', role: role || 'agent',
+      logged_in: 0, talk: 0, wrap: 0, break: 0, meeting: 0, waiting: 0 });
+    for (const u of users || []) seed(u.id, u.name, u.role);
+    const names = await agentNameMap();
+    for (const s of spans || []) {
       const start = new Date(s.started_at).getTime();
       const end   = s.ended_at ? new Date(s.ended_at).getTime() : now;
       const dur   = Math.max(0, Math.min(end, to) - Math.max(start, from)) / 1000;
       if (dur <= 0) continue;
-      const a = acc[s.agent_id] || (acc[s.agent_id] = { agent_id: s.agent_id, name: names[s.agent_id] || '—',
-        logged_in: 0, dialing: 0, talk: 0, wrap: 0, break: 0, available: 0 });
-      if (LOGGED.has(s.state)) a.logged_in += dur;
-      if (s.state === 'DIALING' || s.state === 'CLAIMING') a.dialing += dur;
-      else if (s.state === 'ON_CALL') a.talk += dur;
+      const a = seed(s.agent_id, names[s.agent_id]);   // covers deactivated/deleted users with history
+      if (PROD_LOGGED.has(s.state)) a.logged_in += dur;
+      if (s.state === 'ON_CALL') a.talk += dur;
       else if (s.state === 'WRAP_UP') a.wrap += dur;
       else if (s.state === 'BREAK') a.break += dur;
-      else if (s.state === 'AVAILABLE' || s.state === 'CONNECTING') a.available += dur;
+      else if (s.state === 'MEETING') a.meeting += dur;
+      // Waiting = Ready + background dialing/claiming (the agent hears nothing
+      // until a human answers, so to them it's all one waiting bucket).
+      else if (['AVAILABLE', 'CONNECTING', 'DIALING', 'CLAIMING'].includes(s.state)) a.waiting += dur;
     }
     const rows = Object.values(acc).map(a => {
-      for (const k of ['logged_in', 'dialing', 'talk', 'wrap', 'break', 'available']) a[k] = Math.round(a[k]);
+      for (const k of ['logged_in', 'talk', 'wrap', 'break', 'meeting', 'waiting']) a[k] = Math.round(a[k]);
       return a;
-    }).sort((x, y) => y.logged_in - x.logged_in);
+    }).sort((x, y) => y.logged_in - x.logged_in || x.name.localeCompare(y.name));
     res.json({ from: new Date(from).toISOString(), to: new Date(to).toISOString(), rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
