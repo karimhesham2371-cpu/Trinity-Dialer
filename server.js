@@ -1337,6 +1337,12 @@ app.post('/api/login', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Build stamp — Render injects RENDER_GIT_COMMIT on every deploy. Clients poll
+// this and show a "new version" banner when the server moves past them, so a
+// stale browser tab can never silently run old code again.
+const BUILD_VERSION = env('RENDER_GIT_COMMIT', 'dev').slice(0, 7);
+app.get('/api/version', (_req, res) => res.json({ v: BUILD_VERSION }));
+
 // Fresh identity: role + permissions come from the DB (not the JWT snapshot),
 // so a support console picks up newly-granted access without re-login.
 app.get('/api/me', auth, async (req, res) => {

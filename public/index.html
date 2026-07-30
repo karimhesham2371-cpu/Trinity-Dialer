@@ -524,6 +524,13 @@
   .gtag--closer{background:var(--warn-tint);color:var(--warn)}
   kbd{font:600 11px var(--font-mono);background:var(--surface-2);border:1px solid var(--border-strong);border-radius:5px;padding:1px 6px;color:var(--text)}
 
+  /* ═══ UPDATE BANNER ═══ */
+  #updateBanner{position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:250;
+    background:linear-gradient(180deg,#F5C24E,#E0A62F);color:var(--accent-ink);
+    font:600 12.5px var(--font-ui);padding:8px 18px;border-radius:0 0 12px 12px;cursor:pointer;
+    box-shadow:0 6px 24px rgba(239,182,60,.4)}
+  #updateBanner:hover{filter:brightness(1.06)}
+
   /* ═══ TEAM CHAT ═══ */
   #chatFab{position:fixed;bottom:18px;left:18px;z-index:190;width:46px;height:46px;border-radius:50%;
     border:1px solid rgba(148,163,190,.25);background:linear-gradient(180deg,#161C2A,#10151F);color:var(--text);
@@ -854,6 +861,10 @@
 </div>
 
 <audio id="remoteAudio" autoplay muted></audio>
+<div id="updateBanner" class="hidden" title="Click to load the new version">
+  ⬆ A new version is available — click here to update (finish your current call first)
+</div>
+
 <!-- ═══ TEAM CHAT (all roles) ═══ -->
 <button id="chatFab" class="hidden" title="Team chat">💬<span id="chatBadge" class="hidden">0</span></button>
 <div id="chatPanel" class="hidden">
@@ -1031,6 +1042,7 @@ function route(){
     // Caller-ID choice is a closer privilege — agents get auto-rotated DIDs
     // (ReadyMode-style); their manual dials are assigned a number server-side.
     $('padFromRow').classList.toggle('hidden', !closer);
+    if(closer){ renderPadFrom(); loadCallerIds(); }   // load at login, not just on pad-open
     startAgent(); }
 }
 
@@ -1958,13 +1970,17 @@ async function loadCallerIds(){
 }
 function renderPadFrom(){
   const sel=$('padFrom');
-  sel.innerHTML='<option value="">Caller ID…</option>'+callerIds.map(n=>`<option value="${n}"${n===lockedFrom?' selected':''}>${n}</option>`).join('');
+  sel.innerHTML=(callerIds.length?'<option value="">Caller ID…</option>':'<option value="">No numbers — press Lock it to retry</option>')
+    +callerIds.map(n=>`<option value="${n}"${n===lockedFrom?' selected':''}>${n}</option>`).join('');
   sel.disabled=!!lockedFrom;
   const b=$('padLock');
   b.textContent=lockedFrom?'Change':'Lock it';
   b.classList.toggle('active',!!lockedFrom);
 }
 $('padLock').onclick=async()=>{
+  // Self-heal: if the number list never loaded (deploy blip, dropped request),
+  // the Lock button doubles as a retry.
+  if(!callerIds.length){ await loadCallerIds(); if(callerIds.length) toast('Numbers loaded — pick one','ok'); return; }
   if(lockedFrom){ // unlock so the agent can pick another number
     try{ await apiJson('/api/agent/caller-id','POST',{number:null}); }catch(e){ toast(e.message,'err'); return; }
     lockedFrom=null; renderPadFrom(); return;
@@ -2006,6 +2022,19 @@ $('handBtn').onclick=async()=>{
     toast('🖐 Supervisor notified','ok'); }
   catch(e){ toast(e.message,'err'); }
 };
+
+// ── Build-version watchdog: banner when the server has redeployed past this tab ──
+let buildV=null;
+async function checkBuild(){
+  try{
+    const r=await fetch('/api/version'); if(!r.ok) return;
+    const j=await r.json();
+    if(buildV===null){ buildV=j.v; try{ log('build '+j.v); }catch(e){} return; }
+    if(j.v!==buildV) $('updateBanner').classList.remove('hidden');
+  }catch(e){ /* offline blip */ }
+}
+$('updateBanner').onclick=()=>location.reload();
+checkBuild(); setInterval(checkBuild, 4*60*1000);
 
 // ── Team chat (all roles; agents get WS-instant, everyone polls as fallback) ──
 const CHAT_ROLE_COLORS={admin:'var(--accent)',support:'var(--info)',closer:'var(--ok)',agent:'var(--text-dim)'};
