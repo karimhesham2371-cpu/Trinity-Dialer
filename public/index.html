@@ -2206,6 +2206,13 @@ document.addEventListener('keydown', e=>{
   if(serverState==='OFFLINE'||!$('viewAgent')||$('viewAgent').classList.contains('hidden')) return;
   const tag=(e.target.tagName||'').toLowerCase(); if(tag==='input'||tag==='textarea'||tag==='select') return;
   if(e.code==='Space' && serverState==='ON_CALL'){ e.preventDefault(); toggleMute(); return; }
+  // With the dialpad OPEN on a live call, digit keys are DTMF ("press 1 for
+  // English") — never disposition hotkeys. Pad closed = hotkeys as before.
+  if(/^[0-9*#]$/.test(e.key) && serverState==='ON_CALL' && !$('padWrap').classList.contains('hidden')){
+    e.preventDefault();
+    apiJson('/api/agent/dtmf','POST',{digits:e.key}).then(()=>log('DTMF '+e.key)).catch(err=>toast(err.message,'err'));
+    return;
+  }
   if(/^[0-9]$/.test(e.key) && (serverState==='WRAP_UP'||serverState==='ON_CALL')){
     const d=dispositions.find(x=>String(x.hotkey)===e.key); if(d){ e.preventDefault(); chooseDisposition(d); }
   }
@@ -2488,7 +2495,7 @@ function dialerGuideHtml(role){
   sec('Call controls &amp; the dialpad',['all','Everyone'],
     '<ul>'+
     '<li><b>Mute / Hold</b> — live-call only.</li>'+
-    '<li><b>Dialpad</b> — during a call it sends touch-tones (IVRs, extensions). Off-call it becomes the manual dialer.</li>'+
+    '<li><b>Dialpad</b> — during a call it sends touch-tones (IVRs, extensions): click the buttons or, with the pad open, just type the digits on your keyboard. Off-call it becomes the manual dialer. Keep the pad <i>closed</i> if you want number keys to work as disposition hotkeys.</li>'+
     '<li><b>Hang up</b> — ends the live call, or cancels ringing background dials while Waiting.</li>'+
     '</ul>'+
     '<h4>Manual outbound calls</h4>Open the dialpad while not on a call, type the number, press <b>Call</b>. DNC numbers are refused, and if the number matches a known lead the call attaches to that lead so history and dispositions work.'+

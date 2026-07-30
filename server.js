@@ -4002,10 +4002,12 @@ app.post('/api/agent/note', auth, async (req, res) => {
 // In-call controls (lead leg). Mute is handled client-side on the WebRTC mic.
 app.post('/api/agent/dtmf', auth, async (req, res) => {
   const st = rt[req.user.id];
-  const digits = String((req.body && req.body.digits) || '').replace(/[^0-9*#]/g, '');
+  const digits = String((req.body && req.body.digits) || '').replace(/[^0-9*#wW]/g, '');
   if (!st || !st.leadLeg) return res.status(400).json({ error: 'no active lead call' });
   if (!digits) return res.status(400).json({ error: 'no digits' });
-  try { await telnyx('POST', `/calls/${st.leadLeg}/actions/send_dtmf`, { digits }); res.json({ ok: true }); }
+  // Max tone duration (500ms) — short default tones are exactly what older IVRs
+  // ("press 1 for English") fail to register.
+  try { await telnyx('POST', `/calls/${st.leadLeg}/actions/send_dtmf`, { digits, duration_millis: 500 }); res.json({ ok: true }); }
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 app.post('/api/agent/hold', auth, async (req, res) => {
