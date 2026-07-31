@@ -980,6 +980,7 @@ const PERMISSIONS = [
   { key: 'reports.qa',               label: 'Recording QA',     area: 'reports', hint: 'Flag / score / annotate recordings for quality review (inside Call logs).' },
   { key: 'floor.monitor',            label: 'Live monitor',     area: 'reports', hint: 'Listen in on an agent\'s live call from the office map (needs Office map).' },
   { key: 'floor.kick',               label: 'Kick agent',       area: 'reports', hint: 'Force an agent off the dialer from the office map (needs Office map).' },
+  { key: 'floor.control',            label: 'Remote control',   area: 'reports', hint: 'Reach into an agent\'s console from the office map — end their call, mute their mic, release a stuck wrap-up, refresh their screen (needs Office map).' },
 ];
 const PERM_KEYS = new Set(PERMISSIONS.map(p => p.key));
 const normPerms = (v) => (Array.isArray(v) ? v.filter(k => PERM_KEYS.has(k)) : []);
@@ -1025,6 +1026,7 @@ function permForPath(path, method) {
   if (path.startsWith('/api/admin/reports/recording'))    return ['reports.call_logs', 'reports.research'];
   if (path === '/api/admin/floor/kick')                   return 'floor.kick';
   if (path === '/api/admin/floor/monitor')                return 'floor.monitor';
+  if (path === '/api/admin/floor/control')                return 'floor.control';
   if (path.startsWith('/api/admin/floor'))                return 'reports.office_map';
   if (path === '/api/admin/permissions')                  return PERMISSIONS.map(p => p.key); // any grant
   if (method === 'GET' && (path === '/api/admin/users' || path === '/api/admin/campaigns'))
@@ -1288,10 +1290,12 @@ function areaCodeOf(e164) {
 // Agents subscribe to their own live state; admins subscribe to the whole floor.
 // clients: Set of { ws, userId, role }
 const wsClients = new Set();
-function wsSend(ws, obj) { try { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); } catch {} }
+function wsSend(ws, obj) { try { if (ws.readyState !== 1) return false; ws.send(JSON.stringify(obj)); return true; } catch { return false; } }
 // Admins + support users (the latter for the live office map) see the floor feed.
 function wsToAdmins(obj) { for (const c of wsClients) if (c.role === 'admin' || c.role === 'support') wsSend(c.ws, obj); }
-function wsToAgent(id, obj) { for (const c of wsClients) if (c.userId === id) wsSend(c.ws, obj); }
+// Returns how many of this user's open tabs actually received the push, so
+// callers that need delivery (remote control) can report "not connected".
+function wsToAgent(id, obj) { let n = 0; for (const c of wsClients) if (c.userId === id && wsSend(c.ws, obj)) n++; return n; }
 function agentSnapshot(id) {
   const st = rt[id] || { state: 'OFFLINE' };
   return { agentId: id, state: st.state, leadId: st.leadId || null, leadNumber: st.leadNumber || null,
@@ -3316,6 +3320,71 @@ app.post('/api/admin/floor/monitor', auth, adminOnly, (req, res) => {
   const st = rt[id];
   const live = !!(st && st.state === 'ON_CALL' && st.leadLeg);
   res.json({ ok: true, live, ccid: live ? st.leadLeg : null, state: (st && st.state) || 'OFFLINE' });
+});
+
+// Supervisor action: remote-control an agent's console without taking them off
+// the dialer (that's /kick). Each action is the supervisor pressing a button the
+// agent has in front of them, so the normal downstream flow still runs — ending a
+// call still produces a hangup webhook, wrap-up, and a disposition prompt.
+//
+//   end_call      hang up their live lead leg; if they're only ringing out,
+//                 cancel the in-flight legs and requeue those leads (mirrors
+//                 the agent's own hangup button).
+//   release_wrap  free an agent parked in WRAP_UP — clears the wrap timer and
+//                 the require-disposition hold, then drops them back on the
+//                 floor. For agents who walked away mid-code, not routine use.
+//   mute/unmute   flip the agent's microphone from here; their Mute button
+//                 updates with it and they can still change it themselves.
+//   refresh       reload their browser tab (stale build, wedged UI). Refused
+//                 during a live call so nobody drops a seller mid-sentence.
+app.post('/api/admin/floor/control', auth, adminOnly, async (req, res) => {
+  const id = req.body && req.body.agent_id;
+  const action = String((req.body && req.body.action) || '').toLowerCase();
+  if (!id) return res.status(400).json({ error: 'agent_id required' });
+  if (!['end_call', 'release_wrap', 'mute', 'unmute', 'refresh'].includes(action))
+    return res.status(400).json({ error: 'unknown action' });
+  const st = rt[id];
+  const by = req.user.name || req.user.email || 'a supervisor';
+  try {
+    if (action === 'end_call') {
+      if (st && st.leadLeg) {
+        await telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {});
+      } else if (st && st.pending && Object.keys(st.pending).length) {
+        for (const cc of Object.keys(st.pending)) {
+          const pi = st.pending[cc];
+          telnyx('POST', `/calls/${cc}/actions/hangup`, {}).catch(() => {});
+          if (pi && pi.leadId && !pi.manual) sbUpdate('leads', `id=eq.${pi.leadId}`,
+            { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 5 * 60e3).toISOString() }).catch(() => {});
+        }
+        st.pending = {};
+        if (['DIALING', 'CLAIMING'].includes(st.state)) {
+          st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
+          await setAgentState(id, st.state);
+        }
+      } else {
+        return res.status(409).json({ error: 'agent has no call to end' });
+      }
+      wsToAgent(id, { type: 'remote.ended', by });
+    }
+    else if (action === 'release_wrap') {
+      if (!st || st.state !== 'WRAP_UP') return res.status(409).json({ error: 'agent is not in wrap-up' });
+      clearWrapTimer(st);
+      st.awaitingDisp = false;          // drop the require-disposition hold too
+      st.state = st.conferenceId ? 'AVAILABLE' : 'OFFLINE';
+      await setAgentState(id, st.state);
+      wsToAgent(id, { type: 'remote.wrap_released', by });
+    }
+    else if (action === 'mute' || action === 'unmute') {
+      if (!st || st.state !== 'ON_CALL') return res.status(409).json({ error: 'agent is not on a live call' });
+      wsToAgent(id, { type: 'remote.mute', on: action === 'mute', by });
+    }
+    else if (action === 'refresh') {
+      if (st && st.state === 'ON_CALL') return res.status(409).json({ error: 'agent is on a live call' });
+      if (!wsToAgent(id, { type: 'remote.reload', by })) return res.status(409).json({ error: 'agent console is not connected' });
+    }
+    audit(req.user, 'REMOTE_CONTROL', { target_type: 'agent', target_id: id, meta: { action } });
+    res.json({ ok: true, action, state: (rt[id] && rt[id].state) || 'OFFLINE' });
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 // ══ AGENT: softphone token + presence ══════════════════════════════════════════
