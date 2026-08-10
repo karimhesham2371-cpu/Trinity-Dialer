@@ -2712,7 +2712,8 @@ app.get('/api/admin/reports/agent', auth, adminOnly, async (req, res) => {
       const dur   = Math.max(0, Math.min(end, to) - Math.max(start, from)) / 1000;
       if (dur <= 0) continue;
       const a = seed(s.agent_id, names[s.agent_id]);   // covers deactivated/deleted users with history
-      if (PROD_LOGGED.has(s.state)) a.logged_in += dur;
+      if (s.state === 'PRESENT') { (a._present = a._present || []).push([new Date(s.started_at).getTime(), s.ended_at ? new Date(s.ended_at).getTime() : now]); continue; }
+      if (PROD_LOGGED.has(s.state)) { a.logged_in += dur; (a._worked = a._worked || []).push([new Date(s.started_at).getTime(), s.ended_at ? new Date(s.ended_at).getTime() : now]); }
       if (s.state === 'ON_CALL') a.talk += dur;
       else if (s.state === 'WRAP_UP') a.wrap += dur;
       else if (s.state === 'BREAK') a.break += dur;
@@ -2722,6 +2723,12 @@ app.get('/api/admin/reports/agent', auth, adminOnly, async (req, res) => {
       else if (['AVAILABLE', 'CONNECTING', 'DIALING', 'CLAIMING'].includes(s.state)) a.waiting += dur;
     }
     const rows = Object.values(acc).map(a => {
+      // Union worked+presence so system downtime with the agent at their desk
+      // is credited into logged-in time (same policy as Productivity).
+      if (a._present || a._worked) {
+        a.logged_in = unionSeconds([...(a._worked || []), ...(a._present || [])], from, to);
+        delete a._present; delete a._worked;
+      }
       for (const k of ['logged_in', 'talk', 'wrap', 'break', 'meeting', 'waiting']) a[k] = Math.round(a[k]);
       return a;
     }).sort((x, y) => y.logged_in - x.logged_in || x.name.localeCompare(y.name));
@@ -3123,7 +3130,7 @@ app.get('/api/admin/reports/attendance', auth, adminOnly, async (req, res) => {
     ]);
     const byDay = {};   // `${agent}|${yyyy-mm-dd}` -> row
     for (const s of spans || []) {
-      if (!PROD_LOGGED.has(s.state)) continue;
+      if (!PROD_LOGGED.has(s.state) && s.state !== 'PRESENT') continue;
       const start = new Date(s.started_at);
       const key = s.agent_id + '|' + start.toISOString().slice(0, 10);
       const end = s.ended_at ? new Date(s.ended_at) : new Date();
@@ -3708,6 +3715,46 @@ app.get('/api/agent/script-preview', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Presence heartbeat: credit ready-but-disconnected time ───────────────────
+// Policy (Karim, 2026-08-10): an agent at their desk trying to work must not
+// lose paid hours to OUR faults (carrier blocks, deploys, softphone drops).
+// The console beacons every 45s while the agent intends to be on; beacons are
+// stored as PRESENT spans in agent_state_events (heartbeat-extended, never
+// left open). Hours-logged metrics take the UNION of worked time and presence,
+// and surface the platform-fault slice as downtime_credit.
+const PRESENCE = {};   // agentId -> { rowId, lastPing }
+app.post('/api/agent/presence', auth, async (req, res) => {
+  const id = req.user.id;
+  const now = Date.now(), nowIso = new Date(now).toISOString();
+  try {
+    const pr = PRESENCE[id];
+    if (pr && pr.rowId && now - pr.lastPing < 2 * 60 * 1000) {
+      pr.lastPing = now;
+      sbUpdate('agent_state_events', `id=eq.${pr.rowId}`, { ended_at: nowIso }).catch(() => {});
+    } else {
+      const [row] = await sbInsert('agent_state_events',
+        { agent_id: id, state: 'PRESENT', started_at: nowIso, ended_at: nowIso });
+      PRESENCE[id] = { rowId: row && row.id, lastPing: now };
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Total seconds covered by a set of [startMs,endMs] intervals, clipped to a
+// window — union, so overlaps never double-count.
+function unionSeconds(intervals, fromMs, toMs) {
+  const iv = intervals
+    .map(([a, b]) => [Math.max(a, fromMs), Math.min(b, toMs)])
+    .filter(([a, b]) => b > a)
+    .sort((x, y) => x[0] - y[0]);
+  let total = 0, curA = null, curB = null;
+  for (const [a, b] of iv) {
+    if (curB === null || a > curB) { if (curB !== null) total += curB - curA; curA = a; curB = b; }
+    else if (b > curB) curB = b;
+  }
+  if (curB !== null) total += curB - curA;
+  return total / 1000;
+}
+
 // ── Team chat: one floor-wide room, everyone can post and read ───────────────
 app.get('/api/chat', auth, (req, res) => {
   const after = +req.query.after || 0;
@@ -3845,20 +3892,27 @@ async function productivityWindow(agentId, fromMs, toMs) {
       `agent_id=eq.${agentId}&bridged_at=not.is.null&created_at=gte.${encodeURIComponent(fromIso)}` +
       `&created_at=lte.${encodeURIComponent(toIso)}&select=id`),
   ]);
-  const out = { logged_in: 0, break: 0, wrap: 0, wait: 0, meeting: 0, calls: (calls || []).length };
+  const out = { logged_in: 0, break: 0, wrap: 0, wait: 0, meeting: 0, downtime_credit: 0, calls: (calls || []).length };
+  const worked = [], present = [];
   for (const s of spans || []) {
     const start = new Date(s.started_at).getTime();
     const end = s.ended_at ? new Date(s.ended_at).getTime() : Date.now();
     const dur = Math.max(0, Math.min(end, toMs) - Math.max(start, fromMs)) / 1000;
     if (dur <= 0) continue;
-    if (PROD_LOGGED.has(s.state)) out.logged_in += dur;
+    if (s.state === 'PRESENT') { present.push([start, end]); continue; }
+    if (PROD_LOGGED.has(s.state)) worked.push([start, end]);
     if (s.state === 'BREAK') out.break += dur;
     else if (s.state === 'MEETING') out.meeting += dur;
     else if (s.state === 'WRAP_UP') out.wrap += dur;
     // Waiting between calls: available + background dialing (agent hears nothing yet).
     else if (s.state === 'AVAILABLE' || s.state === 'DIALING' || s.state === 'CLAIMING') out.wait += dur;
   }
-  for (const k of ['logged_in', 'break', 'wrap', 'wait', 'meeting']) out[k] = Math.round(out[k]);
+  // Hours logged = union of worked states and presence beacons: an agent at
+  // their desk while the platform was down gets credited, never double-counted.
+  const workedSec = unionSeconds(worked, fromMs, toMs);
+  out.logged_in = unionSeconds([...worked, ...present], fromMs, toMs);
+  out.downtime_credit = Math.max(0, out.logged_in - workedSec);
+  for (const k of ['logged_in', 'break', 'wrap', 'wait', 'meeting', 'downtime_credit']) out[k] = Math.round(out[k]);
   return out;
 }
 app.get('/api/agent/productivity', auth, async (req, res) => {

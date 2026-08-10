@@ -1806,7 +1806,8 @@ async function loadProductivity(quiet){
     <div class="prodStat"><span class="pl">Wait duration</span><span class="pv">${prodDur(d.wait)}</span></div>
     <div class="prodStat"><span class="pl">Avg wait between calls</span><span class="pv">${prodDur(d.calls?(d.wait||0)/d.calls:0)}</span></div>
     <div class="prodStat"><span class="pl">Calls handled</span><span class="pv">${d.calls||0}</span></div>
-    <div class="prodStat"><span class="pl">Sales / appts</span><span class="pv">${d.sales||0}</span></div></div>`;
+    <div class="prodStat"><span class="pl">Sales / appts</span><span class="pv">${d.sales||0}</span></div>
+    ${d.downtime_credit?`<div class="prodStat"><span class="pl">Credited downtime <span class="faint" style="font-size:10px">(system issues — still counted)</span></span><span class="pv" style="color:var(--info)">${prodDur(d.downtime_credit)}</span></div>`:''}</div>`;
   // Daily goal tracker: progress bars fill through the shift, gold → green at 100%.
   const goalBar=(label,cur,target)=>{
     const pct=Math.min(100,Math.round(cur/target*100));
@@ -2038,6 +2039,18 @@ $('handBtn').onclick=async()=>{
     toast('🖐 Supervisor notified','ok'); }
   catch(e){ toast(e.message,'err'); }
 };
+
+// ── Presence beacon: credits desk-time even when the platform is down ──
+// Fires every 45s while the agent intends to be working (pressed Ready at some
+// point, or is currently in any non-offline state). Server stores it as
+// PRESENT spans; payroll metrics union it with worked time so OUR outages
+// (carrier blocks, deploys) never cost the agent logged hours.
+setInterval(()=>{
+  if(!TOKEN||!USER) return;
+  if(USER.role!=='agent'&&USER.role!=='closer') return;
+  if(!(typeof intendAvailable!=='undefined'&&intendAvailable) && serverState==='OFFLINE') return;
+  apiJson('/api/agent/presence','POST',{}).catch(()=>{});
+},45000);
 
 // ── Build-version watchdog: banner when the server has redeployed past this tab ──
 let buildV=null;
@@ -2547,7 +2560,7 @@ function dialerGuideHtml(role){
     '<h4>Caller ID</h4><b>Agents</b> never pick a number — the dialer auto-assigns a rotating caller ID matched to the lead\'s area code, on manual dials too (ReadyMode-style). <b>Closers</b> get a Caller ID dropdown on the dialpad: pick a number, press <b>Lock it</b>, and every manual call goes out from it — across calls and even redeploys — until they press <b>Change</b>.')+
 
   sec('Productivity &amp; daily goals',['all','Everyone'],
-    'The <b>Productivity</b> tab live-updates every 5 seconds: hours logged in, break / wrap / wait durations, average wait between calls, calls handled (only calls that actually reached you), and sales/appts.'+
+    'The <b>Productivity</b> tab live-updates every 5 seconds: hours logged in, break / wrap / wait durations, average wait between calls, calls handled (only calls that actually reached you), and sales/appts. <b>Hours logged protects agents from our bugs:</b> time spent at the desk trying to work while the system or carrier is down is still credited — it shows as a separate "Credited downtime" line.'+
     '<h4>Goals</h4>If the admin sets daily targets (User management → Daily agent goals), progress bars appear at the top — gold while in progress, green at 100%.')+
 
   sec('Warm transfer: agent → closer',['all','Everyone'],
@@ -3331,7 +3344,8 @@ async function loadAgentPanelStats(agentId){
     row('Wrap-up', prodDur(j.wrap))+
     row('Waiting', prodDur(j.wait))+
     row('Calls handled', j.calls||0)+
-    row('Sales / appts', j.sales||0);
+    row('Sales / appts', j.sales||0)+
+    (j.downtime_credit?row('Credited downtime', prodDur(j.downtime_credit)):'');
 }
 // Supervisor flips an agent's aux from the seat panel.
 async function forceAux(agentId, state){
