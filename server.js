@@ -3643,6 +3643,35 @@ app.post('/api/agent/raise-hand', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// Idle script preview: what script should this agent see BETWEEN calls? Their
+// highest-priority active playlist's RUNNING campaign (else any assigned one),
+// so new agents can rehearse before the first call ever lands.
+app.get('/api/agent/script-preview', auth, async (req, res) => {
+  try {
+    const pas = await sbSelect('playlist_agents', `agent_id=eq.${req.user.id}&select=playlist_id`);
+    const plIds = [...new Set((pas || []).map(x => x.playlist_id))];
+    if (!plIds.length) return res.json({ campaign: null });
+    const inPl = plIds.map(p => `"${p}"`).join(',');
+    const [pls, pcs] = await Promise.all([
+      sbSelect('playlists', `id=in.(${inPl})&active=eq.true&select=id,priority`),
+      sbSelect('playlist_campaigns', `playlist_id=in.(${inPl})&select=playlist_id,campaign_id`),
+    ]);
+    const prio = new Map((pls || []).map(p => [p.id, p.priority != null ? p.priority : 0]));
+    const ordered = (pcs || []).filter(x => prio.has(x.playlist_id))
+      .sort((a, b) => prio.get(a.playlist_id) - prio.get(b.playlist_id));
+    let best = null;
+    for (const { campaign_id } of ordered) {
+      const cfg = await campaignConfig(campaign_id).catch(() => null);
+      if (!cfg) continue;
+      if (cfg.status === 'RUNNING') { best = cfg; break; }
+      if (!best) best = cfg;
+    }
+    if (!best || !best.script) return res.json({ campaign: null });
+    res.json({ campaign: { id: best.id, name: best.name, status: best.status,
+      script: best.script, rebuttals: REBUTTALS[best.id] || [] } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Team chat: one floor-wide room, everyone can post and read ───────────────
 app.get('/api/chat', auth, (req, res) => {
   const after = +req.query.after || 0;

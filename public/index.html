@@ -1043,6 +1043,7 @@ function route(){
     // (ReadyMode-style); their manual dials are assigned a number server-side.
     $('padFromRow').classList.toggle('hidden', !closer);
     if(closer){ renderPadFrom(); loadCallerIds(); }   // load at login, not just on pad-open
+    loadScriptPreview();   // script shows by default, call or no call
     startAgent(); }
 }
 
@@ -1478,6 +1479,20 @@ function renderScript(c){
   if(!c||!c.script){ $('scriptBody').className='empty'; $('scriptBody').textContent='No script set for this campaign.'; }
   else { $('scriptBody').className=''; $('scriptBody').innerHTML=esc(c.script_merged||c.script); }
   renderRebuttals(c&&c.rebuttals||[]);
+}
+// Idle preview: the assigned campaign's script (sample data highlighted) shows
+// by default — call or no call — so agents can rehearse between connects. A
+// live call always replaces it with the real merged script.
+async function loadScriptPreview(){
+  if(curLeadId) return;
+  let j; try{ j=await apiJson('/api/agent/script-preview'); }catch(e){ return; }
+  if(curLeadId) return;                       // a call landed while we fetched
+  if(!j.campaign||!j.campaign.script) return; // keep the "No active call." empty state
+  $('scriptBody').className='';
+  $('scriptBody').innerHTML=
+    `<div class="dim" style="font-size:11px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:10px">${esc(j.campaign.name)} — preview · real lead data fills in on live calls</div>`
+    +scriptPreviewHtml(j.campaign.script);
+  renderRebuttals(j.campaign.rebuttals||[]);
 }
 // Objection cheat-sheet under the script: tap an objection, see the comeback.
 function renderRebuttals(items){
@@ -1949,6 +1964,7 @@ function clearLead(){
   const xb=$('xferBrief'); if(xb) xb.remove();
   $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
   $('scriptBody').className='empty'; $('scriptBody').textContent='No active call.';
+  loadScriptPreview();   // bring the campaign script straight back after each call
   $('history').className='empty'; $('history').textContent='No previous contact.';
   $('dispGrid').innerHTML=''; $('notes').value=''; $('cbWrap').classList.add('hidden');
 }
