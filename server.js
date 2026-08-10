@@ -785,13 +785,22 @@ async function fetchT(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
 }
 
 // ── Telnyx REST ───────────────────────────────────────────────────────────────
+// Body reads need their own clock: fetchT's abort covers the connection, but
+// its timer clears once headers land — a stalled BODY stream would then hang
+// the caller forever (this exact hang wedged the pacer on 2026-08-10).
+function textT(res, ms = 15000) {
+  return Promise.race([
+    res.text(),
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`response body read timed out after ${ms}ms`)), ms)),
+  ]);
+}
 async function telnyx(method, endpoint, body) {
   const res = await fetchT(`${TELNYX_BASE}${endpoint}`, {
     method,
     headers: { 'Authorization': `Bearer ${TELNYX_KEY}`, 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
   });
-  const text = await res.text();
+  const text = await textT(res);
   let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
   if (!res.ok) throw new Error(`Telnyx ${method} ${endpoint} -> ${res.status}: ${text}`);
   return json;
@@ -807,7 +816,7 @@ async function sbReq(method, pathQ, body, prefer) {
     },
     body: body ? JSON.stringify(body) : undefined,
   });
-  const text = await res.text();
+  const text = await textT(res);
   let json; try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
   if (!res.ok) throw new Error(`Supabase ${method} ${pathQ} -> ${res.status}: ${text}`);
   return json;
@@ -1359,6 +1368,8 @@ app.get('/health', (_req, res) => {
     ok: true, service: 'trinity-dialer', phase: 'phase0',
     telnyx_key: !!TELNYX_KEY, connection_id: !!CONNECTION_ID, supabase: !!(SB_HOST && SB_KEY),
     caller_pool: CALLER_POOL.length, agents_online: Object.keys(rt).length,
+    pacer: { busy: pacingBusy, busy_for_sec: pacingBusy ? Math.round((Date.now() - pacingBusyAt) / 1000) : 0,
+      last_tick_ago_sec: PACER_LAST_TICK ? Math.round((Date.now() - PACER_LAST_TICK) / 1000) : null },
     ws_clients: wsClients.size, recording: true,
     outbox_depth: writeOutbox.length, outbox_dropped: outboxDropped,
     wh_public_key: !!TELNYX_PUBLIC_KEY, wh_sig_ok: whSigOk, wh_sig_fail: whSigFail, wh_token: whToken,
@@ -4236,7 +4247,7 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
   console.log(`[bridge] agent ${agentId.slice(0, 8)} ON_CALL (${amd || 'answered'})`);
 }
 
-let pacingBusy = false;
+let pacingBusy = false, pacingBusyAt = 0, PACER_LAST_TICK = 0;
 // Pull the next dialable, in-window lead across a set of campaigns (applying an
 // optional playlist filter set). Returns a lead row or null. The per-state
 // calling window is enforced by callableNow (evaluated in each lead's own tz).
@@ -4268,8 +4279,17 @@ async function nextDialableLead(campaignIds, filters, nowIso) {
   return null;
 }
 async function pacingTick() {
-  if (shuttingDown || pacingBusy || !SB_HOST || !CONNECTION_ID) return;   // don't place new calls during a redeploy drain
-  pacingBusy = true;
+  if (shuttingDown || !SB_HOST || !CONNECTION_ID) return;   // don't place new calls during a redeploy drain
+  if (pacingBusy) {
+    // Watchdog: a hung await inside a previous tick would hold the busy flag
+    // forever and silently stop ALL dialing (it did, on 2026-08-10). Force-release
+    // after 90s — worst case is one overlapping tick, vs a dead floor.
+    if (Date.now() - pacingBusyAt > 90 * 1000) {
+      console.error('[pacing] WATCHDOG: tick wedged >90s — force-releasing busy flag');
+      pacingBusy = false;
+    } else return;
+  }
+  pacingBusy = true; pacingBusyAt = Date.now(); PACER_LAST_TICK = Date.now();
   try {
     // Agents that can take MORE dials: in-conference, not on a connected call,
     // not inbound, and with fewer in-flight legs than the CPA ratio allows.
@@ -4503,9 +4523,13 @@ async function startAiAssistant(ccid) {
   }
 }
 
-let aiPacingBusy = false;
+let aiPacingBusy = false, aiPacingBusyAt = 0;
 async function aiPacingTick() {
-  if (aiPacingBusy) return;
+  if (aiPacingBusy) {
+    if (Date.now() - aiPacingBusyAt > 90 * 1000) { console.error('[ai] WATCHDOG: tick wedged >90s — force-releasing'); aiPacingBusy = false; }
+    else return;
+  }
+  aiPacingBusyAt = Date.now();
   if (!AI.enabled || !AI.assistant_id || !AI.campaign_ids.length) return;
   if (!SB_HOST || !CONNECTION_ID) return;
   aiPacingBusy = true;
@@ -4753,11 +4777,17 @@ async function reserveReaper() {
   }
 }
 
-let enginePacingBusy = false;
+let enginePacingBusy = false, enginePacingBusyAt = 0;
 async function enginePacingTick() {
-  if (enginePacingBusy || !SB_HOST || !CONNECTION_ID) return;
+  if (!SB_HOST || !CONNECTION_ID) return;
   if (AMD_MODE === 'disabled') return;   // predictive REQUIRES AMD; honor the global kill-switch by not dialing at all
-  enginePacingBusy = true;
+  if (enginePacingBusy) {
+    if (Date.now() - enginePacingBusyAt > 90 * 1000) {
+      console.error('[engine] WATCHDOG: tick wedged >90s — force-releasing busy flag');
+      enginePacingBusy = false;
+    } else return;
+  }
+  enginePacingBusy = true; enginePacingBusyAt = Date.now();
   try {
     // Reclaim leaked predictive slots (missed hangup webhook) before pacing.
     for (const cc of Object.keys(dialerRt)) {
