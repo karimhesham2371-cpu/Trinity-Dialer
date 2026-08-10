@@ -4388,7 +4388,15 @@ async function pacingTick() {
       }
       if (inFlight >= cpa) continue;                       // already at this playlist's CPA
       try { await dialLead(agentId, first.lead, first.playlist && first.playlist.id); }
-      catch (e) { console.error('[pacing:dial]', e.message); continue; }
+      catch (e) {
+        console.error('[pacing:dial]', e.message);
+        // Poison-pill guard: an undialable number (invalid/blocked destination)
+        // must be marked out of the queue, or the picker returns the SAME lead
+        // every tick and one bad number deadlocks all dialing (2026-08-10).
+        sbUpdate('leads', `id=eq.${first.lead.id}`, { status: 'BAD_NUMBER', last_outcome: 'invalid_number' }).catch(() => {});
+        PACER_DEBUG.lastDialError = (e.message || '').slice(0, 140);
+        continue;
+      }
       // Top up to the playlist's CPA with additional simultaneous legs.
       let need = cpa - inFlight - 1;
       while (need-- > 0) {
@@ -4396,7 +4404,12 @@ async function pacingTick() {
         const nxt = await pickLead(agentId);
         if (!nxt.lead) break;                              // no more leads for this agent
         try { await dialLead(agentId, nxt.lead, nxt.playlist && nxt.playlist.id); }
-        catch (e) { console.error('[pacing:dial]', e.message); break; }
+        catch (e) {
+          console.error('[pacing:dial]', e.message);
+          sbUpdate('leads', `id=eq.${nxt.lead.id}`, { status: 'BAD_NUMBER', last_outcome: 'invalid_number' }).catch(() => {});
+          PACER_DEBUG.lastDialError = (e.message || '').slice(0, 140);
+          break;
+        }
       }
     }
   } catch (e) { console.error('[pacing]', e.message); PACER_DEBUG.error = e.message; PACER_DEBUG.errorAt = new Date().toISOString(); }
