@@ -3291,6 +3291,20 @@ app.post('/api/admin/floor/message', auth, adminOnly, (req, res) => {
   res.json({ ok: true, delivered });
 });
 
+// Runtime X-ray: the exact in-memory fields the pacer gates on for one agent.
+// Exists because "agent looks AVAILABLE but gets no calls" is undebuggable from
+// the outside — ghost pending entries, a stuck leadLeg, or a stale inbound flag
+// are all invisible in the DB.
+app.get('/api/admin/floor/rt', auth, adminOnly, (req, res) => {
+  const st = rt[req.query.agent_id];
+  if (!st) return res.json({ present: false });
+  res.json({ present: true, state: st.state, hasConference: !!st.conferenceId,
+    leadLeg: st.leadLeg || null, inbound: !!st.inbound, captions: !!st.captions,
+    pendingCount: st.pending ? Object.keys(st.pending).length : 0,
+    pendingAgesSec: st.pending ? Object.values(st.pending).map(p => Math.round((Date.now() - p.at) / 1000)) : [],
+    awaitingDisp: !!st.awaitingDisp, wrapUntil: st.wrapUntil || null });
+});
+
 // Supervisor action: kick an agent off the dialer. Drops any live lead leg, drops
 // the agent's WebRTC leg, forces OFFLINE, and pushes a 'kicked' event to the
 // agent's own browser so their softphone tears down. Reversible: they can log
