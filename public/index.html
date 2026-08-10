@@ -1799,7 +1799,7 @@ async function loadProductivity(quiet){
   catch(e){ if(!el.dataset.loaded) el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
   el.dataset.loaded='1';
   const grp=(title,sub,d)=>`<div class="prodGroup"><h3>${title}</h3>${sub?`<p class="sub">${sub}</p>`:''}
-    <div class="prodStat"><span class="pl">Hours logged in</span><span class="pv">${prodDur(d.logged_in)}</span></div>
+    <div class="prodStat"><span class="pl"><b>Paid hours</b> <span class="faint" style="font-size:10px">everything below is included</span></span><span class="pv" style="color:var(--ok)">${prodDur(d.logged_in)}</span></div>
     <div class="prodStat"><span class="pl">Break duration</span><span class="pv">${prodDur(d.break)}</span></div>
     <div class="prodStat"><span class="pl">Meeting duration</span><span class="pv">${prodDur(d.meeting)}</span></div>
     <div class="prodStat"><span class="pl">Wrap-up duration</span><span class="pv">${prodDur(d.wrap)}</span></div>
@@ -2560,7 +2560,7 @@ function dialerGuideHtml(role){
     '<h4>Caller ID</h4><b>Agents</b> never pick a number — the dialer auto-assigns a rotating caller ID matched to the lead\'s area code, on manual dials too (ReadyMode-style). <b>Closers</b> get a Caller ID dropdown on the dialpad: pick a number, press <b>Lock it</b>, and every manual call goes out from it — across calls and even redeploys — until they press <b>Change</b>.')+
 
   sec('Productivity &amp; daily goals',['all','Everyone'],
-    'The <b>Productivity</b> tab live-updates every 5 seconds: hours logged in, break / wrap / wait durations, average wait between calls, calls handled (only calls that actually reached you), and sales/appts. <b>Hours logged protects agents from our bugs:</b> time spent at the desk trying to work while the system or carrier is down is still credited — it shows as a separate "Credited downtime" line.'+
+    'The <b>Productivity</b> tab live-updates every 5 seconds: hours logged in, break / wrap / wait durations, average wait between calls, calls handled (only calls that actually reached you), and sales/appts. <b>Paid hours is the whole paid clock, by policy:</b> talk time, waiting for calls, wrap-up, breaks, meetings — all of it counts, and so does time spent at the desk while the system or carrier is down (shown as "Credited downtime"). If the dialer is not feeding you calls, that is our problem, never a pay deduction. The only unpaid time is time not logged in at all.'+
     '<h4>Goals</h4>If the admin sets daily targets (User management → Daily agent goals), progress bars appear at the top — gold while in progress, green at 100%.')+
 
   sec('Warm transfer: agent → closer',['all','Everyone'],
@@ -3126,13 +3126,13 @@ async function loadAgentRep(){
       <td class="mono">${fmtDur(r.logged_in)}</td><td class="mono">${fmtDur(r.talk)}</td>
       <td class="mono">${fmtDur(r.wrap)}</td><td class="mono">${fmtDur(r.break)}</td>
       <td class="mono">${fmtDur(r.meeting)}</td><td class="mono">${fmtDur(r.waiting)}</td></tr>`).join('');
-    $('repBody').innerHTML=`<div class="tblwrap"><table><thead><tr><th>Agent</th><th>Logged in</th><th>Talk time</th><th>Wrap-up</th><th>Break</th><th>Meeting</th><th>Waiting</th></tr></thead><tbody>${rows}</tbody></table></div>
-      <p class="dim" style="font-size:11.5px;margin-top:8px"><b>Talk time</b> = connected conversation (on-call). <b>Waiting</b> = Ready + the system dialing in the background. Every active agent and closer is listed, including those with no activity in the range.</p>`;
+    $('repBody').innerHTML=`<div class="tblwrap"><table><thead><tr><th>Agent</th><th>Paid hours</th><th>Talk time</th><th>Wrap-up</th><th>Break</th><th>Meeting</th><th>Waiting</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <p class="dim" style="font-size:11.5px;margin-top:8px"><b>Paid hours</b> = the full paid clock: talk + waiting + wrap-up + break + meeting + credited system downtime. The other columns are its breakdown, not deductions. <b>Talk time</b> = connected conversation (on-call). <b>Waiting</b> = Ready + the system dialing in the background. Every active agent and closer is listed, including those with no activity in the range.</p>`;
   }catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; }
 }
 function exportAgentCsv(){
   if(!agentRepRows.length){ toast('Nothing to export','warn'); return; }
-  const head=['Agent','Role','Logged in (s)','Talk (s)','Wrap (s)','Break (s)','Meeting (s)','Waiting (s)'];
+  const head=['Agent','Role','Paid hours (s)','Talk (s)','Wrap (s)','Break (s)','Meeting (s)','Waiting (s)'];
   const lines=[head.join(',')].concat(agentRepRows.map(r=>[csvq(r.name),r.role||'agent',r.logged_in,r.talk,r.wrap,r.break,r.meeting,r.waiting].join(',')));
   const blob=new Blob([lines.join('\n')],{type:'text/csv'}); const a=document.createElement('a');
   a.href=URL.createObjectURL(blob); a.download='agent-report.csv'; a.click(); URL.revokeObjectURL(a.href);
@@ -3338,7 +3338,7 @@ async function loadAgentPanelStats(agentId){
   el.className=''; el.style.fontSize='';
   el.innerHTML=
     row('Logged in at', j.first_in?new Date(j.first_in).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false}):'—')+
-    row('Hours logged', prodDur(j.logged_in))+
+    row('Paid hours', prodDur(j.logged_in))+
     row('Break', prodDur(j.break))+
     row('Meeting', prodDur(j.meeting))+
     row('Wrap-up', prodDur(j.wrap))+
