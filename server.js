@@ -648,12 +648,12 @@ async function amdNightlyCrossCheck() {
   if (!SB_HOST) return;
   try {
     const since = new Date(Date.now() - 24 * 3600e3).toISOString();
-    const calls = await sbSelect('calls',
-      `answered_at=gte.${encodeURIComponent(since)}&select=telnyx_call_control_id,campaign_id,amd_mode,amd_result,amd_latency_ms,abandoned&limit=200000`).catch(() => []);
+    const calls = await sbSelectAll('calls',
+      `answered_at=gte.${encodeURIComponent(since)}&select=telnyx_call_control_id,campaign_id,amd_mode,amd_result,amd_latency_ms,abandoned`).catch(() => []);
     if (!calls || !calls.length) return;
     const ccids = calls.filter(c => c.telnyx_call_control_id).map(c => `"${c.telnyx_call_control_id}"`);
     const disps = ccids.length
-      ? await sbSelect('dispositions', `telnyx_call_control_id=in.(${ccids.join(',')})&select=telnyx_call_control_id,code&limit=200000`).catch(() => [])
+      ? await sbSelectAll('dispositions', `telnyx_call_control_id=in.(${ccids.join(',')})&select=telnyx_call_control_id,code`).catch(() => [])
       : [];
     const dispBy = {};
     for (const d of disps || []) if (d.telnyx_call_control_id) dispBy[d.telnyx_call_control_id] = d.code;
@@ -2696,10 +2696,10 @@ app.get('/api/admin/reports/agent', auth, adminOnly, async (req, res) => {
     const [users, spans] = await Promise.all([
       sbSelect('agents', 'role=in.(agent,closer)&active=eq.true&select=id,name,role&order=name.asc'),
       // Any span overlapping the window: started before `to` AND (open OR ended after `from`).
-      sbSelect('agent_state_events',
+      sbSelectAll('agent_state_events',
         `started_at=lte.${encodeURIComponent(new Date(to).toISOString())}` +
         `&or=(ended_at.is.null,ended_at.gte.${encodeURIComponent(new Date(from).toISOString())})` +
-        `&select=agent_id,state,started_at,ended_at&limit=100000`),
+        `&select=agent_id,state,started_at,ended_at`),
     ]);
     const acc = {};
     const seed = (id, name, role) => acc[id] || (acc[id] = { agent_id: id, name: name || '—', role: role || 'agent',
@@ -2761,8 +2761,8 @@ app.get('/api/admin/analytics', auth, adminOnly, async (req, res) => {
       const inList = ids.map(i => `"${i}"`).join(',');
       const range = `&created_at=gte.${encodeURIComponent(fromIso)}&created_at=lte.${encodeURIComponent(toIso)}`;
       const [disps, calls] = await Promise.all([
-        sbSelect('dispositions', `campaign_id=in.(${inList})${range}&select=campaign_id,code&limit=200000`),
-        sbSelect('calls', `campaign_id=in.(${inList})${range}&select=campaign_id,duration_sec,talk_seconds&limit=200000`),
+        sbSelectAll('dispositions', `campaign_id=in.(${inList})${range}&select=campaign_id,code`),
+        sbSelectAll('calls', `campaign_id=in.(${inList})${range}&select=campaign_id,duration_sec,talk_seconds`),
       ]);
       for (const d of disps || []) { const a = acc[d.campaign_id]; if (!a) continue;
         a.total_calls++; a._codes[d.code] = (a._codes[d.code] || 0) + 1; }
@@ -2811,8 +2811,8 @@ app.get('/api/admin/amd-stats', auth, adminOnly, async (req, res) => {
     const range = `created_at=gte.${encodeURIComponent(fromIso)}&created_at=lte.${encodeURIComponent(toIso)}`;
     const where = [filt, range].filter(Boolean).join('&');
     const [calls, disps] = await Promise.all([
-      sbSelect('calls', `${where}&select=id,telnyx_call_control_id,campaign_id,amd_mode,amd_result,amd_latency_ms,amd_greeting,answered_at,abandoned,vm_dropped&limit=200000`).catch(() => []),
-      sbSelect('dispositions', `${where}&select=telnyx_call_control_id,code&limit=200000`).catch(() => []),
+      sbSelectAll('calls', `${where}&select=id,telnyx_call_control_id,campaign_id,amd_mode,amd_result,amd_latency_ms,amd_greeting,answered_at,abandoned,vm_dropped`).catch(() => []),
+      sbSelectAll('dispositions', `${where}&select=telnyx_call_control_id,code`).catch(() => []),
     ]);
     const dispByCall = {};
     for (const d of disps || []) if (d.telnyx_call_control_id) dispByCall[d.telnyx_call_control_id] = d.code;
@@ -2883,8 +2883,8 @@ app.get('/api/admin/reports/wallboard', auth, adminOnly, async (_req, res) => {
   try {
     const [names, calls, disps, campaigns] = await Promise.all([
       agentNameMap(),
-      sbSelect('calls', `created_at=gte.${encodeURIComponent(fromIso)}&select=agent_id,bridged_at,duration_sec,talk_seconds&limit=200000`),
-      sbSelect('dispositions', `created_at=gte.${encodeURIComponent(fromIso)}&select=agent_id,code&limit=200000`),
+      sbSelectAll('calls', `created_at=gte.${encodeURIComponent(fromIso)}&select=agent_id,bridged_at,duration_sec,talk_seconds`),
+      sbSelectAll('dispositions', `created_at=gte.${encodeURIComponent(fromIso)}&select=agent_id,code`),
       sbSelect('campaigns', 'select=id,status'),
     ]);
     const per = {};
@@ -3117,8 +3117,8 @@ app.get('/api/admin/reports/attendance', auth, adminOnly, async (req, res) => {
   const fromIso = new Date(Date.now() - days * 86400e3).toISOString();
   try {
     const [spans, names] = await Promise.all([
-      sbSelect('agent_state_events',
-        `started_at=gte.${encodeURIComponent(fromIso)}&select=agent_id,state,started_at,ended_at&order=started_at.asc&limit=100000`),
+      sbSelectAll('agent_state_events',
+        `started_at=gte.${encodeURIComponent(fromIso)}&select=agent_id,state,started_at,ended_at&order=started_at.asc`),
       agentNameMap(),
     ]);
     const byDay = {};   // `${agent}|${yyyy-mm-dd}` -> row
@@ -3157,8 +3157,8 @@ app.get('/api/admin/floor/agent-stats', auth, adminOnly, async (req, res) => {
       sbSelect('agent_state_events',
         `agent_id=eq.${id}&started_at=gte.${dayIso}&state=neq.OFFLINE` +
         '&select=started_at&order=started_at.asc&limit=1').catch(() => []),
-      sbSelect('dispositions',
-        `agent_id=eq.${id}&created_at=gte.${dayIso}&select=code&limit=10000`).catch(() => []),
+      sbSelectAll('dispositions',
+        `agent_id=eq.${id}&created_at=gte.${dayIso}&select=code`).catch(() => []),
     ]);
     const sales = (disps || []).filter(d => LONG_WRAP_RE.test(d.code || '')).length;
     res.json({ ...today, sales, first_in: (first && first[0] && first[0].started_at) || null });
@@ -3835,15 +3835,15 @@ const PROD_LOGGED = new Set(['CONNECTING', 'AVAILABLE', 'CLAIMING', 'DIALING', '
 async function productivityWindow(agentId, fromMs, toMs) {
   const fromIso = new Date(fromMs).toISOString(), toIso = new Date(toMs).toISOString();
   const [spans, calls] = await Promise.all([
-    sbSelect('agent_state_events',
+    sbSelectAll('agent_state_events',
       `agent_id=eq.${agentId}&started_at=lte.${encodeURIComponent(toIso)}` +
       `&or=(ended_at.is.null,ended_at.gte.${encodeURIComponent(fromIso)})` +
-      `&select=state,started_at,ended_at&limit=100000`),
+      `&select=state,started_at,ended_at`),
     // Only calls that actually reached the agent (bridged) count as handled —
     // background dials that never connected (no-answer, machine) don't.
-    sbSelect('calls',
+    sbSelectAll('calls',
       `agent_id=eq.${agentId}&bridged_at=not.is.null&created_at=gte.${encodeURIComponent(fromIso)}` +
-      `&created_at=lte.${encodeURIComponent(toIso)}&select=id&limit=100000`),
+      `&created_at=lte.${encodeURIComponent(toIso)}&select=id`),
   ]);
   const out = { logged_in: 0, break: 0, wrap: 0, wait: 0, meeting: 0, calls: (calls || []).length };
   for (const s of spans || []) {
@@ -3871,9 +3871,9 @@ app.get('/api/agent/productivity', auth, async (req, res) => {
       productivityWindow(req.user.id, dayStart, now),
       productivityWindow(req.user.id, monthStart, now),
       // Positive outcomes (sale/appt/lead) for the goal tracker, month window.
-      sbSelect('dispositions',
+      sbSelectAll('dispositions',
         `agent_id=eq.${req.user.id}&created_at=gte.${new Date(monthStart).toISOString()}` +
-        `&select=code,created_at&limit=10000`).catch(() => []),
+        `&select=code,created_at`).catch(() => []),
     ]);
     const dayIso = new Date(dayStart).toISOString();
     let salesDay = 0, salesMonth = 0;
