@@ -1370,6 +1370,7 @@ app.get('/health', (_req, res) => {
     caller_pool: CALLER_POOL.length, agents_online: Object.keys(rt).length,
     pacer: { busy: pacingBusy, busy_for_sec: pacingBusy ? Math.round((Date.now() - pacingBusyAt) / 1000) : 0,
       last_tick_ago_sec: PACER_LAST_TICK ? Math.round((Date.now() - PACER_LAST_TICK) / 1000) : null },
+    pacer_debug: PACER_DEBUG,
     ws_clients: wsClients.size, recording: true,
     outbox_depth: writeOutbox.length, outbox_dropped: outboxDropped,
     wh_public_key: !!TELNYX_PUBLIC_KEY, wh_sig_ok: whSigOk, wh_sig_fail: whSigFail, wh_token: whToken,
@@ -4248,6 +4249,7 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
 }
 
 let pacingBusy = false, pacingBusyAt = 0, PACER_LAST_TICK = 0;
+let PACER_DEBUG = {};   // last tick's decisions — surfaced in /health for live debugging
 // Pull the next dialable, in-window lead across a set of campaigns (applying an
 // optional playlist filter set). Returns a lead row or null. The per-state
 // calling window is enforced by callableNow (evaluated in each lead's own tz).
@@ -4300,6 +4302,7 @@ async function pacingTick() {
       const inFlight = st.pending ? Object.keys(st.pending).length : 0;
       return inFlight < 5;   // hard max; real per-playlist CPA enforced in the loop
     });
+    PACER_DEBUG = { at: new Date().toISOString(), rtAgents: Object.keys(rt).length, free: freeAgents.length };
     if (!freeAgents.length) return;
     const nowIso = new Date().toISOString();
 
@@ -4314,6 +4317,9 @@ async function pacingTick() {
     // Predictive campaigns belong EXCLUSIVELY to enginePacingTick — excluding them
     // here is what prevents the two engines from double-dialing the same leads.
     const runningSet = new Set((runningCamps || []).filter(c => c.pacing_mode !== 'predictive').map(c => c.id));
+    PACER_DEBUG.runningPowerCampaigns = runningSet.size;
+    PACER_DEBUG.playlistsActive = (playlists || []).length;
+    PACER_DEBUG.plAgentRows = (plAgents || []).length;
     const plById = Object.fromEntries((playlists || []).map(p => [p.id, p]));
     // playlist_id -> [campaignIds that are RUNNING]
     const campsByPlaylist = {};
@@ -4367,6 +4373,7 @@ async function pacingTick() {
       // this agent this tick. Each dialLead marks its lead IN_PROGRESS before the
       // next pick, so we never ring the same number twice.
       const first = await pickLead(agentId);
+      PACER_DEBUG['agent_' + agentId.slice(0, 8)] = first.lead ? ('lead:' + first.lead.phone) : 'NO_DIALABLE_LEAD';
       if (!first.lead) continue;                          // no dialable lead for this agent
       let cpa = cpaOf(first.playlist);
       // FCC guardrail: if this campaign's rolling abandoned rate is nearing the 3%
@@ -4392,7 +4399,7 @@ async function pacingTick() {
         catch (e) { console.error('[pacing:dial]', e.message); break; }
       }
     }
-  } catch (e) { console.error('[pacing]', e.message); }
+  } catch (e) { console.error('[pacing]', e.message); PACER_DEBUG.error = e.message; PACER_DEBUG.errorAt = new Date().toISOString(); }
   finally { pacingBusy = false; }
 }
 
