@@ -2577,7 +2577,7 @@ function dialerGuideHtml(role){
     '<h4>Objection rebuttals</h4>Same page, below the script: objection + comeback pairs that appear on the agent screen as the tap-to-open cheat sheet.')+
 
   sec('Leads: import, playlists, folders, custom fields',['admin','Admin'],
-    '<h4>Import</h4>Upload a CSV (drag &amp; drop). Phones are normalized, invalid rows skipped, DNC-listed numbers blocked — you get a result popup with counts and a rejects file.'+
+    '<h4>Import</h4>Upload a CSV (drag &amp; drop). Phones are normalized and scrubbed for dialability — fake 555 numbers, Caribbean/Canadian +1 codes and unassigned area codes are rejected with a reason (only US geographic + toll-free numbers enter the queue). DNC-listed numbers are blocked. You get a result popup with counts and a downloadable rejects file.'+
     '<h4>Playlists</h4>Bundle lead lists and assign agents to them — this is what the pacing engine feeds from, and what Live stats reports on.'+
     '<h4>Action folders</h4>Saved lead filters for working subsets (e.g. hot states).'+
     '<h4>Custom fields</h4>Any extra CSV column rides along on the lead and can be merged into scripts.'+

@@ -1685,11 +1685,21 @@ app.post('/api/admin/campaigns/:id/leads', auth, adminOnly, async (req, res) => 
     const drafts = rows.map(r => rowToLead(r, mapping, campaignId));
     const invalidRows = [];   // { row, reason }
     const valid = [];
+    // Dialability scrub: only US geographic numbers + real toll-free make it in.
+    // Caribbean +1 codes (Trinidad's 868 etc.), Canadian codes, unassigned area
+    // codes and fake 555 exchanges all LOOK like US numbers but can never be
+    // dialed — one of them deadlocked the whole queue on 2026-08-10.
+    const TOLLFREE = new Set(['800', '833', '844', '855', '866', '877', '888']);
     for (let i = 0; i < drafts.length; i++) {
       const d = drafts[i];
       const digits = String(d.phone || '').replace(/[^\d]/g, '');
       const okLen = (digits.length === 11 && digits.startsWith('1')) || digits.length === 10;
       if (!d.phone || !okLen) { invalidRows.push({ i, raw: d._rawPhone, reason: 'invalid phone' }); continue; }
+      const ten = digits.slice(-10), ac = ten.slice(0, 3), exch = ten.slice(3, 6);
+      if (exch === '555') { invalidRows.push({ i, raw: d._rawPhone, reason: 'fake 555 number' }); continue; }
+      if (!TOLLFREE.has(ac) && !deriveFromAreaCode(ac).state) {
+        invalidRows.push({ i, raw: d._rawPhone, reason: 'non-US or unassigned area code' }); continue;
+      }
       valid.push(d);
     }
 
