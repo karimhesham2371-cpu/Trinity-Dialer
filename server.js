@@ -1581,10 +1581,11 @@ app.delete('/api/admin/campaigns/:id/agents/:agentId', auth, adminOnly, async (r
 
 // ── CSV lead import (Sprint 1) ────────────────────────────────────────────────
 // Canonical lead fields the mapper can target (everything else → custom).
-const CANON_FIELDS = ['first_name','last_name','phone','address','city','state','zip','source'];
+const CANON_FIELDS = ['first_name','last_name','phone','email','address','city','state','zip','source'];
 // Auto-suggest which CSV header maps to each canonical field.
 const HEADER_HINTS = {
   phone:      ['phone','number','phone_number','phone1','primary_phone','cell','mobile','tel'],
+  email:      ['email','e-mail','email_address','e_mail','emailaddress','owner_email','contact_email','mail'],
   first_name: ['first_name','firstname','first','fname','owner_first'],
   last_name:  ['last_name','lastname','last','lname','owner_last'],
   address:    ['address','street','property_address','addr','site_address'],
@@ -1614,6 +1615,10 @@ function rowToLead(r, mapping, campaignId) {
     if (customCols && !customCols.includes(k)) continue; // explicit custom whitelist
     if (r[k]) custom[k] = r[k];
   }
+  // The leads table has no email column — mapped emails live at custom.email,
+  // the canonical key the lead card, lead editor and AI panels already read.
+  const email = String(get('email') || r.email || r.email_address || '').trim();
+  if (email) custom.email = email;
   const ac = areaCodeOf(phone);
   const derived = deriveFromAreaCode(ac);
   return {
