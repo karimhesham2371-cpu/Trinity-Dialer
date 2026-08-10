@@ -2703,7 +2703,7 @@ app.get('/api/admin/reports/agent', auth, adminOnly, async (req, res) => {
     ]);
     const acc = {};
     const seed = (id, name, role) => acc[id] || (acc[id] = { agent_id: id, name: name || '—', role: role || 'agent',
-      logged_in: 0, talk: 0, wrap: 0, break: 0, meeting: 0, waiting: 0 });
+      logged_in: 0, total_logged_in: 0, talk: 0, wrap: 0, break: 0, meeting: 0, waiting: 0 });
     for (const u of users || []) seed(u.id, u.name, u.role);
     const names = await agentNameMap();
     for (const s of spans || []) {
@@ -2713,6 +2713,7 @@ app.get('/api/admin/reports/agent', auth, adminOnly, async (req, res) => {
       if (dur <= 0) continue;
       const a = seed(s.agent_id, names[s.agent_id]);   // covers deactivated/deleted users with history
       if (s.state === 'PRESENT') { (a._present = a._present || []).push([new Date(s.started_at).getTime(), s.ended_at ? new Date(s.ended_at).getTime() : now]); continue; }
+      if (s.state === 'SESSION') { (a._session = a._session || []).push([new Date(s.started_at).getTime(), s.ended_at ? new Date(s.ended_at).getTime() : now]); continue; }
       if (PROD_LOGGED.has(s.state)) { a.logged_in += dur; (a._worked = a._worked || []).push([new Date(s.started_at).getTime(), s.ended_at ? new Date(s.ended_at).getTime() : now]); }
       if (s.state === 'ON_CALL') a.talk += dur;
       else if (s.state === 'WRAP_UP') a.wrap += dur;
@@ -2725,11 +2726,12 @@ app.get('/api/admin/reports/agent', auth, adminOnly, async (req, res) => {
     const rows = Object.values(acc).map(a => {
       // Union worked+presence so system downtime with the agent at their desk
       // is credited into logged-in time (same policy as Productivity).
+      a.total_logged_in = unionSeconds([...(a._worked || []), ...(a._present || []), ...(a._session || [])], from, to);
       if (a._present || a._worked) {
         a.logged_in = unionSeconds([...(a._worked || []), ...(a._present || [])], from, to);
-        delete a._present; delete a._worked;
       }
-      for (const k of ['logged_in', 'talk', 'wrap', 'break', 'meeting', 'waiting']) a[k] = Math.round(a[k]);
+      delete a._present; delete a._worked; delete a._session;
+      for (const k of ['logged_in', 'total_logged_in', 'talk', 'wrap', 'break', 'meeting', 'waiting']) a[k] = Math.round(a[k]);
       return a;
     }).sort((x, y) => y.logged_in - x.logged_in || x.name.localeCompare(y.name));
     res.json({ from: new Date(from).toISOString(), to: new Date(to).toISOString(), rows });
@@ -3722,20 +3724,27 @@ app.get('/api/agent/script-preview', auth, async (req, res) => {
 // stored as PRESENT spans in agent_state_events (heartbeat-extended, never
 // left open). Hours-logged metrics take the UNION of worked time and presence,
 // and surface the platform-fault slice as downtime_credit.
-const PRESENCE = {};   // agentId -> { rowId, lastPing }
-app.post('/api/agent/presence', auth, async (req, res) => {
-  const id = req.user.id;
+// Two layers per beacon: SESSION = signed into the console at all (drives the
+// "Total logged in" report column); PRESENT = trying to work (pressed Ready /
+// in a working state) — only PRESENT credits Paid hours.
+const PRESENCE = {};   // agentId -> { sess:{rowId,lastPing}, pres:{rowId,lastPing} }
+async function touchSpan(id, state, slot) {
   const now = Date.now(), nowIso = new Date(now).toISOString();
+  const box = PRESENCE[id] || (PRESENCE[id] = {});
+  const t = box[slot];
+  if (t && t.rowId && now - t.lastPing < 2 * 60 * 1000) {
+    t.lastPing = now;
+    sbUpdate('agent_state_events', `id=eq.${t.rowId}`, { ended_at: nowIso }).catch(() => {});
+  } else {
+    const [row] = await sbInsert('agent_state_events',
+      { agent_id: id, state, started_at: nowIso, ended_at: nowIso });
+    box[slot] = { rowId: row && row.id, lastPing: now };
+  }
+}
+app.post('/api/agent/presence', auth, async (req, res) => {
   try {
-    const pr = PRESENCE[id];
-    if (pr && pr.rowId && now - pr.lastPing < 2 * 60 * 1000) {
-      pr.lastPing = now;
-      sbUpdate('agent_state_events', `id=eq.${pr.rowId}`, { ended_at: nowIso }).catch(() => {});
-    } else {
-      const [row] = await sbInsert('agent_state_events',
-        { agent_id: id, state: 'PRESENT', started_at: nowIso, ended_at: nowIso });
-      PRESENCE[id] = { rowId: row && row.id, lastPing: now };
-    }
+    await touchSpan(req.user.id, 'SESSION', 'sess');
+    if (req.body && req.body.working) await touchSpan(req.user.id, 'PRESENT', 'pres');
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

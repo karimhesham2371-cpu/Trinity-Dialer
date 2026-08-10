@@ -2048,8 +2048,8 @@ $('handBtn').onclick=async()=>{
 setInterval(()=>{
   if(!TOKEN||!USER) return;
   if(USER.role!=='agent'&&USER.role!=='closer') return;
-  if(!(typeof intendAvailable!=='undefined'&&intendAvailable) && serverState==='OFFLINE') return;
-  apiJson('/api/agent/presence','POST',{}).catch(()=>{});
+  const working=(typeof intendAvailable!=='undefined'&&intendAvailable)||serverState!=='OFFLINE';
+  apiJson('/api/agent/presence','POST',{working}).catch(()=>{});
 },45000);
 
 // ── Build-version watchdog: banner when the server has redeployed past this tab ──
@@ -3123,17 +3123,18 @@ async function loadAgentRep(){
     if(!j.rows.length){ $('repBody').innerHTML='<div class="empty">No agents or closers exist yet.</div>'; return; }
     const rolePill=(r)=> r==='closer'?'<span class="pill pill--ok" style="margin-left:8px">closer</span>':'';
     const rows=j.rows.map(r=>`<tr><td>${esc(r.name)}${rolePill(r.role)}</td>
+      <td class="mono">${fmtDur(r.total_logged_in!=null?r.total_logged_in:r.logged_in)}</td>
       <td class="mono">${fmtDur(r.logged_in)}</td><td class="mono">${fmtDur(r.talk)}</td>
       <td class="mono">${fmtDur(r.wrap)}</td><td class="mono">${fmtDur(r.break)}</td>
       <td class="mono">${fmtDur(r.meeting)}</td><td class="mono">${fmtDur(r.waiting)}</td></tr>`).join('');
-    $('repBody').innerHTML=`<div class="tblwrap"><table><thead><tr><th>Agent</th><th>Paid hours</th><th>Talk time</th><th>Wrap-up</th><th>Break</th><th>Meeting</th><th>Waiting</th></tr></thead><tbody>${rows}</tbody></table></div>
-      <p class="dim" style="font-size:11.5px;margin-top:8px"><b>Paid hours</b> = the full paid clock: talk + waiting + wrap-up + break + meeting + credited system downtime. The other columns are its breakdown, not deductions. <b>Talk time</b> = connected conversation (on-call). <b>Waiting</b> = Ready + the system dialing in the background. Every active agent and closer is listed, including those with no activity in the range.</p>`;
+    $('repBody').innerHTML=`<div class="tblwrap"><table><thead><tr><th>Agent</th><th>Total logged in</th><th>Paid hours</th><th>Talk time</th><th>Wrap-up</th><th>Break</th><th>Meeting</th><th>Waiting</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <p class="dim" style="font-size:11.5px;margin-top:8px"><b>Total logged in</b> = every minute signed into the dialer, whatever the agent was doing — the full session clock. <b>Paid hours</b> = the full paid clock: talk + waiting + wrap-up + break + meeting + credited system downtime. The other columns are the paid breakdown, not deductions. <b>Talk time</b> = connected conversation (on-call). <b>Waiting</b> = Ready + the system dialing in the background. Every active agent and closer is listed, including those with no activity in the range.</p>`;
   }catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; }
 }
 function exportAgentCsv(){
   if(!agentRepRows.length){ toast('Nothing to export','warn'); return; }
-  const head=['Agent','Role','Paid hours (s)','Talk (s)','Wrap (s)','Break (s)','Meeting (s)','Waiting (s)'];
-  const lines=[head.join(',')].concat(agentRepRows.map(r=>[csvq(r.name),r.role||'agent',r.logged_in,r.talk,r.wrap,r.break,r.meeting,r.waiting].join(',')));
+  const head=['Agent','Role','Total logged in (s)','Paid hours (s)','Talk (s)','Wrap (s)','Break (s)','Meeting (s)','Waiting (s)'];
+  const lines=[head.join(',')].concat(agentRepRows.map(r=>[csvq(r.name),r.role||'agent',r.total_logged_in!=null?r.total_logged_in:r.logged_in,r.logged_in,r.talk,r.wrap,r.break,r.meeting,r.waiting].join(',')));
   const blob=new Blob([lines.join('\n')],{type:'text/csv'}); const a=document.createElement('a');
   a.href=URL.createObjectURL(blob); a.download='agent-report.csv'; a.click(); URL.revokeObjectURL(a.href);
   toast('Agent report exported');
