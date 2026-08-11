@@ -652,7 +652,15 @@
       </div>
 
       <div class="card">
-        <p class="panelTitle">Notes</p>
+        <p class="panelTitle">Email capture <span id="emHeard" class="dim" style="font-weight:400;font-size:11px"></span></p>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          <input id="emInput" class="field" placeholder="type what you hear — domain auto-completes" style="flex:1;min-width:220px;font-family:var(--font-mono)">
+          <button id="emSave" class="btn btn-primary btn-sm">Save</button>
+        </div>
+        <div id="emDomains" style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px"></div>
+        <div id="emSpell" class="dim" style="font-size:11.5px;margin-top:6px;line-height:1.5"></div>
+
+        <p class="panelTitle" style="margin-top:18px">Notes</p>
         <textarea id="notes" class="field" placeholder="Type notes for this contact…"></textarea>
         <div class="mt2" style="display:flex;justify-content:flex-end">
           <button id="notesSave" class="btn btn-sm">Save</button>
@@ -1973,6 +1981,7 @@ function clearLead(){
   curLeadId=null; renderedLeadId=null; curLeadObj=null; inboundCall=false;
   const lr=$('leadRecs'); if(lr) lr.remove();
   const ab=$('aiBox'); if(ab) ab.remove();
+  if($('emInput')){ $('emInput').value=''; $('emHeard').textContent=''; renderEmailHelpers(); }
   const xb=$('xferBrief'); if(xb) xb.remove();
   $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
   $('scriptBody').className='empty'; $('scriptBody').textContent='No active call.';
@@ -2191,6 +2200,12 @@ function renderCaption(m){
     while(box.querySelectorAll('.cap-line').length>8) box.firstChild.remove();
   }
   box.scrollTop=box.scrollHeight;
+  // If the seller just spoke an address, surface it for one-tap capture.
+  const heard=emailFromSpeech(m.text);
+  if(heard&&m.final&&$('emHeard')){
+    $('emHeard').innerHTML='— heard <b style="color:var(--accent);cursor:pointer" title="click to use">'+esc(heard)+'</b>';
+    const b=$('emHeard').querySelector('b'); if(b) b.onclick=()=>setCapturedEmail(heard);
+  }
 }
 function clearCaptions(){ capInterimEl=null; $('capBox').classList.add('hidden'); $('capBox').innerHTML=''; }
 
@@ -2210,6 +2225,63 @@ $('cXfer').onclick=async()=>{
     catch(e){ menu.classList.add('hidden'); toast(e.message,'err'); }
   });
 };
+
+// ── Email capture ────────────────────────────────────────────────────────────
+// Sellers say addresses fast, and Americans (rightly) distrust links from an
+// unknown VoIP number — so the address must be captured by ear. These helpers
+// make that accurate: common domains are one tap, obvious mishearings are
+// repaired, and a phonetic read-back lets the agent confirm out loud.
+const EM_DOMAINS=['gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com','aol.com','comcast.net'];
+const NATO={a:'Alpha',b:'Bravo',c:'Charlie',d:'Delta',e:'Echo',f:'Foxtrot',g:'Golf',h:'Hotel',i:'India',j:'Juliet',k:'Kilo',l:'Lima',m:'Mike',n:'November',o:'Oscar',p:'Papa',q:'Quebec',r:'Romeo',s:'Sierra',t:'Tango',u:'Uniform',v:'Victor',w:'Whiskey',x:'X-ray',y:'Yankee',z:'Zulu'};
+function emailFromSpeech(t){
+  if(!t) return null;
+  let x=' '+String(t).toLowerCase()+' ';
+  x=x.replace(/\s+(at|@)\s+/g,'@').replace(/\s+dot\s+/g,'.').replace(/\s+underscore\s+/g,'_')
+     .replace(/\s+(dash|hyphen|minus)\s+/g,'-').replace(/\s+/g,' ');
+  const m=x.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/);
+  return m?m[0]:null;
+}
+function emailRepair(v){
+  if(!v) return v;
+  let e=String(v).trim().toLowerCase().replace(/\s+/g,'').replace(/\.$/,'');
+  const fix={'gmail.con':'gmail.com','gmail.co':'gmail.com','gmial.com':'gmail.com','gmai.com':'gmail.com',
+    'gmail.cm':'gmail.com','yahoo.con':'yahoo.com','yaho.com':'yahoo.com','hotmail.con':'hotmail.com',
+    'outlook.con':'outlook.com','icloud.con':'icloud.com','.comm':'.com','.cim':'.com','.con':'.com'};
+  for(const bad in fix){ if(e.endsWith(bad)) e=e.slice(0,-bad.length)+fix[bad]; }
+  return e;
+}
+function emailValid(e){ return /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(e||''); }
+function renderEmailHelpers(){
+  if(!$('emInput')) return;
+  const v=$('emInput').value.trim();
+  $('emDomains').innerHTML=EM_DOMAINS.map(d=>'<button class="btn btn-sm" data-emd="'+d+'" style="font-size:11px;height:26px;padding:0 8px">@'+d+'</button>').join('');
+  $('emDomains').querySelectorAll('[data-emd]').forEach(b=>b.onclick=()=>{
+    const cur=$('emInput').value.trim();
+    $('emInput').value=(cur.split('@')[0]||cur)+'@'+b.dataset.emd;
+    renderEmailHelpers(); $('emInput').focus();
+  });
+  const e=emailRepair(v);
+  if(!v){ $('emSpell').textContent=''; return; }
+  const local=(e.split('@')[0]||'');
+  const spell=local.split('').map(c=>/[a-z]/.test(c)?NATO[c]:(/[0-9]/.test(c)?c:(c==='.'?'dot':c==='_'?'underscore':c==='-'?'dash':c))).join(' · ');
+  $('emSpell').innerHTML=emailValid(e)
+    ? '<b style="color:var(--ok)">'+esc(e)+'</b><br><span class="faint">read back: '+esc(spell)+' … at '+esc(e.split('@')[1]||'')+'</span>'
+    : '<span style="color:var(--warn)">'+esc(e)+' — not a valid address yet</span>';
+}
+function setCapturedEmail(e){ if($('emInput')){ $('emInput').value=e; renderEmailHelpers(); } }
+$('emInput').addEventListener('input',renderEmailHelpers);
+$('emInput').addEventListener('blur',()=>{ const r=emailRepair($('emInput').value); if(r) $('emInput').value=r; renderEmailHelpers(); });
+$('emInput').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); $('emSave').click(); } });
+$('emSave').onclick=async()=>{
+  const e=emailRepair($('emInput').value);
+  if(!emailValid(e)){ toast('That address is not valid yet','warn'); return; }
+  if(!curLeadId){ toast('No active contact','warn'); return; }
+  try{ await apiJson('/api/agent/lead/'+curLeadId,'POST',{fields:{email:e}});
+    toast('Email saved: '+e,'ok');
+    if(curLeadObj){ curLeadObj.custom=curLeadObj.custom||{}; curLeadObj.custom.email=e; renderLead(curLeadObj,curCallerId); }
+  }catch(err){ toast(err.message,'err'); }
+};
+renderEmailHelpers();
 
 // Save a standalone note on the current contact (shows up in History as NOTE).
 $('notesSave').onclick=async()=>{
@@ -2627,6 +2699,7 @@ function dialerGuideHtml(role){
     '<li><b>Dialpad</b> — during a call it sends touch-tones (IVRs, extensions): click the buttons or, with the pad open, just type the digits on your keyboard. Off-call it becomes the manual dialer. Keep the pad <i>closed</i> if you want number keys to work as disposition hotkeys.</li>'+
     '<li><b>Hang up</b> — ends the live call, or cancels ringing background dials while Waiting.</li>'+
     '</ul>'+
+    '<h4>Capturing an email by ear</h4>The <b>Email capture</b> box sits under the lead card. Type only what you hear — tap a domain chip (@gmail.com, @yahoo.com…) instead of typing it, and the box repairs common mishearings (gmail.con → gmail.com). Under it appears a <b>phonetic read-back</b> (J·Oscar·Hotel·November) so you can confirm the address out loud letter by letter. With <b>Live captions</b> on, an address the contact speaks aloud ("john dot smith at gmail dot com") is detected automatically and shown next to the heading — click it to fill the box. Press Save (or Enter) and it is written to the contact.'+
     '<h4>Manual outbound calls</h4>Open the dialpad while not on a call, type the number, press <b>Call</b>. DNC numbers are refused, and if the number matches a known lead the call attaches to that lead so history and dispositions work.'+
     '<h4>Caller ID</h4><b>Agents</b> never pick a number — the dialer auto-assigns a rotating caller ID matched to the lead\'s area code, on manual dials too (ReadyMode-style). <b>Closers</b> get a Caller ID dropdown on the dialpad: pick a number, press <b>Lock it</b>, and every manual call goes out from it — across calls and even redeploys — until they press <b>Change</b>.')+
 
