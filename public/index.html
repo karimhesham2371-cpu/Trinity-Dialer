@@ -2207,6 +2207,9 @@ let capInterimEl=null;
 // eye lands on the email instead of scanning the whole transcript.
 const CAP_EM_RE=/\b(at|dot|period|underscore|dash|hyphen|plus|gmail|g mail|yahoo|hotmail|hot mail|outlook|out look|icloud|i cloud|aol|comcast|com|net|org|email|e-mail)\b|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
 function capMarkup(text){
+  // Only mark lines that are actually about an address — "at" and "com" turn up
+  // constantly in normal talk, and highlighting those is just noise.
+  if(!capHasEmail(text)) return esc(text);
   // esc() first, then mark — none of the matched tokens contain HTML specials.
   return esc(text).replace(CAP_EM_RE,m=>'<span class="cap-em">'+m+'</span>');
 }
@@ -2231,7 +2234,7 @@ function renderCaption(m){
   }
   box.scrollTop=box.scrollHeight;
   // Interim counts too — the pin should land while they are still talking.
-  scanCaptionForEmail(m.text,m.final);
+  scanCaptionForEmail(m.text,m.final,m.track);
   const heard=emailFromSpeech(m.text);
   if(heard&&m.final&&$('emHeard')){
     $('emHeard').innerHTML='— heard <b style="color:var(--accent);cursor:pointer" title="click to use">'+esc(heard)+'</b>';
@@ -2269,6 +2272,15 @@ const EM_NUMW={zero:'0',one:'1',two:'2',three:'3',four:'4',five:'5',six:'6',seve
 const EM_FILLER=new Set(['my','address','is','it','its','email','e','mail','the','and','sure','use','name',
   'ok','okay','yeah','yes','so','um','uh','you','can','me','reach','at','just','well','alright','right',
   'that','this','would','be','send','to']);
+// Hesitations are transparent — "dave, uh, at yahoo" is still dave.
+const EM_HESIT=new Set(['uh','um','uhh','umm','er','erm','ah','hmm','sorry','okay','ok']);
+// Sellers use consumer mail providers. Requiring either a known provider or an
+// explicit cue word stops ordinary talk ("check it at auction dot com") from
+// being read as an address.
+const EM_MAILDOM=new Set(['gmail.com','yahoo.com','ymail.com','hotmail.com','outlook.com','live.com',
+  'msn.com','icloud.com','me.com','mac.com','aol.com','comcast.net','protonmail.com','proton.me',
+  'att.net','verizon.net','sbcglobal.net','bellsouth.net','cox.net','charter.net','earthlink.net',
+  'gmx.com','mail.com','yandex.com','zoho.com']);
 function emailNormalize(t){
   let x=' '+String(t||'').toLowerCase().replace(/[,!?]/g,' ')+' ';
   x=x.replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine)\b/g,m=>' '+EM_NUMW[m]+' ');
@@ -2286,16 +2298,20 @@ function emailNormalize(t){
 // ("@gmail.com") so the agent only has to type the name.
 function emailCandidates(t){
   const x=emailNormalize(t), out=[];
+  const cue=/\b(e-?\s?mail|address)\b|@/i.test(String(t||''));
   const m=x.match(/([a-z0-9._%+\- ]{1,60})@([a-z0-9.-]+\.[a-z]{2,})/);
-  if(m){
+  if(m&&(cue||EM_MAILDOM.has(m[2]))){
     const toks=m[1].trim().split(/\s+/).filter(Boolean), kept=[];
-    for(let i=toks.length-1;i>=0;i--){ if(EM_FILLER.has(toks[i])) break; kept.unshift(toks[i]); }
-    const local=(kept.length?kept:toks.slice(-1)).join('');
-    if(local) out.push(local+'@'+m[2]);
+    for(let i=toks.length-1;i>=0;i--){
+      if(EM_HESIT.has(toks[i])) continue;              // skip, keep reading left
+      if(EM_FILLER.has(toks[i])) break;                // real boundary
+      kept.unshift(toks[i]);
+    }
+    if(kept.length) out.push(kept.join('')+'@'+m[2]);
   }
   if(!out.length){
     const dom=x.match(/@([a-z0-9-]+\.[a-z]{2,})/);
-    if(dom) out.push('@'+dom[1]);
+    if(dom&&(cue||EM_MAILDOM.has(dom[1]))) out.push('@'+dom[1]);
     else{ const bare=x.match(/\b(gmail|yahoo|hotmail|outlook|icloud|aol|comcast)\b[\s.]*(com|net)?/);
       if(bare) out.push('@'+bare[1]+'.'+(bare[2]||(bare[1]==='comcast'?'net':'com'))); }
   }
@@ -2339,10 +2355,19 @@ function setCapturedEmail(e){
    The transcript scrolls away faster than an agent can type, so every address
    the captions hear gets pinned above the lead card and stays there until the
    next call. Domain-only hits still help — she then types just the name. */
-let emCands=[], emAutoFilled=false;
-function clearEmailPin(){ emCands=[]; emAutoFilled=false; if($('emPin')){ $('emPin').classList.remove('on'); $('emPinAlt').innerHTML=''; $('emPinVal').textContent='—'; $('emPinSrc').textContent=''; } }
-function scanCaptionForEmail(text,final){
-  const c=emailCandidates(text); if(!c.length) return;
+let emCands=[], emAutoFilled=false, emPrev={};
+function clearEmailPin(){ emCands=[]; emAutoFilled=false; emPrev={}; if($('emPin')){ $('emPin').classList.remove('on'); $('emPinAlt').innerHTML=''; $('emPinVal').textContent='—'; $('emPinSrc').textContent=''; } }
+// Telnyx sends captions in chunks, so "my email is john dot smith" and
+// "at gmail dot com" often arrive as two messages. Stitch a chunk onto the one
+// before it — but only when the previous chunk was already about an address AND
+// this one opens like a continuation, so ordinary talk ("call me back tomorrow"
+// + "at gmail dot com") can't glue itself into a wrong address.
+const CAP_EM_CONT=/^\s*(at\b|@|dot\b|period\b|underscore\b|dash\b|gmail|g\s*mail|yahoo|hotmail|hot\s*mail|outlook|out\s*look|icloud|i\s*cloud|aol|comcast)/i;
+function scanCaptionForEmail(text,final,track){
+  const k=track||'x', prev=emPrev[k]||'';
+  const stitched=(prev&&capHasEmail(prev)&&CAP_EM_CONT.test(text))?(prev+' '+text):text;
+  if(final) emPrev[k]=text;
+  const c=emailCandidates(stitched); if(!c.length) return;
   const best=c[0];
   emCands=[best].concat(emCands.filter(x=>x!==best)).slice(0,4);
   // A full address outranks a bare domain no matter which arrived last.
