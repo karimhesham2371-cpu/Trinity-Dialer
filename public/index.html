@@ -2054,11 +2054,12 @@ setInterval(()=>{
 },45000);
 
 // ── Build-version watchdog: banner when the server has redeployed past this tab ──
-let buildV=null;
+let buildV=null, CPA_MAX=12;   // server-authoritative; refreshed by checkBuild()
 async function checkBuild(){
   try{
     const r=await fetch('/api/version'); if(!r.ok) return;
     const j=await r.json();
+    if(j.cpa_max) CPA_MAX=j.cpa_max;
     if(buildV===null){ buildV=j.v; try{ log('build '+j.v); }catch(e){} return; }
     if(j.v!==buildV) $('updateBanner').classList.remove('hidden');
   }catch(e){ /* offline blip */ }
@@ -3729,7 +3730,7 @@ async function renderPlaylists(){
         <label class="dim" style="font-size:12px;display:flex;align-items:center;gap:5px">CPA
           <select class="field" data-plcpa="${p.id}" style="padding:2px 6px;height:auto;width:auto">
             <option value=""${p.lines_per_agent==null?' selected':''}>Default</option>
-            ${[1,2,3,4,5].map(n=>`<option value="${n}"${p.lines_per_agent===n?' selected':''}>${n}</option>`).join('')}
+            ${Array.from({length:CPA_MAX},(_,i)=>i+1).map(n=>`<option value="${n}"${p.lines_per_agent===n?' selected':''}>${n}</option>`).join('')}
           </select></label>
         <span class="mono" data-plcount="${p.id}" style="margin-left:auto;color:var(--accent)"></span>
         <button class="btn btn-sm" data-togglepl="${p.id}:${p.active?0:1}">${p.active?'Pause':'Activate'}</button>
@@ -4344,7 +4345,7 @@ async function renderWindow(){
       <td><label class="row" style="gap:6px;align-items:center;margin:0"><input type="checkbox" class="cwEc"${s.end!=null?' checked':''}><input type="time" class="field cwEt" value="${m2t(s.end)}"${s.end==null?' disabled':''} style="width:110px" title="Queue Default when unchecked"></label></td>
     </tr>`).join('');
   let d={lines_per_agent:1,ring_secs:25}; try{ d=await apiJson('/api/admin/settings/dialer'); }catch(e){}
-  const lpaOpts=(sel)=>Array.from({length:5},(_,i)=>i+1).map(n=>`<option value="${n}"${n===sel?' selected':''}>${n} line${n>1?'s':''} / agent${n===1?' (power — no abandons)':''}</option>`).join('');
+  const lpaOpts=(sel)=>Array.from({length:CPA_MAX},(_,i)=>i+1).map(n=>`<option value="${n}"${n===sel?' selected':''}>${n} line${n>1?'s':''} / agent${n===1?' (power)':(n>=6?' (aggressive)':'')}</option>`).join('');
   let cp={dispositions:[],defaults:{recycle_window_days:10,neg_strike_limit:4,neg_redial_hours:24}}; try{ cp=await apiJson('/api/admin/settings/call-policy'); }catch(e){}
   const cpOpts=(cp.dispositions||[]).map((dsp,i)=>`<option value="${i}">${esc(dsp.label)} (${esc(dsp.code)})</option>`).join('');
   $('ldBody').innerHTML=`<div class="card" style="max-width:760px"><h2>Calling window (by state)</h2>
@@ -4360,7 +4361,7 @@ async function renderWindow(){
       <tbody>${stRows}</tbody></table>
     </div></div>
     <div class="card mt3" style="max-width:520px"><h2>Dialer pacing (CPA)</h2>
-    <p class="dim" style="font-size:13px"><b>Calls per agent</b> = how many lines are dialed simultaneously for each free agent. <b>1</b> = pure power dialing (one call at a time, zero abandoned calls). Higher values cut wait time between calls but drop unanswered extra legs when a human answers first — raise gradually. <b>Ring time</b> is how long a number rings before it's given up as no-answer.</p>
+    <p class="dim" style="font-size:13px"><b>Calls per agent</b> = how many lines are dialed simultaneously for each free agent. <b>1</b> = pure power dialing (one call at a time, zero abandoned calls). Higher values cut wait time between calls but drop unanswered extra legs when a human answers first — raise gradually and watch <b>Abd%</b> on Live stats. The FCC guardrail auto-clamps pacing if abandonment nears 3%, so CPA sets the ceiling, not the actual rate. <b>Ring time</b> is how long a number rings before it's given up as no-answer.</p>
     <div class="row mt3" style="gap:12px;align-items:flex-end">
       <div class="fw"><span class="lbl">Calls per agent</span><select id="dlLpa" class="field">${lpaOpts(d.lines_per_agent)}</select></div>
       <div class="fw"><span class="lbl">Ring time (sec)</span><input id="dlRing" class="field" type="number" min="10" max="60" value="${d.ring_secs}"></div>
