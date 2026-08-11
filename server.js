@@ -1199,7 +1199,10 @@ const WRAP_SHORT_SEC = 5, WRAP_LONG_SEC = 180;
 // one. When on, a talked call holds the agent in WRAP_UP with no auto-return
 // until they submit a disposition (the wrap timer starts only after they code
 // it). A 30-min safety cap frees an agent who clearly walked away.
-const REQUIRE_DISPOSITION = true;
+// Wrap-up is a fixed window, not a gate: agents are never held waiting for a
+// disposition (Karim, 2026-08-11). Kept false so the enforcement paths compile
+// and can be re-enabled if that policy ever changes.
+const REQUIRE_DISPOSITION = false;
 const DISP_WRAP_SAFETY_MS = 30 * 60 * 1000;
 const LONG_WRAP_RE = /appointment|appt|(^|[^a-z])sale([^a-z]|$)|(^|[^a-z])lead([^a-z]|$)/i;
 function wrapSecondsFor(disp) {
@@ -4381,7 +4384,12 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
       st.awaitingDisp = false;   // call is now coded — release the enforcement hold
       if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});
       st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
-      if (st.state !== 'OFFLINE' && st.conferenceId) {
+      if (st.state === 'ON_CALL') {
+        // Coded late — they are already on the next call. Never interrupt it.
+        wrapSec = 0;
+      } else if (st.state !== 'OFFLINE' && st.conferenceId) {
+        // Sale/appointment extends the 5s window to 3 minutes for the web form;
+        // every other outcome keeps the short window.
         wrapSec = wrapSecondsFor(disp);
         st.state = 'WRAP_UP';
         await setAgentState(req.user.id, 'WRAP_UP');
@@ -5880,21 +5888,17 @@ app.post('/webhooks/telnyx', async (req, res) => {
           console.log(`[bridge] inbound ended (no lead), agent ${agentId.slice(0, 8)} AVAILABLE`);
         } else if (talked) {
           st.inbound = false;   // an inbound call with a lead follows the normal wrap/disposition flow
-          // Talked to a human → WRAP_UP, keeping leadId so /context + /disposition
-          // resolve the right lead. When REQUIRE_DISPOSITION is on we do NOT start
-          // an auto-return: the agent is held (awaitingDisp) until they code the
-          // call — the wrap timer starts only after they submit. Otherwise fall
-          // back to the old 3s auto-advance.
+          // Talked to a human → WRAP_UP for exactly WRAP_SHORT_SEC, keeping
+          // leadId so /context + /disposition resolve the right lead. The agent
+          // is NEVER held: those seconds are their window to decide whether the
+          // call was a sale. Marking Sale/Appointment inside the window extends
+          // wrap to 3 minutes (handled in /api/agent/disposition); anything else
+          // returns them to Ready automatically.
           if (st.state !== 'OFFLINE') {
             st.state = 'WRAP_UP'; await setAgentState(agentId, 'WRAP_UP');
-            if (REQUIRE_DISPOSITION) {
-              clearWrapTimer(st); st.awaitingDisp = true; st.wrapEnteredAt = Date.now();
-              wsAgentSnapshot(agentId);   // push dispRequired so the client blocks Ready
-              console.log(`[bridge] call ended (talked), agent ${agentId.slice(0, 8)} WRAP_UP — awaiting disposition`);
-            } else {
-              scheduleWrapReturn(agentId, WRAP_SHORT_SEC);
-              console.log(`[bridge] call ended (talked), agent ${agentId.slice(0, 8)} WRAP_UP (${WRAP_SHORT_SEC}s)`);
-            }
+            st.awaitingDisp = false; st.wrapEnteredAt = Date.now();
+            scheduleWrapReturn(agentId, WRAP_SHORT_SEC);
+            console.log(`[bridge] call ended (talked), agent ${agentId.slice(0, 8)} WRAP_UP (${WRAP_SHORT_SEC}s window)`);
           }
         } else {
           // Never reached a human (no-answer / machine). Recycle for another

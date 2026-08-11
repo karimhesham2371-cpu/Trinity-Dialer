@@ -1237,7 +1237,9 @@ function stopTimer(){ if(timerInt){clearInterval(timerInt);timerInt=null;} $('ti
 
 // Softphone reconnect: capped exponential backoff (2s, 4s, 8s… max 30s).
 let sipRetries=0, sipReconnT=null;
+let shiftEnded=false;   // set by End of shift; blocks every auto-reconnect path
 function scheduleSipReconnect(){
+  if(shiftEnded) return;   // shift is over — never pull them back onto the floor
   if(sipReconnT) return;
   const delay=Math.min(30000, 2000*Math.pow(2, sipRetries++));
   log('softphone dropped — reconnecting in '+Math.round(delay/1000)+'s');
@@ -1247,6 +1249,7 @@ function scheduleSipReconnect(){
   sipReconnT=setTimeout(()=>{ sipReconnT=null; if(TOKEN) startAgent(); }, delay);
 }
 async function startAgent(){
+  if(shiftEnded) return;   // only Ready (which clears the flag) may restart the softphone
   if(sipReconnT){ clearTimeout(sipReconnT); sipReconnT=null; }
   if(startRetryT){ clearTimeout(startRetryT); startRetryT=null; }
   const old=client; client=null;   // detach BEFORE disconnect so its socket.close is ignored
@@ -1321,6 +1324,7 @@ async function startAgent(){
 // socket-drop reconnect). Capped so it keeps trying all shift without hammering.
 let startRetries=0, startRetryT=null;
 function scheduleStartRetry(){
+  if(shiftEnded) return;
   if(startRetryT || !TOKEN) return;
   const delay=Math.min(20000, 1500*Math.pow(2, startRetries++));
   startRetryT=setTimeout(()=>{ startRetryT=null; if(TOKEN) startAgent(); }, delay);
@@ -2055,6 +2059,7 @@ $('handBtn').onclick=async()=>{
 setInterval(()=>{
   if(!TOKEN||!USER) return;
   if(USER.role!=='agent'&&USER.role!=='closer') return;
+  if(shiftEnded) return;   // shift closed — stop crediting time
   const working=(typeof intendAvailable!=='undefined'&&intendAvailable)||serverState!=='OFFLINE';
   apiJson('/api/agent/presence','POST',{working}).catch(()=>{});
 },45000);
@@ -2278,14 +2283,20 @@ async function setAux(target){
     if(!confirm("End your shift?\n\nThis takes you off the dialer and stops the clock. You can then sign out.")) return;
     try{
       await apiJson('/api/agent/end-shift','POST',{});
-      intendAvailable=false;
-      clearAuxTimer(); applyState('OFFLINE');
-      toast('Shift ended — you can sign out now','ok');
-      log('shift ended');
+      shiftEnded=true; intendAvailable=false;
+      if(sipReconnT){ clearTimeout(sipReconnT); sipReconnT=null; }
+      if(startRetryT){ clearTimeout(startRetryT); startRetryT=null; }
+      try{ if(client){ const c=client; client=null; c.disconnect(); } }catch(e){}
+      agentCall=null;
+      clearAuxTimer(); applyState('OFFLINE'); clearLead();
+      $('agConn').className='pill pill--faint'; $('agConn').textContent='Softphone —';
+      toast('Shift ended — you are offline. You can sign out now.','ok');
+      log('shift ended — offline, no further calls');
     }catch(e){ toast(e.message,'err'); }
     return;
   }
   if(target==='READY'){
+    shiftEnded=false;   // starting a new shift
     clearAuxTimer();
     // Can't go Ready while a call is still uncoded — nudge the agent to disposition.
     if(dispRequiredNow){ toast('Disposition required — code this call first.','warn'); return; }
