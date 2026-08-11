@@ -2914,7 +2914,7 @@ function fmtTime(iso){ if(!iso) return '—'; const d=new Date(iso); const diff=
   return d.toLocaleString([], {hour12:false,month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); }
 function dstr(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
 function csvq(s){ s=String(s==null?'':s); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }
-function stateDot(s){ return {AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',CLAIMING:'info',WRAP_UP:'warn',BREAK:'warn',MEETING:'info'}[s]||'faint'; }
+function stateDot(s){ return {AVAILABLE:'ok',ON_CALL:'ok',DIALING:'info',CLAIMING:'info',RESERVED:'ok',WRAP_UP:'warn',BREAK:'warn',MEETING:'info'}[s]||'faint'; }
 
 // ── 1) Audit logs ──
 function initAudit(){
@@ -3295,7 +3295,7 @@ async function renderMap(){
     }catch(e){}
   },30000);
 }
-function stateLabel(s){ return ({AVAILABLE:'Waiting',DIALING:'Waiting',CLAIMING:'Waiting',ON_CALL:'On call',WRAP_UP:'Wrap up',BREAK:'Break',MEETING:'Meeting',CONNECTING:'Connecting',OFFLINE:'Offline'})[s]||s; }
+function stateLabel(s){ return ({AVAILABLE:'Waiting',DIALING:'Waiting',CLAIMING:'Waiting',RESERVED:'Waiting',ON_CALL:'On call',WRAP_UP:'Wrap up',BREAK:'Break',MEETING:'Meeting',CONNECTING:'Connecting',OFFLINE:'Offline'})[s]||s; }
 // The seat timer measures how long the agent has been in the state the
 // SUPERVISOR sees. Waiting spans (available/dialing/claiming) flip many times a
 // minute under the hood; collapsing them keeps the clock honest instead of
@@ -3310,6 +3310,7 @@ function seatTimerTxt(a){ if(!a||!a.labelSince||a.state==='OFFLINE') return ''; 
 function seatEl(a){ const dc=stateDot(a.state); const el=document.createElement('div');
   el.className='seat seat--'+dc; el.dataset.aid=a.id;
   el.innerHTML=`<b>${esc(a.name)}</b><div class="seatstate"><span class="dot dot--${dc}"></span><span data-st>${esc(stateLabel(a.state))}</span><span data-tm class="mono" style="margin-left:auto;font-size:10px;opacity:.7;font-variant-numeric:tabular-nums">${seatTimerTxt(a)}</span></div>`;
+  el.title=a.name+' — the clock shows time in the current state and restarts when the state changes';
   return el; }
 function drawFloor(){
   const floor=$('floor'), bench=$('bench'); floor.innerHTML=''; bench.innerHTML='';
