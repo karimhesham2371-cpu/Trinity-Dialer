@@ -3076,8 +3076,10 @@ function clCallRow(r,i){
   let rec;
   if(r.recording_url){
     rec=`<button class="btn btn-sm" onclick="listenRec(this,'${r.id}')">Listen</button> <button class="btn btn-sm" onclick="dlRec('${r.id}')">Download</button>`;
-  } else if(!r.ended_at){
+  } else if(!r.ended_at && (Date.now()-new Date(r.created_at).getTime())<15*60*1000){
     rec='<span style="color:#2563eb;font-weight:600">● Recording…</span>';
+  } else if(!r.ended_at){
+    rec='<span class="dim" title="This call never reported an end — usually an inbound leg that was not answered">Never answered</span>';
   } else if(answered){
     rec='<span class="dim" title="Recording is still being processed — refreshes automatically">Processing…</span>';
   } else {
@@ -4431,8 +4433,10 @@ function aiCallRow(r,i){
   let rec;
   if(r.recording_url){
     rec=`<button class="btn btn-sm" onclick="listenRec(this,'${r.id}')">Listen</button> <button class="btn btn-sm" onclick="dlRec('${r.id}')">Download</button>`;
-  } else if(!r.ended_at){
+  } else if(!r.ended_at && (Date.now()-new Date(r.created_at).getTime())<15*60*1000){
     rec='<span style="color:#2563eb;font-weight:600">● Recording…</span>';
+  } else if(!r.ended_at){
+    rec='<span class="dim" title="This call never reported an end — usually an inbound leg that was not answered">Never answered</span>';
   } else if(answered){
     rec='<span class="dim" title="Recording is still being processed — refreshes automatically">Processing…</span>';
   } else {

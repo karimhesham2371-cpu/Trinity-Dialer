@@ -5255,6 +5255,17 @@ app.post('/webhooks/telnyx', async (req, res) => {
   const role    = cs && cs.role;
   const agentId = (cs && cs.agentId) || findAgentByLeg(ccid);
 
+  // Universal close-out: every hangup stamps ended_at/hangup_cause on the call
+  // row, before any role-specific routing. Unbridged inbound legs (voicemail
+  // box, no-agent, rejected) previously fell through every branch and stayed
+  // open forever — 304 rows were stuck showing "Recording…" in the call log.
+  // saveCall upserts by ccid, so re-writing the same values later is harmless.
+  if (event === 'call.hangup' && ccid) {
+    saveCall({ telnyx_call_control_id: ccid,
+      ended_at: new Date().toISOString(),
+      hangup_cause: payload.hangup_cause || null }, 'call-ended-universal');
+  }
+
   // Idempotency: Telnyx redelivers webhooks. Record the event id; if we've already
   // seen it, skip processing so we never bridge/hangup twice.
   if (eventId) {
