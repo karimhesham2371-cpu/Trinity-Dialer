@@ -795,6 +795,7 @@
     </div>
     <div id="ldSearchResults" class="hidden"></div>
     <div class="navtabs" id="ldSub" style="margin-bottom:14px">
+      <button class="navtab" data-lt="campaigns" onclick="leadTab('campaigns')">Campaigns</button>
       <button class="navtab active" data-lt="import" onclick="leadTab('import')">Import</button>
       <button class="navtab" data-lt="script" onclick="leadTab('script')">Script</button>
       <button class="navtab" data-lt="playlists" onclick="leadTab('playlists')">Playlists</button>
@@ -3491,7 +3492,65 @@ function leadTab(t){
   $('ldSub').querySelectorAll('[data-lt]').forEach(b=>b.classList.toggle('active', b.dataset.lt===t));
   const body=$('ldBody'); body.innerHTML='<p class="dim">Loading…</p>';
   if(!ldCampId && ['import','script','folders','fields'].includes(t)){ body.innerHTML='<p class="dim">Create a campaign first (Console tab).</p>'; return; }
-  ({import:renderImport,script:renderScriptAdmin,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow,recycle:renderRecycle,stats:renderPlaylistStats}[t]||(()=>{}))();
+  ({campaigns:renderCampaignsFiles,import:renderImport,script:renderScriptAdmin,playlists:renderPlaylists,numbers:renderNumbers,folders:renderFolders,fields:renderFields,dnc:renderDnc,window:renderWindow,recycle:renderRecycle,stats:renderPlaylistStats}[t]||(()=>{}))();
+}
+
+// ── Campaigns tab: every campaign -> its imported files, with actions ──
+async function renderCampaignsFiles(){
+  let camps=[];
+  try{ const j=await apiJson('/api/admin/campaigns'); camps=(j.campaigns||j||[]); }
+  catch(e){ $('ldBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
+  if(!camps.length){ $('ldBody').innerHTML='<div class="empty">No campaigns yet.</div>'; return; }
+  $('ldBody').innerHTML=camps.map(c=>`<div class="card mt" data-campcard="${c.id}">
+    <div style="display:flex;align-items:center;gap:10px;cursor:pointer" data-campopen="${c.id}">
+      <h2 style="margin:0">${esc(c.name)}</h2>
+      <span class="pill pill--${c.status==='RUNNING'?'ok':'faint'}">${esc(c.status||'DRAFT')}</span>
+      <span class="pill pill--info">${esc(c.pacing_mode||'power')}</span>
+      <span class="dim" style="margin-left:auto;font-size:12px">click to view files ▾</span>
+    </div>
+    <div class="hidden mt3" data-campfiles="${c.id}"><p class="dim">Loading…</p></div>
+  </div>`).join('');
+  $('ldBody').querySelectorAll('[data-campopen]').forEach(h=>h.onclick=()=>{
+    const id=h.dataset.campopen, box=$('ldBody').querySelector(`[data-campfiles="${id}"]`);
+    box.classList.toggle('hidden');
+    if(!box.classList.contains('hidden')) loadCampaignFiles(id, box);
+  });
+}
+async function loadCampaignFiles(campId, box){
+  let j; try{ j=await apiJson('/api/admin/campaigns/'+campId+'/batches'); }
+  catch(e){ box.innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
+  if(!j.batches.length){ box.innerHTML='<div class="empty">No files imported into this campaign yet.</div>'; return; }
+  box.innerHTML=`<div class="tblwrap"><table><thead><tr>
+    <th>File</th><th>Imported</th><th style="text-align:right">Rows in</th><th style="text-align:right">Remaining</th><th style="text-align:right">Dialable</th><th>Status</th><th style="text-align:right">Actions</th>
+    </tr></thead><tbody>${j.batches.map(b=>{
+      const paused=b.paused>0&&b.dialable===0;
+      return `<tr>
+      <td>${esc(b.filename||'(unnamed)')}</td>
+      <td class="dim" style="font-size:12px">${new Date(b.created_at).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false})}</td>
+      <td class="mono" style="text-align:right">${b.inserted}</td>
+      <td class="mono" style="text-align:right">${b.remaining}</td>
+      <td class="mono" style="text-align:right">${b.dialable}</td>
+      <td>${paused?'<span class="pill pill--warn">paused</span>':'<span class="pill pill--ok">active</span>'}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="btn btn-sm" data-bdl="${b.id}" title="Download the imported contacts">⬇ Contacts</button>
+        <button class="btn btn-sm" data-bres="${b.id}" title="Download contacts + dialing results">⬇ Results</button>
+        <button class="btn btn-sm ${paused?'':'btn-warn'}" data-bpause="${b.id}" data-on="${paused?'0':'1'}">${paused?'Activate':'Pause'}</button>
+        <button class="btn btn-sm btn-danger" data-bdel="${b.id}">Delete</button>
+      </td></tr>`;}).join('')}</tbody></table></div>
+    <p class="dim" style="font-size:11.5px;margin-top:8px">Pause removes this file from the dial queue (reversible). Delete permanently removes leads that were never dialed; leads with call history are kept for reporting.</p>`;
+  box.querySelectorAll('[data-bdl]').forEach(x=>x.onclick=()=>window.open('/api/admin/batches/'+x.dataset.bdl+'/export?kind=contacts&token='+encodeURIComponent(TOKEN)));
+  box.querySelectorAll('[data-bres]').forEach(x=>x.onclick=()=>window.open('/api/admin/batches/'+x.dataset.bres+'/export?kind=results&token='+encodeURIComponent(TOKEN)));
+  box.querySelectorAll('[data-bpause]').forEach(x=>x.onclick=async()=>{
+    try{ await apiJson('/api/admin/batches/'+x.dataset.bpause+'/deactivate','POST',{on:x.dataset.on==='1'});
+      toast(x.dataset.on==='1'?'File paused — its leads left the dial queue':'File reactivated'); loadCampaignFiles(campId, box); }
+    catch(e){ toast(e.message,'err'); }
+  });
+  box.querySelectorAll('[data-bdel]').forEach(x=>x.onclick=async()=>{
+    if(!confirm("Delete the leads from this file?"+"\n\n"+"Leads never dialed are permanently removed. Leads with call history are kept for reporting.")) return;
+    try{ const r=await apiJson('/api/admin/batches/'+x.dataset.bdel,'DELETE');
+      toast('Deleted '+r.deleted+' leads'+(r.kept_with_history?' — '+r.kept_with_history+' kept (have call history)':'')); loadCampaignFiles(campId, box); }
+    catch(e){ toast(e.message,'err'); }
+  });
 }
 
 // ── Global lead search ──

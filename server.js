@@ -3280,6 +3280,83 @@ app.get('/api/agent/market-value', auth, async (req, res) => {
   }
 });
 
+// ── Campaign file management: per-batch view, export, pause, delete ──────────
+// Every CSV upload is an import_batches row and its leads carry import_batch_id.
+app.get('/api/admin/campaigns/:id/batches', auth, adminOnly, async (req, res) => {
+  try {
+    const [batches, leads] = await Promise.all([
+      sbSelect('import_batches', `campaign_id=eq.${req.params.id}&select=*&order=created_at.desc`),
+      sbSelectAll('leads', `campaign_id=eq.${req.params.id}&select=import_batch_id,status`),
+    ]);
+    const agg = {};
+    for (const l of leads || []) {
+      const k = l.import_batch_id || 'none';
+      const a = agg[k] || (agg[k] = { remaining: 0, dialable: 0, paused: 0, done: 0, bad: 0 });
+      a.remaining++;
+      if (l.status === 'NEW' || l.status === 'CALLBACK') a.dialable++;
+      else if (l.status === 'PAUSED') a.paused++;
+      else if (l.status === 'DONE' || l.status === 'CONTACTED') a.done++;
+      else if (l.status === 'BAD_NUMBER') a.bad++;
+    }
+    res.json({ batches: (batches || []).map(b => ({ ...b, ...(agg[b.id] || { remaining: 0, dialable: 0, paused: 0, done: 0, bad: 0 }) })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// CSV export of one batch: kind=contacts (the imported data, normalized) or
+// kind=results (contact + dialing outcome per lead). Browser-friendly via ?token.
+app.get('/api/admin/batches/:bid/export', auth, adminOnly, async (req, res) => {
+  const kind = req.query.kind === 'results' ? 'results' : 'contacts';
+  try {
+    const rows = await sbSelectAll('leads', `import_batch_id=eq.${req.params.bid}&select=*&order=created_at.asc`);
+    const customKeys = [...new Set(rows.flatMap(l => Object.keys(l.custom || {})))].filter(k => k !== 'ai' && k !== 'deal').sort();
+    const base = ['first_name', 'last_name', 'phone', 'address', 'city', 'state', 'zip', 'source'];
+    const head = kind === 'contacts'
+      ? [...base, ...customKeys]
+      : [...base, 'status', 'last_outcome', 'attempts', 'last_attempt_at', 'next_callback_at', ...customKeys];
+    const line = (l) => {
+      const vals = base.map(k => l[k]);
+      if (kind === 'results') vals.push(l.status, l.last_outcome, l.attempts, l.last_attempt_at, l.next_callback_at);
+      vals.push(...customKeys.map(k => (l.custom || {})[k]));
+      return vals.map(csvCell).join(',');
+    };
+    const csv = head.join(',') + '\n' + rows.map(line).join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="batch_${kind}_${req.params.bid.slice(0, 8)}.csv"`);
+    audit(req.user, 'BATCH_EXPORT', { target_type: 'batch', target_id: req.params.bid, meta: { kind, rows: rows.length } });
+    res.send(csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Pause / reactivate a batch: paused leads leave the dial queue (status PAUSED);
+// reactivation restores CALLBACK for leads holding a callback time, else NEW.
+app.post('/api/admin/batches/:bid/deactivate', auth, adminOnly, async (req, res) => {
+  const on = !!(req.body && req.body.on);
+  try {
+    if (on) {
+      await sbUpdate('leads', `import_batch_id=eq.${req.params.bid}&status=in.(NEW,CALLBACK)`, { status: 'PAUSED' });
+    } else {
+      await sbUpdate('leads', `import_batch_id=eq.${req.params.bid}&status=eq.PAUSED&next_callback_at=not.is.null`, { status: 'CALLBACK' });
+      await sbUpdate('leads', `import_batch_id=eq.${req.params.bid}&status=eq.PAUSED`, { status: 'NEW' });
+    }
+    audit(req.user, on ? 'BATCH_PAUSE' : 'BATCH_ACTIVATE', { target_type: 'batch', target_id: req.params.bid });
+    res.json({ ok: true, paused: on });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete a batch: removes its never-worked leads (no attempts); leads with call
+// history are kept for reporting integrity and the batch row survives with them.
+app.delete('/api/admin/batches/:bid', auth, adminOnly, async (req, res) => {
+  try {
+    const before = await sbSelectAll('leads', `import_batch_id=eq.${req.params.bid}&select=id,attempts`);
+    const keep = (before || []).filter(l => (l.attempts || 0) > 0).length;
+    await sbDelete('leads', `import_batch_id=eq.${req.params.bid}&or=(attempts.is.null,attempts.eq.0)`);
+    if (!keep) await sbDelete('import_batches', `id=eq.${req.params.bid}`).catch(() => {});
+    audit(req.user, 'BATCH_DELETE', { target_type: 'batch', target_id: req.params.bid,
+      meta: { deleted: (before || []).length - keep, kept_with_history: keep } });
+    res.json({ ok: true, deleted: (before || []).length - keep, kept_with_history: keep });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Coaching admin: daily goals + rebuttal cheat-sheets ──────────────────────
 app.get('/api/admin/coaching', auth, adminOnly, (_req, res) => {
   res.json({ goals: AGENT_GOALS, rebuttals: REBUTTALS });
