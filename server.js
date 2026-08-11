@@ -654,6 +654,21 @@ function amdEvent(row) { sbReq('POST', 'amd_events', row, 'return=minimal').catc
 // days). Recomputed lazily from the calls table and cached; pacing reads it to
 // throttle the dial ratio before the cap is hit.
 const AMD_ABANDON_CAP = 0.03, AMD_ABANDON_THROTTLE = 0.025;
+// Abandon-rate guardrail — OPERATOR CONTROLLED (Karim, 2026-08-11).
+// enabled:false lets the configured CPA run unclamped; the rate is still
+// measured, displayed and logged either way, because that record is what
+// demonstrates compliance (or explains a complaint) after the fact.
+let GUARDRAIL = { enabled: true, soft_threshold: AMD_ABANDON_THROTTLE };
+async function loadGuardrail() {
+  try {
+    const rows = await sbSelect('app_settings', 'key=eq.abandon_guardrail&select=value');
+    const v = rows && rows[0] && rows[0].value;
+    if (v) GUARDRAIL = {
+      enabled: v.enabled !== false,
+      soft_threshold: Math.max(0.001, Math.min(1, Number(v.soft_threshold) || AMD_ABANDON_THROTTLE)),
+    };
+  } catch (e) { console.error('[guardrail:load]', e.message); }
+}
 const _abandonCache = new Map();   // campaignId -> { at, rate }
 const ABANDON_TTL_MS = 5 * 60 * 1000;
 async function campaignAbandonRate(campaignId) {
@@ -2416,6 +2431,25 @@ app.put('/api/admin/settings/call-policy', auth, adminOnly, async (req, res) => 
 // Call-result recycling — the global no-answer/busy/voicemail redial rounds +
 // positive-result DNC days (ReadyMode-style "Edit call results" for the system
 // outcomes). One setting for all campaigns.
+app.get('/api/admin/settings/guardrail', auth, adminOnly, (_req, res) => {
+  res.json({ ...GUARDRAIL, fcc_reference: 0.03 });
+});
+app.put('/api/admin/settings/guardrail', auth, adminOnly, async (req, res) => {
+  const b = req.body || {};
+  const value = {
+    enabled: b.enabled !== false,
+    soft_threshold: Math.max(0.001, Math.min(1, Number(b.soft_threshold) || AMD_ABANDON_THROTTLE)),
+  };
+  try {
+    await sbReq('POST', 'app_settings?on_conflict=key',
+      { key: 'abandon_guardrail', value, updated_at: new Date().toISOString() },
+      'resolution=merge-duplicates,return=minimal');
+    GUARDRAIL = value;
+    audit(req.user, 'EDIT_GUARDRAIL', { target_type: 'settings', meta: value });
+    console.warn(`[guardrail] ${value.enabled ? 'ENABLED' : 'DISABLED'} by ${req.user.name} (threshold ${(value.soft_threshold * 100).toFixed(1)}%)`);
+    res.json({ ok: true, ...value });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/admin/settings/recycle', auth, adminOnly, (_req, res) => {
   res.json({ recycle: RECYCLE, defaults: RECYCLE_DEFAULT });
 });
@@ -3050,6 +3084,7 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
         live: !!(pl && pl.active !== false && runningByPl[k] && onlineByPl[k]),
         agents_online: onlineByPl[k] || 0,
         mode: modeByPl[k] || 'power',
+        guardrail: GUARDRAIL.enabled,
         ratio: ratioByPl[k] || null,   // predictive: lines/agent actually in force right now
         cpa: cpaOf(pl), calls: s.calls, ans: s.ans, md: s.md, drop: s.drop,
         abd_pct: s.ans > 0 ? Math.round((s.drop / s.ans) * 1000) / 10 : 0,
@@ -4586,7 +4621,7 @@ async function pacingTick() {
       // agent and can never abandon a live answer. Rate is cached (5-min TTL).
       if (cpa > 1) {
         const arate = await campaignAbandonRate(first.lead.campaign_id).catch(() => 0);
-        if (arate >= AMD_ABANDON_THROTTLE) {
+        if (GUARDRAIL.enabled && arate >= GUARDRAIL.soft_threshold) {
           cpa = 1;
           console.log(`[pacing] campaign ${String(first.lead.campaign_id).slice(0, 8)} abandoned=${(arate * 100).toFixed(2)}% >= throttle — CPA clamped to 1`);
         }
@@ -4917,9 +4952,14 @@ async function adjustDialRatio(campaignId, acfg, ctx) {
   let reason = 'playlist-cpa';
   const abandon = await campaignAbandonRate(campaignId).catch(() => 0);
   const human = _humanRate.has(campaignId) ? _humanRate.get(campaignId) : 0.3;
-  if (abandon >= acfg.abandonSoft && ratio > 1) {
+  const softLimit = GUARDRAIL.soft_threshold;
+  if (GUARDRAIL.enabled && abandon >= softLimit && ratio > 1) {
     ratio = 1; reason = 'abandon-clamp';
-    console.warn(`[engine] ALERT campaign ${String(campaignId).slice(0, 8)} abandon=${(abandon * 100).toFixed(2)}% >= soft ${(acfg.abandonSoft * 100).toFixed(2)}% — CPA clamped to 1 (FCC guardrail)`);
+    console.warn(`[engine] ALERT campaign ${String(campaignId).slice(0, 8)} abandon=${(abandon * 100).toFixed(2)}% >= soft ${(softLimit * 100).toFixed(2)}% — CPA clamped to 1 (guardrail ON)`);
+  } else if (!GUARDRAIL.enabled && abandon >= softLimit) {
+    // Guardrail off: never silently clamp, but keep the warning in the record.
+    reason = 'guardrail-off-over-threshold';
+    console.warn(`[engine] campaign ${String(campaignId).slice(0, 8)} abandon=${(abandon * 100).toFixed(2)}% >= ${(softLimit * 100).toFixed(2)}% — guardrail DISABLED by operator, running CPA ${ratio}`);
   }
   if (ratio !== acfg.dialRatio) {
     acfg.dialRatio = ratio;   // update the cached cfg so the change applies this tick
@@ -6038,6 +6078,7 @@ server.listen(PORT, async () => {
   setInterval(refreshCampPlaylistMap, 30 * 1000);
   await loadCallPolicy();
   await loadRecycle();   // after call-policy: owns positive_dnc_days
+  await loadGuardrail();
   await loadAiConfig();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
   {
@@ -6060,6 +6101,7 @@ server.listen(PORT, async () => {
   setInterval(savePlaylistStats, 15 * 1000);   // durable Live stats — survive redeploys
   setInterval(loadCallPolicy, 60 * 1000);
   setInterval(loadRecycle, 60 * 1000);
+  setInterval(loadGuardrail, 60 * 1000);
   setInterval(loadAiConfig, 60 * 1000);
   sweepExpiredDnc();
   setInterval(sweepExpiredDnc, 10 * 60 * 1000);   // auto-remove expired (e.g. 90-day) DNC entries

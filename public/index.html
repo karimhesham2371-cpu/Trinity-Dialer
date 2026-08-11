@@ -4371,6 +4371,15 @@ async function renderWindow(){
       <table id="cwTable" class="wbtbl"><thead><tr><th>State / Region</th><th>TZ</th><th>Enabled</th><th>Start</th><th>End</th></tr></thead>
       <tbody>${stRows}</tbody></table>
     </div></div>
+    <div class="card mt3" style="max-width:520px"><h2>Abandon-rate guardrail</h2>
+    <p class="dim" style="font-size:13px">When ON, the dialer automatically drops pacing to 1 line/agent if a campaign's 30-day abandoned-call rate reaches your threshold. When OFF, your <b>CPA runs exactly as set</b> — the rate is still measured and shown on Live stats, but nothing throttles you. The US telemarketing rule caps abandoned calls at <b>3%</b> of answered calls; running above it is your decision as the caller of record.</p>
+    <div class="row mt3" style="gap:12px;align-items:flex-end">
+      <div class="fw"><span class="lbl">Guardrail</span><select id="gdOn" class="field">
+        <option value="1">On — auto-clamp pacing</option>
+        <option value="0">Off — my CPA always runs</option></select></div>
+      <div class="fw"><span class="lbl">Clamp at (%)</span><input id="gdPct" class="field" type="number" min="0.1" max="100" step="0.1" style="width:110px"></div>
+      <button class="btn btn-primary" id="gdSave" style="flex:0 0 auto">Save</button>
+    </div><div id="gdMsg" class="dim mt3" style="font-size:12px"></div></div>
     <div class="card mt3" style="max-width:520px"><h2>Ring time</h2>
     <p class="dim" style="font-size:13px">How long a number rings before it's given up as no-answer. <b>Calls per agent (CPA) now lives on each playlist</b> — Leads → Playlists — so pacing is set per list, in one place.</p>
     <div class="row mt3" style="gap:12px;align-items:flex-end">
@@ -4397,6 +4406,22 @@ async function renderWindow(){
     try{ const j=await apiJson('/api/admin/settings/calling-window','PUT',payload);
       $('cwMsg').innerHTML=`<b style="color:var(--ok)">Saved — default ${m2t(j.default.start)}–${m2t(j.default.end)} lead-local, per-state windows applied</b>`; }
     catch(e){ $('cwMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  };
+  (async()=>{
+    try{ const g=await apiJson('/api/admin/settings/guardrail');
+      $('gdOn').value=g.enabled?'1':'0'; $('gdPct').value=(g.soft_threshold*100).toFixed(1);
+      syncCsel($('gdOn'));
+      if(!g.enabled) $('gdMsg').innerHTML='<b style="color:var(--warn)">Guardrail is OFF — pacing runs at your configured CPA. Watch Abd% on Live stats.</b>';
+    }catch(e){}
+  })();
+  $('gdSave').onclick=async()=>{
+    const on=$('gdOn').value==='1';
+    if(!on&&!confirm("Turn the abandon-rate guardrail OFF?"+"\n\n"+"Your CPA will run unclamped. Abandoned calls above 3% of answered calls breach the US telemarketing rule — you remain the caller of record.")) return;
+    try{ const j=await apiJson('/api/admin/settings/guardrail','PUT',{enabled:on,soft_threshold:(+$('gdPct').value||2.5)/100});
+      $('gdMsg').innerHTML=j.enabled
+        ? `<b style="color:var(--ok)">Guardrail ON — pacing clamps at ${( j.soft_threshold*100).toFixed(1)}% abandoned</b>`
+        : '<b style="color:var(--warn)">Guardrail OFF — your CPA always runs. Abd% is still tracked on Live stats.</b>'; }
+    catch(e){ $('gdMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
   $('dlSave').onclick=async()=>{
     try{ const j=await apiJson('/api/admin/settings/dialer','PUT',{ring_secs:+$('dlRing').value});
@@ -4503,6 +4528,7 @@ async function renderPlaylistStats(){
       <td style="text-align:right">${r.drop}</td>
       <td style="text-align:right;color:${abdColor(r.abd_pct)};font-weight:600">${r.abd_pct.toFixed(1)}%</td>
       <td style="text-align:right">${r.dial?`<b>${r.dial}</b>`:'0'}</td></tr>`).join('');
+    const gdOff=rows.some(r=>r.guardrail===false);
     const t=j.totals||{};
     const totRow=`<tr style="border-top:2px solid var(--border-strong);font-weight:700">
       <td>Total</td><td></td>
@@ -4512,7 +4538,7 @@ async function renderPlaylistStats(){
       <td style="text-align:right">${t.drop||0}</td>
       <td style="text-align:right;color:${abdColor(t.abd_pct||0)}">${(t.abd_pct||0).toFixed(1)}%</td>
       <td style="text-align:right">${t.dial||0}</td></tr>`;
-    root.innerHTML=`<table class="wbtbl"><thead><tr>
+    root.innerHTML=(gdOff?`<div class="dim" style="font-size:12px;margin-bottom:8px;color:var(--warn)">⚠ Abandon guardrail is OFF — pacing is not auto-clamped. Watch Abd% below (US rule: 3% of answered calls).</div>`:'')+`<table class="wbtbl"><thead><tr>
       <th>Playlist</th><th style="text-align:right">CPA</th><th style="text-align:right">Calls</th>
       <th style="text-align:right">Ans</th><th style="text-align:right">MD</th><th style="text-align:right">Drop</th>
       <th style="text-align:right">Abd%</th><th style="text-align:right">Dial</th></tr></thead>
