@@ -1170,6 +1170,7 @@ const STATE_UI = {
 };
 function applyState(s, snap){
   const prev=serverState; serverState=s;
+  if(pendingReload && s!=='ON_CALL') setTimeout(maybeAutoReload, 500);   // safe moment reached
   document.body.setAttribute('data-agstate', s);   // drives the state-colored theme
   syncRemoteMute();
   if(s!=='OFFLINE'){ const kb=$('kickBanner'); if(kb) kb.classList.add('hidden'); }
@@ -2056,17 +2057,33 @@ setInterval(()=>{
 
 // ── Build-version watchdog: banner when the server has redeployed past this tab ──
 let buildV=null, CPA_MAX=12;   // server-authoritative; refreshed by checkBuild()
+let pendingReload=false;
 async function checkBuild(){
   try{
     const r=await fetch('/api/version'); if(!r.ok) return;
     const j=await r.json();
     if(j.cpa_max) CPA_MAX=j.cpa_max;
     if(buildV===null){ buildV=j.v; try{ log('build '+j.v); }catch(e){} return; }
-    if(j.v!==buildV) $('updateBanner').classList.remove('hidden');
+    if(j.v===buildV || pendingReload) return;
+    // A stale tab silently runs old code — that has caused several "it's still
+    // broken" reports. Update automatically instead of trusting a refresh:
+    // never mid-call, never mid-typing.
+    pendingReload=true;
+    $('updateBanner').classList.remove('hidden');
+    maybeAutoReload();
   }catch(e){ /* offline blip */ }
 }
+function maybeAutoReload(){
+  if(!pendingReload) return;
+  const onCall = serverState==='ON_CALL';
+  const typing = ['INPUT','TEXTAREA'].includes((document.activeElement||{}).tagName)
+                 && (document.activeElement.value||'').trim().length>0;
+  if(onCall||typing){ setTimeout(maybeAutoReload, 5000); return; }   // wait for a safe moment
+  $('updateBanner').textContent='⬆ Updating to the latest version…';
+  setTimeout(()=>location.reload(), 1200);
+}
 $('updateBanner').onclick=()=>location.reload();
-checkBuild(); setInterval(checkBuild, 4*60*1000);
+checkBuild(); setInterval(checkBuild, 60*1000);
 
 // ── Team chat (all roles; agents get WS-instant, everyone polls as fallback) ──
 const CHAT_ROLE_COLORS={admin:'var(--accent)',support:'var(--info)',closer:'var(--ok)',agent:'var(--text-dim)'};
@@ -3244,8 +3261,11 @@ async function renderMap(){
   window._floorSnapT=setInterval(async()=>{
     if(!$('floor')){ clearInterval(window._floorSnapT); window._floorSnapT=null; return; }
     try{ const j=await apiJson('/api/admin/floor');
-      j.agents.forEach(a=>{ const cur=floorAgents.find(x=>x.id===a.id);
-        if(cur&&cur.state!==a.state) applyFloorState(cur,a.state,a.stateSince); });
+      j.agents.forEach(a=>{ const cur=floorAgents.find(x=>x.id===a.id); if(!cur) return;
+        if(cur.state!==a.state) applyFloorState(cur,a.state,a.stateSince);
+        // Same state: trust the server's clock so a dropped push can never
+        // leave a seat stuck at 00:00 (or drifting).
+        else if(a.stateSince && stateLabel(a.state)===stateLabel(cur.state) && !cur._labelHeld) cur.labelSince=Math.min(cur.labelSince||a.stateSince, a.stateSince); });
     }catch(e){}
   },30000);
 }
