@@ -1420,6 +1420,7 @@ app.get('/health', (_req, res) => {
     ok: true, service: 'trinity-dialer', phase: 'phase0',
     telnyx_key: !!TELNYX_KEY, connection_id: !!CONNECTION_ID, supabase: !!(SB_HOST && SB_KEY),
     caller_pool: CALLER_POOL.length, agents_online: Object.keys(rt).length,
+    balance: BALANCE.amount, balance_currency: BALANCE.currency,
     pacer: { busy: pacingBusy, busy_for_sec: pacingBusy ? Math.round((Date.now() - pacingBusyAt) / 1000) : 0,
       last_tick_ago_sec: PACER_LAST_TICK ? Math.round((Date.now() - PACER_LAST_TICK) / 1000) : null },
     pacer_debug: PACER_DEBUG,
@@ -3875,6 +3876,28 @@ app.get('/api/agent/script-preview', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Carrier balance watch ────────────────────────────────────────────────────
+// A negative/zero Telnyx balance stops ALL calls — including the leg that puts
+// an agent's softphone online — so it presents as "everyone is offline". That
+// cost real diagnostic time twice on 2026-08-11; now it is surfaced loudly.
+let BALANCE = { amount: null, currency: 'USD', at: 0, error: null };
+async function refreshBalance() {
+  if (!TELNYX_KEY) return;
+  try {
+    const j = await telnyx('GET', '/balance');
+    const d = (j && j.data) || {};
+    BALANCE = { amount: Number(d.balance), currency: d.currency || 'USD', at: Date.now(), error: null };
+    if (BALANCE.amount <= 0) console.error(`[balance] CRITICAL: ${BALANCE.amount} ${BALANCE.currency} — calls WILL fail (agents cannot go online)`);
+    else if (BALANCE.amount < 25) console.warn(`[balance] LOW: ${BALANCE.amount} ${BALANCE.currency}`);
+  } catch (e) { BALANCE = { ...BALANCE, error: e.message, at: Date.now() }; }
+}
+app.get('/api/admin/balance', auth, adminOnly, async (_req, res) => {
+  if (Date.now() - BALANCE.at > 60 * 1000) await refreshBalance();
+  const amount = BALANCE.amount;
+  res.json({ ...BALANCE,
+    level: amount == null ? 'unknown' : amount <= 0 ? 'critical' : amount < 25 ? 'low' : 'ok' });
+});
+
 // ── Presence heartbeat: credit ready-but-disconnected time ───────────────────
 // Policy (Karim, 2026-08-10): an agent at their desk trying to work must not
 // lose paid hours to OUR faults (carrier blocks, deploys, softphone drops).
@@ -6115,6 +6138,7 @@ server.listen(PORT, async () => {
   await loadCallPolicy();
   await loadRecycle();   // after call-policy: owns positive_dnc_days
   await loadGuardrail();
+  refreshBalance();
   await loadAiConfig();
   console.log(`[boot] caller pool: ${CALLER_POOL.join(', ') || '(none)'}`);
   {
@@ -6138,6 +6162,7 @@ server.listen(PORT, async () => {
   setInterval(loadCallPolicy, 60 * 1000);
   setInterval(loadRecycle, 60 * 1000);
   setInterval(loadGuardrail, 60 * 1000);
+  setInterval(refreshBalance, 5 * 60 * 1000);
   setInterval(loadAiConfig, 60 * 1000);
   sweepExpiredDnc();
   setInterval(sweepExpiredDnc, 10 * 60 * 1000);   // auto-remove expired (e.g. 90-day) DNC entries

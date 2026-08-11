@@ -862,6 +862,7 @@
 </div>
 
 <audio id="remoteAudio" autoplay muted></audio>
+<div id="balBanner" class="hidden" style="position:fixed;top:0;left:0;right:0;z-index:240;background:var(--danger);color:#fff;font:600 13px var(--font-ui);padding:9px 18px;text-align:center"></div>
 <div id="updateBanner" class="hidden" title="Click to load the new version">
   ⬆ A new version is available — click here to update (finish your current call first)
 </div>
@@ -1239,7 +1240,9 @@ function scheduleSipReconnect(){
   if(sipReconnT) return;
   const delay=Math.min(30000, 2000*Math.pow(2, sipRetries++));
   log('softphone dropped — reconnecting in '+Math.round(delay/1000)+'s');
-  toast('Softphone disconnected — reconnecting…','warn');
+  toast(sipRetries>=3
+    ? 'Softphone can’t connect after several tries — tell your supervisor (often carrier balance or network).'
+    : 'Softphone disconnected — reconnecting…','warn');
   sipReconnT=setTimeout(()=>{ sipReconnT=null; if(TOKEN) startAgent(); }, delay);
 }
 async function startAgent(){
@@ -2057,6 +2060,25 @@ setInterval(()=>{
 
 // ── Build-version watchdog: banner when the server has redeployed past this tab ──
 let buildV=null, CPA_MAX=12;   // server-authoritative; refreshed by checkBuild()
+// Carrier balance watch: a zero/negative balance stops every call — including
+// the one that brings an agent's softphone online — so it must never be a
+// silent condition for whoever runs the floor.
+async function checkBalance(){
+  if(!TOKEN||!USER||!['admin','support'].includes(USER.role)) return;
+  try{
+    const b=await apiJson('/api/admin/balance');
+    const el=$('balBanner');
+    if(b.level==='critical'){
+      el.textContent='⚠ Telnyx balance is '+b.amount+' '+b.currency+' — calls cannot be placed and agents cannot go online. Top up now.';
+      el.style.background='var(--danger)'; el.classList.remove('hidden');
+    } else if(b.level==='low'){
+      el.textContent='Telnyx balance is low: '+b.amount+' '+b.currency+' — top up to avoid the floor stopping mid-shift.';
+      el.style.background='var(--warn)'; el.style.color='var(--accent-ink)'; el.classList.remove('hidden');
+    } else el.classList.add('hidden');
+  }catch(e){}
+}
+setInterval(checkBalance, 5*60*1000);
+
 let pendingReload=false;
 async function checkBuild(){
   try{
@@ -2312,6 +2334,7 @@ async function refreshMe(){
 }
 async function loadAdmin(){
   await refreshMe();
+  checkBalance();
   if(!meRefreshT) meRefreshT=setInterval(()=>{ if(TOKEN&&USER&&$('viewAdmin')&&!$('viewAdmin').classList.contains('hidden')) refreshMe(); },60000);
   applyNavAccess();
   if(USER && USER.role==='admin'){ await loadUsers(); adminTab('console'); return; }
