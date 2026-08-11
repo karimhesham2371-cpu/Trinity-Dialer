@@ -272,13 +272,15 @@ function plStat(pid) {
 // in several active playlists attributes to the highest-priority one; a campaign
 // in no playlist falls back to the legacy 'c:<id>' key. Refreshed every 30s.
 let CAMP_PLAYLIST = {};
+let PLAYLIST_CPA = {};    // playlistId -> explicit lines_per_agent (null = inherit)
 async function refreshCampPlaylistMap() {
   if (!SB_HOST) return;
   try {
     const [pls, pcs] = await Promise.all([
-      sbSelect('playlists', 'active=eq.true&select=id,priority'),
+      sbSelect('playlists', 'active=eq.true&select=id,priority,lines_per_agent'),
       sbSelect('playlist_campaigns', 'select=playlist_id,campaign_id'),
     ]);
+    PLAYLIST_CPA = Object.fromEntries((pls || []).map(p => [p.id, p.lines_per_agent]));
     const prio = new Map((pls || []).map(p => [p.id, p.priority != null ? p.priority : 0]));
     const m = {};
     for (const { playlist_id, campaign_id } of pcs || []) {
@@ -289,6 +291,15 @@ async function refreshCampPlaylistMap() {
   } catch (e) { console.error('[campPlaylist]', e.message); }
 }
 const plKeyForCampaign = (cid) => CAMP_PLAYLIST[cid] || ('c:' + cid);
+// The CPA an admin set on the playlist that owns this campaign, if any. This is
+// the ONE knob for lines-per-agent: the power pacer already honoured it, and the
+// predictive engine now uses it as its ratio ceiling too (fixed 2026-08-11 —
+// previously predictive silently ignored it and used dial_ratio_max).
+function playlistCpaForCampaign(cid) {
+  const pid = CAMP_PLAYLIST[cid];
+  const n = pid ? PLAYLIST_CPA[pid] : null;
+  return (n >= 1 && n <= CPA_MAX) ? n : null;
+}
 // Persist the wallboard counters (app_settings key 'playlist_stats') so a Render
 // redeploy doesn't zero the Live stats mid-shift. Saved every 15s when changed.
 let _plStatsSaved = '';
@@ -2971,10 +2982,16 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
     // Per-playlist liveness: any RUNNING campaign attached + any assigned agent
     // whose softphone is connected right now. A live playlist ALWAYS gets a row,
     // zeros and all — it disappears when it's paused or its agents sign off.
-    const runningByPl = {}, onlineByPl = {};
+    const runningByPl = {}, onlineByPl = {}, modeByPl = {}, ratioByPl = {};
     for (const { playlist_id, campaign_id } of pcs || []) {
       const c = campById[campaign_id];
-      if (c && c.status === 'RUNNING') runningByPl[playlist_id] = (runningByPl[playlist_id] || 0) + 1;
+      if (c && c.status === 'RUNNING') {
+        runningByPl[playlist_id] = (runningByPl[playlist_id] || 0) + 1;
+        if (c.pacing_mode === 'predictive') {
+          modeByPl[playlist_id] = 'predictive';
+          ratioByPl[playlist_id] = Math.max(ratioByPl[playlist_id] || 0, Number(c.dial_ratio) || 1);
+        } else if (!modeByPl[playlist_id]) modeByPl[playlist_id] = 'power';
+      }
     }
     for (const { playlist_id, agent_id } of pas || []) {
       const st = rt[agent_id];
@@ -3029,6 +3046,8 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
         active: pl ? pl.active !== false : false,
         live: !!(pl && pl.active !== false && runningByPl[k] && onlineByPl[k]),
         agents_online: onlineByPl[k] || 0,
+        mode: modeByPl[k] || 'power',
+        ratio: ratioByPl[k] || null,   // predictive: lines/agent actually in force right now
         cpa: cpaOf(pl), calls: s.calls, ans: s.ans, md: s.md, drop: s.drop,
         abd_pct: s.ans > 0 ? Math.round((s.drop / s.ans) * 1000) / 10 : 0,
         dial,
@@ -4890,7 +4909,7 @@ async function adjustDialRatio(campaignId, acfg, ctx) {
   } else if (human > 0.5 && ratio > acfg.dialRatioMin) {
     ratio = Math.max(acfg.dialRatioMin, Math.round((ratio - 0.1) * 100) / 100); reason = 'high-human-rate';
   } else if (ctx.idlePct > 0.4 && ratio < acfg.dialRatioMax) {
-    ratio = Math.min(acfg.dialRatioMax, Math.round((ratio + 0.1) * 100) / 100); reason = 'agents-idle';
+    ratio = Math.min(acfg.dialRatioMax, Math.round((ratio + 0.5) * 100) / 100); reason = 'agents-idle';
   }
   if (ratio !== acfg.dialRatio) {
     acfg.dialRatio = ratio;   // update the cached cfg so the change applies this tick
@@ -5005,6 +5024,10 @@ async function enginePacingTick() {
       if (!onFloor.length) continue;
       const inFlight = campaignInFlight(campaignId);
       const idlePct = onFloor.length ? available / onFloor.length : 0;
+      // Playlist CPA (when the admin set one) is the authority for how many
+      // lines this campaign may ring per free agent.
+      const plCpa = playlistCpaForCampaign(campaignId);
+      if (plCpa) acfg.dialRatioMax = plCpa;
       const ratio = await adjustDialRatio(campaignId, acfg, { available, inFlight, placed: 0, idlePct });
       // Pacing math (spec §2): ceil(available × ratio) − unresolved_in_flight.
       let toPlace = Math.ceil(available * ratio) - inFlight;

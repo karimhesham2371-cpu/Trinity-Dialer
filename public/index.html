@@ -3162,7 +3162,7 @@ function openAdminWs(){
   const proto=location.protocol==='https:'?'wss':'ws';
   adminWs=new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
   adminWs.onmessage=(ev)=>{ let m; try{ m=JSON.parse(ev.data); }catch{ return; }
-    if(m.type==='floor.agent'){ const a=floorAgents.find(x=>x.id===m.agentId); if(a){ a.state=m.state; a.stateSince=m.stateSince||Date.now(); updateSeatState(a.id,m.state); } }
+    if(m.type==='floor.agent'){ const a=floorAgents.find(x=>x.id===m.agentId); if(a) applyFloorState(a,m.state,m.stateSince); }
     else if(m.type==='floor.hand'){
       try{ beep(); }catch{}
       toast('🖐 '+m.name+' needs help ('+m.state+')','warn');
@@ -3211,7 +3211,8 @@ async function loadAttendance(){
 }
 
 async function renderMap(){
-  try{ const j=await apiJson('/api/admin/floor'); floorAgents=j.agents; }
+  try{ const j=await apiJson('/api/admin/floor'); floorAgents=j.agents;
+    floorAgents.forEach(a=>{ a.labelSince=a.stateSince||Date.now(); }); }
   catch(e){ $('repBody').innerHTML='<div class="empty">'+esc(e.message)+'</div>'; return; }
   $('repBody').innerHTML=`<p class="dim" style="font-size:12px;margin:0 0 12px">Drag an agent onto the floor to place their desk; drag off to unseat. Positions are saved.</p>
     <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
@@ -3243,12 +3244,22 @@ async function renderMap(){
     if(!$('floor')){ clearInterval(window._floorSnapT); window._floorSnapT=null; return; }
     try{ const j=await apiJson('/api/admin/floor');
       j.agents.forEach(a=>{ const cur=floorAgents.find(x=>x.id===a.id);
-        if(cur&&(cur.state!==a.state)){ cur.state=a.state; cur.stateSince=a.stateSince||Date.now(); updateSeatState(a.id,a.state); } });
+        if(cur&&cur.state!==a.state) applyFloorState(cur,a.state,a.stateSince); });
     }catch(e){}
   },30000);
 }
 function stateLabel(s){ return ({AVAILABLE:'Waiting',DIALING:'Waiting',CLAIMING:'Waiting',ON_CALL:'On call',WRAP_UP:'Wrap up',BREAK:'Break',MEETING:'Meeting',CONNECTING:'Connecting',OFFLINE:'Offline'})[s]||s; }
-function seatTimerTxt(a){ if(!a||!a.stateSince||a.state==='OFFLINE') return ''; return fmtMS(Math.max(0,Date.now()-a.stateSince)); }
+// The seat timer measures how long the agent has been in the state the
+// SUPERVISOR sees. Waiting spans (available/dialing/claiming) flip many times a
+// minute under the hood; collapsing them keeps the clock honest instead of
+// resetting to 00:00 on every internal transition.
+function applyFloorState(a,state,since){
+  const prevLabel=a.state?stateLabel(a.state):null;
+  a.state=state;
+  if(stateLabel(state)!==prevLabel||!a.labelSince) a.labelSince=since||Date.now();
+  updateSeatState(a.id,state);
+}
+function seatTimerTxt(a){ if(!a||!a.labelSince||a.state==='OFFLINE') return ''; return fmtMS(Math.max(0,Date.now()-a.labelSince)); }
 function seatEl(a){ const dc=stateDot(a.state); const el=document.createElement('div');
   el.className='seat seat--'+dc; el.dataset.aid=a.id;
   el.innerHTML=`<b>${esc(a.name)}</b><div class="seatstate"><span class="dot dot--${dc}"></span><span data-st>${esc(stateLabel(a.state))}</span><span data-tm class="mono" style="margin-left:auto;font-size:10px;opacity:.7;font-variant-numeric:tabular-nums">${seatTimerTxt(a)}</span></div>`;
@@ -3369,7 +3380,7 @@ async function forceAux(agentId, state){
   try{
     await apiJson('/api/admin/floor/aux','POST',{agent_id:agentId, state});
     toast(state==='BREAK'?'Agent placed on Break':state==='MEETING'?'Agent pulled into Meeting':'Agent set to Ready','ok');
-    const a=floorAgents.find(x=>x.id===agentId); if(a){ a.state=state; a.stateSince=Date.now(); updateSeatState(agentId,state); }
+    const a=floorAgents.find(x=>x.id===agentId); if(a) applyFloorState(a,state,Date.now());
     openAgentPanel(agentId);
   }catch(e){ toast(e.message,'err'); }
 }
@@ -4474,7 +4485,7 @@ async function renderPlaylistStats(){
         <button class="btn" id="plsReset" style="flex:0 0 auto">Reset counters</button>
       </div>
     </div>
-    <p class="dim" style="font-size:13px;margin-top:6px"><b>CPA</b> lines/agent · <b>Calls</b> dialed · <b>Ans</b> answered by an agent · <b>MD</b> machine-detected · <b>Drop</b> answered with no free agent (abandoned) · <b>Abd%</b> = Drop ÷ Ans · <b>Dial</b> ringing now. Counters cover <b>today</b> and reset automatically at midnight Eastern — mornings always start at zero (Reset counters clears them sooner). Watch <b>Abd%</b> — if it climbs, lower the playlist CPA. Live playlists (green dot) appear the moment they have a running campaign and connected agents. Auto-refresh 1s.</p>
+    <p class="dim" style="font-size:13px;margin-top:6px"><b>CPA</b> lines/agent (predictive shows the ceiling with the ratio in force now) · <b>Calls</b> dialed · <b>Ans</b> answered by an agent · <b>MD</b> machine-detected · <b>Drop</b> answered with no free agent (abandoned) · <b>Abd%</b> = Drop ÷ Ans · <b>Dial</b> ringing now. Counters cover <b>today</b> and reset automatically at midnight Eastern — mornings always start at zero (Reset counters clears them sooner). Watch <b>Abd%</b> — if it climbs, lower the playlist CPA. Live playlists (green dot) appear the moment they have a running campaign and connected agents. Auto-refresh 1s.</p>
     <div id="plsMsg" class="dim mt3" style="font-size:12px"></div>
     <div class="tblwrap mt3"><div id="plsRoot"><p class="dim">Loading…</p></div></div></div>`;
   const abdColor=(p)=> p>=10?'var(--danger)':(p>=5?'var(--warn)':'var(--ok)');
@@ -4485,7 +4496,7 @@ async function renderPlaylistStats(){
       if($('plsSince')) $('plsSince').textContent='today · since '+new Date(j.since).toLocaleTimeString([],{hour12:false}); return; }
     const body=rows.map(r=>`<tr>
       <td>${r.live?'<span class="dot dot--ok dot--pulse" style="margin-right:7px"></span>':''}${esc(r.name)}${r.active?'':' <span class="dim" style="font-size:11px">(paused)</span>'}${r.agents_online?` <span class="dim" style="font-size:11px">· ${r.agents_online} agent${r.agents_online>1?'s':''}</span>`:''}</td>
-      <td style="text-align:right">${r.cpa}</td>
+      <td style="text-align:right">${r.cpa}${r.mode==='predictive'?` <span class="dim" style="font-size:10px">(now ${r.ratio||1})</span>`:''}</td>
       <td style="text-align:right">${r.calls}</td>
       <td style="text-align:right">${r.ans}</td>
       <td style="text-align:right">${r.md}</td>
