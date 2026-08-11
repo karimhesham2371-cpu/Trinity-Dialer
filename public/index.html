@@ -2293,32 +2293,50 @@ function emailNormalize(t){
   x=x.replace(/\s+(at|@)\s+/g,'@').replace(/\s+dot\s+/g,'.').replace(/\s+period\s+/g,'.')
      .replace(/\s+underscore\s+/g,'_').replace(/\s+(dash|hyphen|minus)\s+/g,'-')
      .replace(/\s+plus\s+/g,'+');
-  // Business domains are spoken as separate words — "at we buy homes dot com".
-  // Glue everything between the @ and the TLD back into one host.
-  x=x.replace(/@\s*([a-z0-9][a-z0-9 -]{0,45})\.(com|net|org|co|us|biz|info|realty|homes|properties)\b/g,
+  // Business domains are spoken as separate words — "at we buy homes dot com",
+  // "at summit capital group dot net". Glue everything between the @ and the
+  // ending back into one host. Any ending is accepted, not a fixed list: the
+  // company name is whatever the seller's company happens to be called. A dot
+  // can't appear inside the run, so this can never span two hosts.
+  x=x.replace(/@\s*([a-z0-9][a-z0-9 -]{0,45})\.([a-z]{2,24})\b/g,
     (mm,host,tld)=>'@'+host.replace(/[\s]+/g,'')+'.'+tld);
   return x.replace(/\s+/g,' ');
 }
 // Returns a full address when one was spoken, otherwise the domain alone
 // ("@gmail.com") so the agent only has to type the name.
-// forceCue: the agent already asked for the address, so the seller's reply
+// Obvious website talk — "check out our website at ..." is not an address.
+const EM_WEBSITE=/\b(web\s?site|our site|check (it |us )?out|google us|look us up|listed on)\b/i;
+// Confidence, not eligibility: anything address-shaped gets pinned so nothing
+// is missed, but only a confident read auto-fills the capture box.
+// forceCue = the agent already asked for the address, so the seller's reply
 // counts even though the reply itself never says the word "email".
-function emailCandidates(t,forceCue){
+// "send it over to", "shoot it to", "reach me at" all mean an address is coming,
+// even though the word "email" never appears.
+const EM_CUE=/\b(e-?\s?mail|address)\b|@|\b(send|shoot|forward)\b[^.]{0,25}\b(to|over)\b|\b(reach|contact)\b[^.]{0,15}\bat\b/i;
+function emailConfident(t,forceCue){
+  return !!(forceCue||EM_CUE.test(String(t||''))
+    ||EM_MAILDOM.has(((emailCandidates(t)[0]||'').split('@')[1])||''));
+}
+function emailCandidates(t){
   const x=emailNormalize(t), out=[];
-  const cue=forceCue||/\b(e-?\s?mail|address)\b|@/i.test(String(t||''));
+  if(EM_WEBSITE.test(String(t||''))) return out;
   const m=x.match(/([a-z0-9._%+\- ]{1,60})@([a-z0-9.-]+\.[a-z]{2,})/);
-  if(m&&(cue||EM_MAILDOM.has(m[2]))){
+  if(m){
     const toks=m[1].trim().split(/\s+/).filter(Boolean), kept=[];
     for(let i=toks.length-1;i>=0;i--){
       if(EM_HESIT.has(toks[i])) continue;              // skip, keep reading left
       if(EM_FILLER.has(toks[i])) break;                // real boundary
       kept.unshift(toks[i]);
     }
-    if(kept.length) out.push(kept.join('')+'@'+m[2]);
+    const local=kept.join('');
+    // "we bought that one at auction dot com" -> "1" is not a name; keep the
+    // domain alone rather than inventing a local part.
+    if(local&&!/^\d{1,2}$/.test(local)) out.push(local+'@'+m[2]);
+    else if(m[2]) out.push('@'+m[2]);
   }
   if(!out.length){
     const dom=x.match(/@([a-z0-9-]+\.[a-z]{2,})/);
-    if(dom&&(cue||EM_MAILDOM.has(dom[1]))) out.push('@'+dom[1]);
+    if(dom) out.push('@'+dom[1]);
     else{ const bare=x.match(/\b(gmail|yahoo|hotmail|outlook|icloud|aol|comcast)\b[\s.]*(com|net)?/);
       if(bare) out.push('@'+bare[1]+'.'+(bare[2]||(bare[1]==='comcast'?'net':'com'))); }
   }
@@ -2377,13 +2395,14 @@ function scanCaptionForEmail(text,final,track){
   const k=track||'x', prev=emPrev[k]||'';
   // A chunk can also break mid-domain ("...at we buy" / "homes dot com"), so a
   // TLD arriving in the first few words counts as a continuation too.
-  const cont=CAP_EM_CONT.test(text)||/^\s*(\S+\s+){0,3}(dot\s+(com|net|org|co)\b|\.(com|net|org|co)\b)/i.test(text);
+  const cont=CAP_EM_CONT.test(text)||/^\s*(\S+\s+){0,3}(dot\s+[a-z]{2,24}\b|\.[a-z]{2,24}\b)/i.test(text);
   const stitched=(prev&&capHasEmail(prev)&&cont)?(prev+' '+text):text;
   if(final) emPrev[k]=text;
   // "What's the best email for you?" opens a window on EITHER track — the reply
   // is usually just "jesse lee at we buy homes dot com" with no cue word in it.
   if(/\b(e-?\s?mail|address)\b/i.test(text)) emCueUntil=Date.now()+45000;
-  const c=emailCandidates(stitched,Date.now()<emCueUntil); if(!c.length) return;
+  const c=emailCandidates(stitched); if(!c.length) return;
+  const conf=emailConfident(stitched,Date.now()<emCueUntil);
   const best=c[0];
   emCands=[best].concat(emCands.filter(x=>x!==best)).slice(0,4);
   // A full address outranks a bare domain no matter which arrived last.
@@ -2391,7 +2410,8 @@ function scanCaptionForEmail(text,final,track){
   const show=full||emCands[0];
   $('emPin').classList.add('on');
   $('emPinVal').textContent=show;
-  $('emPinSrc').textContent=final?'':'(still speaking…)';
+  $('emPinSrc').textContent=!final?'(still speaking…)':(conf?'':'— unsure, read it back');
+  $('emPin').style.opacity=conf?'1':'.8';
   const alts=emCands.filter(x=>x!==show);
   $('emPinAlt').innerHTML=alts.map(a=>'<button class="btn btn-sm" data-emc="'+esc(a)+'" style="font-size:11px;height:24px;padding:0 7px">'+esc(a)+'</button>').join('');
   $('emPinAlt').querySelectorAll('[data-emc]').forEach(b=>b.onclick=()=>setCapturedEmail(b.dataset.emc));
@@ -2400,9 +2420,10 @@ function scanCaptionForEmail(text,final,track){
   $('emPinVal').onclick=()=>setCapturedEmail(show);
   const dom=show.split('@')[1]||'';
   if(dom&&dom!==emHeardDom){ emHeardDom=dom; renderEmailHelpers(); }
-  // Fill the box for her, but never overwrite what she typed herself.
+  // Fill the box only on a confident read — an unsure one still gets pinned for
+  // her to click, but must not quietly land in the field. Never overwrite her.
   const cur=$('emInput').value.trim();
-  if(full&&final&&(!cur||emAutoFilled)){ $('emInput').value=full; emAutoFilled=true; renderEmailHelpers(); }
+  if(full&&final&&conf&&(!cur||emAutoFilled)){ $('emInput').value=full; emAutoFilled=true; renderEmailHelpers(); }
 }
 $('emListen').onclick=async()=>{
   const on=!$('emListen').classList.contains('on');
