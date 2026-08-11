@@ -4371,24 +4371,12 @@ async function renderWindow(){
       <table id="cwTable" class="wbtbl"><thead><tr><th>State / Region</th><th>TZ</th><th>Enabled</th><th>Start</th><th>End</th></tr></thead>
       <tbody>${stRows}</tbody></table>
     </div></div>
-    <div class="card mt3" style="max-width:520px"><h2>Dialer pacing (CPA)</h2>
-    <p class="dim" style="font-size:13px"><b>Calls per agent</b> = how many lines are dialed simultaneously for each free agent. <b>1</b> = pure power dialing (one call at a time, zero abandoned calls). Higher values cut wait time between calls but drop unanswered extra legs when a human answers first — raise gradually and watch <b>Abd%</b> on Live stats. The FCC guardrail auto-clamps pacing if abandonment nears 3%, so CPA sets the ceiling, not the actual rate. <b>Ring time</b> is how long a number rings before it's given up as no-answer.</p>
+    <div class="card mt3" style="max-width:520px"><h2>Ring time</h2>
+    <p class="dim" style="font-size:13px">How long a number rings before it's given up as no-answer. <b>Calls per agent (CPA) now lives on each playlist</b> — Leads → Playlists — so pacing is set per list, in one place.</p>
     <div class="row mt3" style="gap:12px;align-items:flex-end">
-      <div class="fw"><span class="lbl">Calls per agent</span><select id="dlLpa" class="field">${lpaOpts(d.lines_per_agent)}</select></div>
       <div class="fw"><span class="lbl">Ring time (sec)</span><input id="dlRing" class="field" type="number" min="10" max="60" value="${d.ring_secs}"></div>
       <button class="btn btn-primary" id="dlSave" style="flex:0 0 auto">Save</button>
-    </div><div id="dlMsg" class="dim mt3" style="font-size:12px"></div></div>
-    <div class="card mt3" style="max-width:520px"><h2>Call Result Management</h2>
-    <p class="dim" style="font-size:13px">Pick a disposition, then set how its calls recycle. <b>Recycle window</b> = how many days the number stays re-dialable, counted from the first dial. <b>Strikes</b> = how many times this outcome can hit a number (across any campaign) before it's permanently added to DNC. <b>Redial spacing</b> = the wait between re-dials while inside the window.</p>
-    <div class="row mt3"><div class="fw" style="flex:1"><span class="lbl">Disposition</span><select id="cpDisp" class="field">${cpOpts}</select></div></div>
-    <div class="row mt3" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
-      <div class="fw"><span class="lbl">Recycle window (days)</span><input id="cpWin" class="field" type="number" min="1" max="365"></div>
-      <div class="fw"><span class="lbl">Strikes</span><input id="cpStr" class="field" type="number" min="1" max="20"></div>
-    </div>
-    <div class="row mt3" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
-      <div class="fw"><span class="lbl">Redial spacing (hours)</span><input id="cpRedial" class="field" type="number" min="1" max="720"></div>
-      <button class="btn btn-primary" id="cpSave" style="flex:0 0 auto">Save</button>
-    </div><div id="cpMsg" class="dim mt3" style="font-size:12px"></div></div>`;
+    </div><div id="dlMsg" class="dim mt3" style="font-size:12px"></div></div>`;
   enhanceAll($('ldBody'));
   // Enable/disable each time input as its "custom" checkbox toggles.
   $('cwTable').addEventListener('change',(ev)=>{
@@ -4411,22 +4399,9 @@ async function renderWindow(){
     catch(e){ $('cwMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
   $('dlSave').onclick=async()=>{
-    try{ const j=await apiJson('/api/admin/settings/dialer','PUT',{lines_per_agent:+$('dlLpa').value,ring_secs:+$('dlRing').value});
-      $('dlMsg').innerHTML=`<b style="color:var(--ok)">Saved — ${j.lines_per_agent} line(s)/agent, ${j.ring_secs}s ring</b>`; }
+    try{ const j=await apiJson('/api/admin/settings/dialer','PUT',{ring_secs:+$('dlRing').value});
+      $('dlMsg').innerHTML=`<b style="color:var(--ok)">Saved — ${j.ring_secs}s ring</b>`; }
     catch(e){ $('dlMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
-  };
-  const cpFill=()=>{ const d=(cp.dispositions||[])[+$('cpDisp').value]; if(!d)return; const pol=d.policy||cp.defaults;
-    $('cpWin').value=pol.recycle_window_days; $('cpStr').value=pol.neg_strike_limit; $('cpRedial').value=pol.neg_redial_hours;
-    $('cpMsg').innerHTML=d.is_dnc?`<span class="dim">“${esc(d.label)}” always goes to <b>permanent</b> DNC — these knobs don't apply.</span>`
-      :d.positive?`<span class="dim">“${esc(d.label)}” is a positive outcome — DNC auto-clears after ${cp.positive_dnc_days} days; these knobs don't apply.</span>`
-      :d.is_callback?`<span class="dim">“${esc(d.label)}” schedules a callback — these knobs don't apply.</span>`:''; };
-  if($('cpDisp')){ $('cpDisp').onchange=cpFill; cpFill(); }
-  $('cpSave').onclick=async()=>{ const d=(cp.dispositions||[])[+$('cpDisp').value]; if(!d)return;
-    try{ const j=await apiJson('/api/admin/settings/call-policy','PUT',{ code:d.code,
-        recycle_window_days:+$('cpWin').value, neg_strike_limit:+$('cpStr').value, neg_redial_hours:+$('cpRedial').value});
-      d.policy=j.policy;
-      $('cpMsg').innerHTML=`<b style="color:var(--ok)">Saved “${esc(d.label)}” — recycle ${j.policy.recycle_window_days}d · ${j.policy.neg_strike_limit} strikes → DNC · redial every ${j.policy.neg_redial_hours}h</b>`; }
-    catch(e){ $('cpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
   };
 }
 
@@ -4437,6 +4412,9 @@ async function renderWindow(){
 async function renderRecycle(){
   const RDEF={no_answer:{delay_minutes:240,max_rounds:11},busy:{delay_minutes:20,max_rounds:11},voicemail:{delay_minutes:360,max_rounds:5},positive_dnc_days:90};
   let r=RDEF;
+  let cp={dispositions:[],defaults:{recycle_window_days:10,neg_strike_limit:4,neg_redial_hours:24}};
+  try{ cp=await apiJson('/api/admin/settings/call-policy'); }catch(e){}
+  const cpOpts=(cp.dispositions||[]).map((dsp,i)=>`<option value="${i}">${esc(dsp.label)} (${esc(dsp.code)})</option>`).join('');
   try{ const j=await apiJson('/api/admin/settings/recycle'); const g=j.recycle||{};
     r={ no_answer:g.no_answer||RDEF.no_answer, busy:g.busy||RDEF.busy, voicemail:g.voicemail||RDEF.voicemail, positive_dnc_days:g.positive_dnc_days||RDEF.positive_dnc_days }; }catch(e){}
   const fmtDelay=(mins)=>{ if(mins>=1440&&mins%1440===0)return (mins/1440)+' day'+(mins/1440>1?'s':''); if(mins>=60&&mins%60===0)return (mins/60)+' hour'+(mins/60>1?'s':''); return mins+' min'; };
@@ -4445,7 +4423,7 @@ async function renderRecycle(){
       <td><input id="rc_${key}_delay" class="field" type="number" min="1" max="43200" value="${r[key].delay_minutes}" style="width:110px"><div class="dim mono" style="font-size:11px" id="rc_${key}_dlbl">${fmtDelay(r[key].delay_minutes)}</div></td>
       <td><input id="rc_${key}_max" class="field" type="number" min="1" max="50" value="${r[key].max_rounds}" style="width:90px"></td>
     </tr>`;
-  $('ldBody').innerHTML=`<div class="card" style="max-width:720px"><h2>Call result recycling</h2>
+  $('ldBody').innerHTML=`<div class="card" style="max-width:720px"><h2>Call results <span class="dim" style="font-size:12px;font-weight:400">— recycling &amp; disposition rules</span></h2>
     <p class="dim" style="font-size:13px">When a dial <b>doesn't reach a person</b>, the lead is re-queued and dialed again — up to <b>Max rounds</b> times, each round waiting <b>Re-dial after</b>. After the last round the lead is retired (Exhausted). Answered calls are handled by the agent's disposition instead. One global setting for every campaign. The calling window and DNC list are always still enforced.</p>
     <div class="tblwrap mt3"><table class="wbtbl">
       <thead><tr><th>Call result</th><th>Re-dial after (minutes)</th><th>Max rounds</th></tr></thead>
@@ -4459,8 +4437,30 @@ async function renderRecycle(){
       <button class="btn btn-primary" id="rcSave" style="flex:0 0 auto">Save</button>
     </div>
     <div class="dim mt2" style="font-size:12px">A Lead/Sale goes on the DNC list for this many days, then is auto-removed — so the same number can be re-dialed if it's uploaded again after that.</div>
-    <div id="rcMsg" class="dim mt3" style="font-size:12px"></div></div>`;
+    <div id="rcMsg" class="dim mt3" style="font-size:12px"></div></div>
+    <div class="card mt3" style="max-width:720px"><h2>Per-disposition rules <span class="dim" style="font-size:12px;font-weight:400">— what agents code a call as</span></h2>
+    <p class="dim" style="font-size:13px">The table above governs dials that never reached a person. These govern calls an <b>agent</b> coded. <b>Recycle window</b> = days the number stays re-dialable, from its first dial. <b>Strikes</b> = how many times this outcome can hit a number (any campaign) before permanent DNC. <b>Redial spacing</b> = wait between re-dials — unless the disposition maps to a result above (No answer / Busy / Voicemail), in which case it follows that row exactly.</p>
+    <div class="row mt3"><div class="fw" style="flex:1"><span class="lbl">Disposition</span><select id="cpDisp" class="field">${cpOpts}</select></div></div>
+    <div class="row mt3" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
+      <div class="fw"><span class="lbl">Recycle window (days)</span><input id="cpWin" class="field" type="number" min="1" max="365"></div>
+      <div class="fw"><span class="lbl">Strikes → DNC</span><input id="cpStr" class="field" type="number" min="1" max="20"></div>
+      <div class="fw"><span class="lbl">Redial spacing (hours)</span><input id="cpRedial" class="field" type="number" min="1" max="720"></div>
+      <button class="btn btn-primary" id="cpSave" style="flex:0 0 auto">Save</button>
+    </div><div id="cpMsg" class="dim mt3" style="font-size:12px"></div></div>`;
   enhanceAll($('ldBody'));
+  const cpFill=()=>{ const d=(cp.dispositions||[])[+$('cpDisp').value]; if(!d)return; const pol=d.policy||cp.defaults;
+    $('cpWin').value=pol.recycle_window_days; $('cpStr').value=pol.neg_strike_limit; $('cpRedial').value=pol.neg_redial_hours;
+    $('cpMsg').innerHTML=d.is_dnc?`<span class="dim">“${esc(d.label)}” always goes to <b>permanent</b> DNC — these knobs don't apply.</span>`
+      :d.positive?`<span class="dim">“${esc(d.label)}” is a positive outcome — DNC auto-clears after the days set above; these knobs don't apply.</span>`
+      :d.is_callback?`<span class="dim">“${esc(d.label)}” schedules a callback — these knobs don't apply.</span>`:''; };
+  if($('cpDisp')){ $('cpDisp').onchange=cpFill; cpFill(); }
+  $('cpSave').onclick=async()=>{ const d=(cp.dispositions||[])[+$('cpDisp').value]; if(!d)return;
+    try{ const j=await apiJson('/api/admin/settings/call-policy','PUT',{ code:d.code,
+        recycle_window_days:+$('cpWin').value, neg_strike_limit:+$('cpStr').value, neg_redial_hours:+$('cpRedial').value});
+      d.policy=j.policy;
+      $('cpMsg').innerHTML=`<b style="color:var(--ok)">Saved “${esc(d.label)}” — recycle ${j.policy.recycle_window_days}d · ${j.policy.neg_strike_limit} strikes → DNC · redial every ${j.policy.neg_redial_hours}h</b>`; }
+    catch(e){ $('cpMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`; }
+  };
   ['no_answer','busy','voicemail'].forEach(k=>{ const d=$('rc_'+k+'_delay'); if(d) d.oninput=()=>{ const l=$('rc_'+k+'_dlbl'); if(l) l.textContent=fmtDelay(Math.max(1,+d.value||1)); }; });
   $('rcSave').onclick=async()=>{
     const pack=(k)=>({delay_minutes:+$('rc_'+k+'_delay').value, max_rounds:+$('rc_'+k+'_max').value});

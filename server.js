@@ -132,7 +132,6 @@ const DEFAULT_DISPOSITIONS = [
 ];
 // Codes never shown as agent buttons even if present in a campaign's custom list.
 const AGENT_HIDDEN_DISPOSITIONS = new Set(['AUTO_ANSWERING_MACHINE', 'AMD_MISS', 'NOTE']);
-const DEFAULT_RECYCLE = { no_answer: { hours: 4, max: 5 }, busy: { minutes: 20, max: 8 } };
 
 // ── System-outcome list recycling (admin-editable, app_settings key "recycle") ──
 // When a dial ends WITHOUT reaching a human (ring-out / busy / voicemail), the
@@ -298,7 +297,7 @@ const plKeyForCampaign = (cid) => CAMP_PLAYLIST[cid] || ('c:' + cid);
 function playlistCpaForCampaign(cid) {
   const pid = CAMP_PLAYLIST[cid];
   const n = pid ? PLAYLIST_CPA[pid] : null;
-  return (n >= 1 && n <= CPA_MAX) ? n : null;
+  return (n >= 1 && n <= CPA_MAX) ? n : 1;   // no playlist CPA set = safest (power)
 }
 // Persist the wallboard counters (app_settings key 'playlist_stats') so a Render
 // redeploy doesn't zero the Live stats mid-shift. Saved every 15s when changed.
@@ -2359,9 +2358,10 @@ app.get('/api/admin/settings/dialer', auth, adminOnly, async (_req, res) => {
   res.json({ ...DIALER });
 });
 app.put('/api/admin/settings/dialer', auth, adminOnly, async (req, res) => {
-  const lpa = parseInt(req.body && req.body.lines_per_agent, 10);
+  // lines_per_agent is no longer settable globally — CPA lives on playlists.
+  const lpa = DIALER.lines_per_agent;
   const rs = parseInt(req.body && req.body.ring_secs, 10);
-  if (!(lpa >= 1 && lpa <= CPA_MAX)) return res.status(400).json({ error: `lines_per_agent must be 1-${CPA_MAX}` });
+
   if (!(rs >= 10 && rs <= 60)) return res.status(400).json({ error: 'ring_secs must be 10-60' });
   const value = { lines_per_agent: lpa, ring_secs: rs };
   try {
@@ -3015,7 +3015,7 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
         liveDial[k] = (liveDial[k] || 0) + 1;
       }
     }
-    const cpaOf = (pl) => { const n = pl && pl.lines_per_agent; return (n >= 1 && n <= CPA_MAX) ? n : DIALER.lines_per_agent; };
+    const cpaOf = (pl) => { const n = pl && pl.lines_per_agent; return (n >= 1 && n <= CPA_MAX) ? n : 1; };
     const liveKeys = (playlists || []).filter(p => p.active !== false && runningByPl[p.id] && onlineByPl[p.id]).map(p => p.id);
     const keys = new Set([...Object.keys(PLAYLIST_STATS), ...Object.keys(liveDial), ...liveKeys]);
     const rows = [];
@@ -3030,7 +3030,7 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
           playlist_id: null,
           name: (camp ? camp.name : '(deleted campaign)') + ' · predictive',
           active: camp ? camp.status === 'RUNNING' : false,
-          cpa: (camp && camp.dial_ratio) || DIALER.lines_per_agent,
+          cpa: (camp && camp.dial_ratio) || 1,
           calls: s.calls, ans: s.ans, md: s.md, drop: s.drop,
           abd_pct: s.ans > 0 ? Math.round((s.drop / s.ans) * 1000) / 10 : 0,
           dial,
@@ -4082,7 +4082,6 @@ async function campaignConfig(id) {
   const cfg = {
     ...c,
     dispositions: Array.isArray(c.dispositions) && c.dispositions.length ? c.dispositions : DEFAULT_DISPOSITIONS,
-    recycle_rules: c.recycle_rules && Object.keys(c.recycle_rules).length ? c.recycle_rules : DEFAULT_RECYCLE,
     wrap_seconds: c.wrap_seconds != null ? c.wrap_seconds : 5,
     script: c.script || '',
   };
@@ -4204,11 +4203,21 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
       } else {
         const firstDial = (act && act.first_dial_at) ? new Date(act.first_dial_at).getTime() : Date.now();
         const windowEnd = firstDial + dp.recycle_window_days * 86400e3;
-        const rule = disp.recycle ? ((cfg.recycle_rules || DEFAULT_RECYCLE)[disp.recycle] || {}) : {};
-        const ms = rule.hours ? rule.hours * 3600e3 : (rule.minutes ? rule.minutes * 60e3 : dp.neg_redial_hours * 3600e3);
+        // ONE source of truth for redial spacing + round caps: the global
+        // Call results settings (app_settings key 'recycle'). A disposition
+        // tagged with a recycle bucket (no_answer/busy/voicemail) follows that
+        // bucket exactly like the system-outcome path does; anything else uses
+        // the disposition's own redial spacing. The legacy per-campaign
+        // recycle_rules column is no longer consulted (merged 2026-08-11).
+        const bucket = disp.recycle && RECYCLE[disp.recycle] ? RECYCLE[disp.recycle] : null;
+        const ms = bucket ? bucket.delay_minutes * 60e3 : dp.neg_redial_hours * 3600e3;
+        const rounds = (lead.attempts || 0) + 1;
+        const maxRounds = bucket ? bucket.max_rounds : dp.neg_strike_limit;
         const next = Date.now() + ms;
-        if (next >= windowEnd) {
-          patch.status = 'EXHAUSTED';   // next redial would fall outside the 10-day window
+        if (rounds >= maxRounds) {
+          patch.status = 'EXHAUSTED';   // hit the round cap for this outcome
+        } else if (next >= windowEnd) {
+          patch.status = 'EXHAUSTED';   // next redial would fall outside the recycle window
         } else {
           patch.status = 'NEW';
           patch.next_callback_at = new Date(next).toISOString();
@@ -4538,7 +4547,7 @@ async function pacingTick() {
     // DIALER.lines_per_agent; null/invalid on the playlist = inherit global.
     const cpaOf = (pl) => {
       const n = pl && pl.lines_per_agent;
-      return (n >= 1 && n <= CPA_MAX) ? n : DIALER.lines_per_agent;
+      return (n >= 1 && n <= CPA_MAX) ? n : 1;   // playlist CPA is the only source
     };
 
     // Pick the next dialable lead for one agent, honouring its playlist priority.
@@ -4897,19 +4906,17 @@ async function dialEngineLead(lead, acfg) {
 // nears the soft threshold; grows slowly when agents sit idle. Hard-clamped to
 // [dialRatioMin, dialRatioMax]; forced to the floor at/above the soft threshold.
 async function adjustDialRatio(campaignId, acfg, ctx) {
-  let ratio = acfg.dialRatio;
-  let reason = 'steady';
+  // CPA comes from the playlist and takes effect immediately — no ramping, no
+  // heuristics. The ONLY thing that may lower it is the FCC abandonment
+  // guardrail, which is a legal requirement and stays.
+  const cpa = playlistCpaForCampaign(campaignId);
+  let ratio = cpa;
+  let reason = 'playlist-cpa';
   const abandon = await campaignAbandonRate(campaignId).catch(() => 0);
   const human = _humanRate.has(campaignId) ? _humanRate.get(campaignId) : 0.3;
-  if (abandon >= acfg.abandonSoft) {
-    if (ratio > acfg.dialRatioMin) {
-      ratio = acfg.dialRatioMin; reason = 'abandon-clamp';
-      console.warn(`[engine] ALERT campaign ${String(campaignId).slice(0, 8)} abandon=${(abandon * 100).toFixed(2)}% >= soft ${(acfg.abandonSoft * 100).toFixed(2)}% — dial_ratio clamped to floor ${ratio}`);
-    }
-  } else if (human > 0.5 && ratio > acfg.dialRatioMin) {
-    ratio = Math.max(acfg.dialRatioMin, Math.round((ratio - 0.1) * 100) / 100); reason = 'high-human-rate';
-  } else if (ctx.idlePct > 0.4 && ratio < acfg.dialRatioMax) {
-    ratio = Math.min(acfg.dialRatioMax, Math.round((ratio + 0.5) * 100) / 100); reason = 'agents-idle';
+  if (abandon >= acfg.abandonSoft && ratio > 1) {
+    ratio = 1; reason = 'abandon-clamp';
+    console.warn(`[engine] ALERT campaign ${String(campaignId).slice(0, 8)} abandon=${(abandon * 100).toFixed(2)}% >= soft ${(acfg.abandonSoft * 100).toFixed(2)}% — CPA clamped to 1 (FCC guardrail)`);
   }
   if (ratio !== acfg.dialRatio) {
     acfg.dialRatio = ratio;   // update the cached cfg so the change applies this tick
@@ -5024,10 +5031,6 @@ async function enginePacingTick() {
       if (!onFloor.length) continue;
       const inFlight = campaignInFlight(campaignId);
       const idlePct = onFloor.length ? available / onFloor.length : 0;
-      // Playlist CPA (when the admin set one) is the authority for how many
-      // lines this campaign may ring per free agent.
-      const plCpa = playlistCpaForCampaign(campaignId);
-      if (plCpa) acfg.dialRatioMax = plCpa;
       const ratio = await adjustDialRatio(campaignId, acfg, { available, inFlight, placed: 0, idlePct });
       // Pacing math (spec §2): ceil(available × ratio) − unresolved_in_flight.
       let toPlace = Math.ceil(available * ratio) - inFlight;
