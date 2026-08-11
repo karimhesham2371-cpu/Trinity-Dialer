@@ -556,6 +556,19 @@
   #capBox .cap-line{margin-bottom:3px}
   #capBox .cap-who{font-weight:600;margin-right:6px}
   #capBox .cap-interim{opacity:.55;font-style:italic}
+  /* email-focus: make address words jump out of the transcript */
+  #capBox .cap-em{background:rgba(239,182,60,.18);color:var(--accent);border-radius:3px;padding:0 3px;font-weight:600}
+  #capBox.emFocus{max-height:150px;border-color:rgba(239,182,60,.45)}
+  #capBox.emFocus .cap-line:not(.hasEm){opacity:.35}
+  #emPin{display:none;margin-top:6px;border:1px solid rgba(239,182,60,.45);border-radius:12px;
+    background:rgba(239,182,60,.10);padding:8px 12px}
+  #emPin.on{display:block}
+  #emPin .pinLbl{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-dim)}
+  #emPin .pinVal{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:19px;font-weight:700;
+    color:var(--accent);letter-spacing:.02em;word-break:break-all;line-height:1.25}
+  #emPin .pinAlt{margin-top:5px;display:flex;gap:5px;flex-wrap:wrap}
+  #emPin .pinAlt button{font-family:ui-monospace,Menlo,Consolas,monospace}
+  #emListen.on{border-color:var(--accent);color:var(--accent);box-shadow:0 0 12px rgba(239,182,60,.3)}
 
   /* ═══ AI WRAP ═══ */
   .dispBtn.aiSuggest{border-color:var(--accent);box-shadow:0 0 14px rgba(239,182,60,.28);position:relative}
@@ -645,6 +658,11 @@
         <div id="timer" class="timer hidden">00:00</div>
       </div>
       <div id="capBox" class="hidden"></div>
+      <div id="emPin">
+        <div class="pinLbl">Email heard <span id="emPinSrc" class="faint" style="text-transform:none;letter-spacing:0"></span></div>
+        <div class="pinVal" id="emPinVal">—</div>
+        <div class="pinAlt" id="emPinAlt"></div>
+      </div>
 
       <div class="card" style="flex:1">
         <p class="panelTitle">Lead</p>
@@ -655,6 +673,7 @@
         <p class="panelTitle">Email capture <span id="emHeard" class="dim" style="font-weight:400;font-size:11px"></span></p>
         <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
           <input id="emInput" class="field" placeholder="type what you hear — domain auto-completes" style="flex:1;min-width:220px;font-family:var(--font-mono)">
+          <button id="emListen" class="btn btn-sm" title="Focus live captions on the email address">🎧 Listen</button>
           <button id="emSave" class="btn btn-primary btn-sm">Save</button>
         </div>
         <div id="emDomains" style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px"></div>
@@ -1981,7 +2000,7 @@ function clearLead(){
   curLeadId=null; renderedLeadId=null; curLeadObj=null; inboundCall=false;
   const lr=$('leadRecs'); if(lr) lr.remove();
   const ab=$('aiBox'); if(ab) ab.remove();
-  if($('emInput')){ $('emInput').value=''; $('emHeard').textContent=''; renderEmailHelpers(); }
+  if($('emInput')){ $('emInput').value=''; $('emHeard').textContent=''; clearEmailPin(); renderEmailHelpers(); }
   const xb=$('xferBrief'); if(xb) xb.remove();
   $('leadCard').className='empty'; $('leadCard').textContent='No lead yet. You\'ll be connected automatically.';
   $('scriptBody').className='empty'; $('scriptBody').textContent='No active call.';
@@ -2184,23 +2203,35 @@ $('capToggle').onchange=async()=>{
   catch(e){ /* not connected yet — synced on next ws open */ }
 };
 let capInterimEl=null;
+// Words that carry an address when spoken aloud — highlighted so the agent's
+// eye lands on the email instead of scanning the whole transcript.
+const CAP_EM_RE=/\b(at|dot|period|underscore|dash|hyphen|plus|gmail|g mail|yahoo|hotmail|hot mail|outlook|out look|icloud|i cloud|aol|comcast|com|net|org|email|e-mail)\b|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+function capMarkup(text){
+  // esc() first, then mark — none of the matched tokens contain HTML specials.
+  return esc(text).replace(CAP_EM_RE,m=>'<span class="cap-em">'+m+'</span>');
+}
+function capHasEmail(text){ return /\b(at|dot|gmail|yahoo|hotmail|outlook|icloud|aol|comcast|email)\b/i.test(text||''); }
 function renderCaption(m){
   if(!capOn()||serverState!=='ON_CALL') return;
   const box=$('capBox'); box.classList.remove('hidden');
   const who=m.track==='inbound'?'Seller':'You';
   const col=m.track==='inbound'?'var(--accent)':'var(--text-dim)';
+  const body=`<span class="cap-who" style="color:${col}">${who}</span>${capMarkup(m.text)}`;
+  const hasEm=capHasEmail(m.text);
   if(!m.final){
     if(!capInterimEl){ capInterimEl=document.createElement('div'); capInterimEl.className='cap-line cap-interim'; box.appendChild(capInterimEl); }
-    capInterimEl.innerHTML=`<span class="cap-who" style="color:${col}">${who}</span>${esc(m.text)}`;
+    capInterimEl.className='cap-line cap-interim'+(hasEm?' hasEm':'');
+    capInterimEl.innerHTML=body;
   } else {
     if(capInterimEl){ capInterimEl.remove(); capInterimEl=null; }
-    const div=document.createElement('div'); div.className='cap-line';
-    div.innerHTML=`<span class="cap-who" style="color:${col}">${who}</span>${esc(m.text)}`;
+    const div=document.createElement('div'); div.className='cap-line'+(hasEm?' hasEm':'');
+    div.innerHTML=body;
     box.appendChild(div);
     while(box.querySelectorAll('.cap-line').length>8) box.firstChild.remove();
   }
   box.scrollTop=box.scrollHeight;
-  // If the seller just spoke an address, surface it for one-tap capture.
+  // Interim counts too — the pin should land while they are still talking.
+  scanCaptionForEmail(m.text,m.final);
   const heard=emailFromSpeech(m.text);
   if(heard&&m.final&&$('emHeard')){
     $('emHeard').innerHTML='— heard <b style="color:var(--accent);cursor:pointer" title="click to use">'+esc(heard)+'</b>';
@@ -2233,14 +2264,44 @@ $('cXfer').onclick=async()=>{
 // repaired, and a phonetic read-back lets the agent confirm out loud.
 const EM_DOMAINS=['gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com','aol.com','comcast.net'];
 const NATO={a:'Alpha',b:'Bravo',c:'Charlie',d:'Delta',e:'Echo',f:'Foxtrot',g:'Golf',h:'Hotel',i:'India',j:'Juliet',k:'Kilo',l:'Lima',m:'Mike',n:'November',o:'Oscar',p:'Papa',q:'Quebec',r:'Romeo',s:'Sierra',t:'Tango',u:'Uniform',v:'Victor',w:'Whiskey',x:'X-ray',y:'Yankee',z:'Zulu'};
-function emailFromSpeech(t){
-  if(!t) return null;
-  let x=' '+String(t).toLowerCase()+' ';
-  x=x.replace(/\s+(at|@)\s+/g,'@').replace(/\s+dot\s+/g,'.').replace(/\s+underscore\s+/g,'_')
-     .replace(/\s+(dash|hyphen|minus)\s+/g,'-').replace(/\s+/g,' ');
-  const m=x.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/);
-  return m?m[0]:null;
+const EM_NUMW={zero:'0',one:'1',two:'2',three:'3',four:'4',five:'5',six:'6',seven:'7',eight:'8',nine:'9'};
+// Words that precede an address but are not part of it ("my email is sarah…").
+const EM_FILLER=new Set(['my','address','is','it','its','email','e','mail','the','and','sure','use','name',
+  'ok','okay','yeah','yes','so','um','uh','you','can','me','reach','at','just','well','alright','right',
+  'that','this','would','be','send','to']);
+function emailNormalize(t){
+  let x=' '+String(t||'').toLowerCase().replace(/[,!?]/g,' ')+' ';
+  x=x.replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine)\b/g,m=>' '+EM_NUMW[m]+' ');
+  x=x.replace(/\bg\s*[-.]?\s*mail\b/g,'gmail').replace(/\bhot\s*[-.]?\s*mail\b/g,'hotmail')
+     .replace(/\bi\s*cloud\b/g,'icloud').replace(/\bout\s*look\b/g,'outlook')
+     .replace(/\byah+oo?\b/g,'yahoo');
+  // people spell addresses out — "j o h n" / "j-o-h-n" is one word, not four
+  x=x.replace(/\b(?:[a-z0-9](?:[\s-]+|$)){2,}/g,m=>' '+m.replace(/[\s-]+/g,'')+' ');
+  x=x.replace(/\s+(at|@)\s+/g,'@').replace(/\s+dot\s+/g,'.').replace(/\s+period\s+/g,'.')
+     .replace(/\s+underscore\s+/g,'_').replace(/\s+(dash|hyphen|minus)\s+/g,'-')
+     .replace(/\s+plus\s+/g,'+');
+  return x.replace(/\s+/g,' ');
 }
+// Returns a full address when one was spoken, otherwise the domain alone
+// ("@gmail.com") so the agent only has to type the name.
+function emailCandidates(t){
+  const x=emailNormalize(t), out=[];
+  const m=x.match(/([a-z0-9._%+\- ]{1,60})@([a-z0-9.-]+\.[a-z]{2,})/);
+  if(m){
+    const toks=m[1].trim().split(/\s+/).filter(Boolean), kept=[];
+    for(let i=toks.length-1;i>=0;i--){ if(EM_FILLER.has(toks[i])) break; kept.unshift(toks[i]); }
+    const local=(kept.length?kept:toks.slice(-1)).join('');
+    if(local) out.push(local+'@'+m[2]);
+  }
+  if(!out.length){
+    const dom=x.match(/@([a-z0-9-]+\.[a-z]{2,})/);
+    if(dom) out.push('@'+dom[1]);
+    else{ const bare=x.match(/\b(gmail|yahoo|hotmail|outlook|icloud|aol|comcast)\b[\s.]*(com|net)?/);
+      if(bare) out.push('@'+bare[1]+'.'+(bare[2]||(bare[1]==='comcast'?'net':'com'))); }
+  }
+  return out.filter((v,i,a)=>a.indexOf(v)===i);
+}
+function emailFromSpeech(t){ const c=emailCandidates(t); return (c[0]&&c[0][0]!=='@')?c[0]:null; }
 function emailRepair(v){
   if(!v) return v;
   let e=String(v).trim().toLowerCase().replace(/\s+/g,'').replace(/\.$/,'');
@@ -2268,8 +2329,48 @@ function renderEmailHelpers(){
     ? '<b style="color:var(--ok)">'+esc(e)+'</b><br><span class="faint">read back: '+esc(spell)+' … at '+esc(e.split('@')[1]||'')+'</span>'
     : '<span style="color:var(--warn)">'+esc(e)+' — not a valid address yet</span>';
 }
-function setCapturedEmail(e){ if($('emInput')){ $('emInput').value=e; renderEmailHelpers(); } }
-$('emInput').addEventListener('input',renderEmailHelpers);
+function setCapturedEmail(e){
+  if(!$('emInput')) return;
+  $('emInput').value=(e||'')[0]==='@'?($('emInput').value.split('@')[0]||'')+e:e;
+  emAutoFilled=false; renderEmailHelpers(); $('emInput').focus();
+}
+
+/* ── Email-focused captions ────────────────────────────────────────────────
+   The transcript scrolls away faster than an agent can type, so every address
+   the captions hear gets pinned above the lead card and stays there until the
+   next call. Domain-only hits still help — she then types just the name. */
+let emCands=[], emAutoFilled=false;
+function clearEmailPin(){ emCands=[]; emAutoFilled=false; if($('emPin')){ $('emPin').classList.remove('on'); $('emPinAlt').innerHTML=''; $('emPinVal').textContent='—'; $('emPinSrc').textContent=''; } }
+function scanCaptionForEmail(text,final){
+  const c=emailCandidates(text); if(!c.length) return;
+  const best=c[0];
+  emCands=[best].concat(emCands.filter(x=>x!==best)).slice(0,4);
+  // A full address outranks a bare domain no matter which arrived last.
+  const full=emCands.find(x=>x[0]!=='@');
+  const show=full||emCands[0];
+  $('emPin').classList.add('on');
+  $('emPinVal').textContent=show;
+  $('emPinSrc').textContent=final?'':'(still speaking…)';
+  const alts=emCands.filter(x=>x!==show);
+  $('emPinAlt').innerHTML=alts.map(a=>'<button class="btn btn-sm" data-emc="'+esc(a)+'" style="font-size:11px;height:24px;padding:0 7px">'+esc(a)+'</button>').join('');
+  $('emPinAlt').querySelectorAll('[data-emc]').forEach(b=>b.onclick=()=>setCapturedEmail(b.dataset.emc));
+  $('emPinVal').style.cursor='pointer';
+  $('emPinVal').title='click to use';
+  $('emPinVal').onclick=()=>setCapturedEmail(show);
+  // Fill the box for her, but never overwrite what she typed herself.
+  const cur=$('emInput').value.trim();
+  if(full&&final&&(!cur||emAutoFilled)){ $('emInput').value=full; emAutoFilled=true; renderEmailHelpers(); }
+}
+$('emListen').onclick=async()=>{
+  const on=!$('emListen').classList.contains('on');
+  $('emListen').classList.toggle('on',on);
+  $('capBox').classList.toggle('emFocus',on);
+  $('emListen').textContent=on?'🎧 Listening':'🎧 Listen';
+  if(on&&!capOn()){ $('capToggle').checked=true; $('capToggle').onchange(); }  // captions are the input
+  if(on) toast('Captions focused on the email address','ok');
+};
+// Once she edits the box it is hers — captions may still pin, never overwrite.
+$('emInput').addEventListener('input',()=>{ emAutoFilled=false; renderEmailHelpers(); });
 $('emInput').addEventListener('blur',()=>{ const r=emailRepair($('emInput').value); if(r) $('emInput').value=r; renderEmailHelpers(); });
 $('emInput').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); $('emSave').click(); } });
 $('emSave').onclick=async()=>{
