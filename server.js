@@ -249,6 +249,20 @@ const rt = {};
 //   rt[*].pending at request time, not stored here.
 let PLAYLIST_STATS = {};
 let PLAYLIST_STATS_SINCE = Date.now();
+// "Live" means TODAY: the board rolls to zero automatically at midnight in the
+// floor's business timezone (Eastern — where the leads are), so mornings never
+// open on yesterday's numbers. Manual Reset still works for intraday resets.
+const STATS_TZ = 'America/New_York';
+const statsDay = () => new Date().toLocaleDateString('en-CA', { timeZone: STATS_TZ });
+let PLAYLIST_STATS_DAY = statsDay();
+function rolloverPlaylistStats() {
+  const d = statsDay();
+  if (d === PLAYLIST_STATS_DAY) return;
+  PLAYLIST_STATS = {}; PLAYLIST_STATS_SINCE = Date.now(); PLAYLIST_STATS_DAY = d;
+  console.log(`[playlistStats] daily rollover -> ${d}`);
+  savePlaylistStats();
+}
+setInterval(rolloverPlaylistStats, 60 * 1000);
 function plStat(pid) {
   const k = pid || '__direct__';
   return PLAYLIST_STATS[k] || (PLAYLIST_STATS[k] = { calls: 0, ans: 0, md: 0, drop: 0 });
@@ -279,11 +293,11 @@ const plKeyForCampaign = (cid) => CAMP_PLAYLIST[cid] || ('c:' + cid);
 // redeploy doesn't zero the Live stats mid-shift. Saved every 15s when changed.
 let _plStatsSaved = '';
 async function savePlaylistStats() {
-  const body = JSON.stringify({ stats: PLAYLIST_STATS, since: PLAYLIST_STATS_SINCE });
+  const body = JSON.stringify({ stats: PLAYLIST_STATS, since: PLAYLIST_STATS_SINCE, day: PLAYLIST_STATS_DAY });
   if (body === _plStatsSaved || !SB_HOST) return;
   try {
     await sbReq('POST', 'app_settings?on_conflict=key',
-      { key: 'playlist_stats', value: { stats: PLAYLIST_STATS, since: PLAYLIST_STATS_SINCE },
+      { key: 'playlist_stats', value: { stats: PLAYLIST_STATS, since: PLAYLIST_STATS_SINCE, day: PLAYLIST_STATS_DAY },
         updated_at: new Date().toISOString() },
       'resolution=merge-duplicates,return=minimal');
     _plStatsSaved = body;
@@ -293,7 +307,10 @@ async function loadPlaylistStats() {
   try {
     const rows = await sbSelect('app_settings', 'key=eq.playlist_stats&select=value');
     const v = rows && rows[0] && rows[0].value;
-    if (v && v.stats) {
+    // Restore only if the stored counters are from TODAY (business tz) — a
+    // stored payload from a previous day starts fresh instead.
+    const storedDay = v && (v.day || (v.since ? new Date(v.since).toLocaleDateString('en-CA', { timeZone: STATS_TZ }) : null));
+    if (v && v.stats && storedDay === statsDay()) {
       PLAYLIST_STATS = v.stats;
       PLAYLIST_STATS_SINCE = v.since || Date.now();
       _plStatsSaved = JSON.stringify({ stats: PLAYLIST_STATS, since: PLAYLIST_STATS_SINCE });
