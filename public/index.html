@@ -3351,7 +3351,17 @@ function applyFloorState(a,state,since){
   if(stateLabel(state)!==prevLabel||!a.labelSince) a.labelSince=since||Date.now();
   updateSeatState(a.id,state);
 }
-function seatTimerTxt(a){ if(!a||!a.labelSince||a.state==='OFFLINE') return ''; return fmtMS(Math.max(0,Date.now()-a.labelSince)); }
+// Single source of truth: the server's state-start (same value the live roster
+// uses, skew-corrected). Falling back to the local label clock only if the
+// roster hasn't loaded yet — this keeps the map and the roster always in
+// agreement instead of drifting apart.
+function seatTimerTxt(a){
+  if(!a||a.state==='OFFLINE') return '';
+  const r=rosterData.find(x=>x.id===a.id);
+  const since=(r&&r.since)||a.labelSince;
+  if(!since) return '';
+  return fmtMS(Math.max(0,Date.now()-rosterSkew-since));
+}
 function seatEl(a){ const dc=stateDot(a.state); const el=document.createElement('div');
   el.className='seat seat--'+dc; el.dataset.aid=a.id;
   el.innerHTML=`<b>${esc(a.name)}</b><div class="seatstate"><span class="dot dot--${dc}"></span><span data-st>${esc(stateLabel(a.state))}</span><span data-tm class="mono" style="margin-left:auto;font-size:10px;opacity:.7;font-variant-numeric:tabular-nums">${seatTimerTxt(a)}</span></div>`;
