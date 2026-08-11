@@ -5521,12 +5521,48 @@ app.post('/webhooks/telnyx', async (req, res) => {
         await telnyx('POST', `/conferences/${cs.conf || st.conferenceId}/actions/join`, {
           call_control_id: ccid, start_conference_on_enter: true, mute: false,
         });
-        st.leadLeg = ccid; st.inbound = true; st.leadId = null;
+        // Resolve WHO is calling so the agent isn't answering blind: match the
+        // caller's number to an existing lead, else create one in the DID's
+        // campaign (an inbound caller IS a lead — usually returning our call).
+        const fromNum = normPhone(cs.from || payload.from || '');
+        const toNum = normPhone(payload.to || '');
+        let lead = null;
+        try {
+          if (fromNum) {
+            const hit = await sbSelect('leads',
+              `phone=eq.${encodeURIComponent(fromNum)}&select=*&order=created_at.desc&limit=1`);
+            lead = (hit && hit[0]) || null;
+            if (!lead && cs.campaignId) {
+              const ac = areaCodeOf(fromNum);
+              const derived = deriveFromAreaCode(ac);
+              const [row] = await sbInsert('leads', {
+                campaign_id: cs.campaignId, phone: fromNum, first_name: null, last_name: null,
+                source: 'inbound', status: 'CONTACTED', area_code: ac, state: derived.state || null,
+                timezone: derived.tz, custom: { inbound_first_call: new Date().toISOString() },
+              });
+              lead = row || null;
+              if (lead) console.log(`[inbound] created lead for new caller ${fromNum}`);
+            }
+          }
+        } catch (e) { console.error('[inbound:lead]', e.message); }
+        st.leadLeg = ccid; st.inbound = true;
+        st.leadId = lead ? lead.id : null;
+        st.leadNumber = fromNum || null;
+        st.fromNumber = toNum || null;   // the DID they called in on
         st.onCallSince = Date.now(); st.state = 'ON_CALL';
         await setAgentState(agentId, 'ON_CALL');
         startCaptionsIfWanted(agentId, ccid);
-        saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString() }, 'call-bridged-inbound');
-        console.log(`[inbound] agent ${agentId.slice(0, 8)} ON_CALL (bridged inbound)`);
+        // Push the contact card immediately (same instant path as outbound); for
+        // an unmatched caller push at least the number so the agent sees it.
+        if (lead) pushLeadContext(agentId, lead);
+        else wsToAgent(agentId, { type: 'lead.context', inbound: true,
+          lead: { id: null, phone: fromNum, first_name: null, last_name: null, custom: {} },
+          caller_id: toNum || null, onCallSince: st.onCallSince, campaign: null });
+        saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString(),
+          lead_id: lead ? lead.id : null, campaign_id: cs.campaignId || null,
+          agent_id: agentId, from_number: fromNum || null, to_number: toNum || null,
+          direction: 'inbound' }, 'call-bridged-inbound');
+        console.log(`[inbound] agent ${agentId.slice(0, 8)} ON_CALL from ${fromNum || '?'}${lead ? ' (lead matched)' : ''}`);
       }
       return;
     }
