@@ -1191,7 +1191,10 @@ async function setAgentState(id, state) {
 // (appointment / sale / lead) so they can finish paperwork. Server-authoritative
 // so it survives a client refresh and correctly gates pacing (WRAP_UP is not
 // dialable). The client renders the countdown off `wrapUntil` in the snapshot.
-const WRAP_SHORT_SEC = 3, WRAP_LONG_SEC = 180;
+// Wrap-up rule (Karim, 2026-08-11): 5 seconds after EVERY call — agents cannot
+// select or extend it — except a SALE disposition, which gets 3 minutes so the
+// agent can fill the lead into the web form.
+const WRAP_SHORT_SEC = 5, WRAP_LONG_SEC = 180;
 // Require a disposition on every CONNECTED call before the agent gets the next
 // one. When on, a talked call holds the agent in WRAP_UP with no auto-return
 // until they submit a disposition (the wrap timer starts only after they code
@@ -3626,6 +3629,35 @@ app.post('/api/agent/available', auth, async (req, res) => {
 
 // Go Offline / break. reason:'break' tracks a BREAK span (counts toward logged-in
 // time, measurable break duration); otherwise a full logout to OFFLINE.
+// End of shift: the agent's own "I am done for the day" action. Releases the
+// softphone exactly like going offline, but stamps an END_SHIFT audit entry so
+// attendance/paid-hours reporting can tell a deliberate sign-off from a drop.
+app.post('/api/agent/end-shift', auth, async (req, res) => {
+  const id = req.user.id;
+  const st = rt[id];
+  if (st && st.state === 'ON_CALL') return res.status(409).json({ error: 'finish your current call first' });
+  try {
+    if (st) {
+      clearWrapTimer(st);
+      if (st.pending) {
+        for (const cc of Object.keys(st.pending)) {
+          const pi = st.pending[cc];
+          telnyx('POST', `/calls/${cc}/actions/hangup`, {}).catch(() => {});
+          if (pi && pi.leadId && !pi.manual) sbUpdate('leads', `id=eq.${pi.leadId}`,
+            { status: 'CALLBACK', next_callback_at: new Date(Date.now() + 5 * 60e3).toISOString() }).catch(() => {});
+        }
+        st.pending = {};
+      }
+      if (st.agentLeg) telnyx('POST', `/calls/${st.agentLeg}/actions/hangup`, {}).catch(() => {});
+    }
+    delete PRESENCE[id];              // stop crediting presence once the shift is closed
+    rt[id] = { state: 'OFFLINE' };
+    await setAgentState(id, 'OFFLINE');
+    audit(req.user, 'END_SHIFT', { target_type: 'session' });
+    res.json({ ok: true });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 app.post('/api/agent/offline', auth, async (req, res) => {
   const id = req.user.id;
   const st = rt[id];
