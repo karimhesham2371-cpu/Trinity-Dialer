@@ -2266,6 +2266,7 @@ $('cXfer').onclick=async()=>{
 // make that accurate: common domains are one tap, obvious mishearings are
 // repaired, and a phonetic read-back lets the agent confirm out loud.
 const EM_DOMAINS=['gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com','aol.com','comcast.net'];
+let emHeardDom='';   // business domain picked up from the captions, if any
 const NATO={a:'Alpha',b:'Bravo',c:'Charlie',d:'Delta',e:'Echo',f:'Foxtrot',g:'Golf',h:'Hotel',i:'India',j:'Juliet',k:'Kilo',l:'Lima',m:'Mike',n:'November',o:'Oscar',p:'Papa',q:'Quebec',r:'Romeo',s:'Sierra',t:'Tango',u:'Uniform',v:'Victor',w:'Whiskey',x:'X-ray',y:'Yankee',z:'Zulu'};
 const EM_NUMW={zero:'0',one:'1',two:'2',three:'3',four:'4',five:'5',six:'6',seven:'7',eight:'8',nine:'9'};
 // Words that precede an address but are not part of it ("my email is sarah…").
@@ -2292,13 +2293,19 @@ function emailNormalize(t){
   x=x.replace(/\s+(at|@)\s+/g,'@').replace(/\s+dot\s+/g,'.').replace(/\s+period\s+/g,'.')
      .replace(/\s+underscore\s+/g,'_').replace(/\s+(dash|hyphen|minus)\s+/g,'-')
      .replace(/\s+plus\s+/g,'+');
+  // Business domains are spoken as separate words — "at we buy homes dot com".
+  // Glue everything between the @ and the TLD back into one host.
+  x=x.replace(/@\s*([a-z0-9][a-z0-9 -]{0,45})\.(com|net|org|co|us|biz|info|realty|homes|properties)\b/g,
+    (mm,host,tld)=>'@'+host.replace(/[\s]+/g,'')+'.'+tld);
   return x.replace(/\s+/g,' ');
 }
 // Returns a full address when one was spoken, otherwise the domain alone
 // ("@gmail.com") so the agent only has to type the name.
-function emailCandidates(t){
+// forceCue: the agent already asked for the address, so the seller's reply
+// counts even though the reply itself never says the word "email".
+function emailCandidates(t,forceCue){
   const x=emailNormalize(t), out=[];
-  const cue=/\b(e-?\s?mail|address)\b|@/i.test(String(t||''));
+  const cue=forceCue||/\b(e-?\s?mail|address)\b|@/i.test(String(t||''));
   const m=x.match(/([a-z0-9._%+\- ]{1,60})@([a-z0-9.-]+\.[a-z]{2,})/);
   if(m&&(cue||EM_MAILDOM.has(m[2]))){
     const toks=m[1].trim().split(/\s+/).filter(Boolean), kept=[];
@@ -2331,7 +2338,10 @@ function emailValid(e){ return /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(e||''); }
 function renderEmailHelpers(){
   if(!$('emInput')) return;
   const v=$('emInput').value.trim();
-  $('emDomains').innerHTML=EM_DOMAINS.map(d=>'<button class="btn btn-sm" data-emd="'+d+'" style="font-size:11px;height:26px;padding:0 8px">@'+d+'</button>').join('');
+  // A heard business domain (webuyhomes.com) is offered first — she types the
+  // name and taps the domain, same as the consumer providers.
+  const doms=(emHeardDom&&EM_DOMAINS.indexOf(emHeardDom)<0)?[emHeardDom].concat(EM_DOMAINS):EM_DOMAINS;
+  $('emDomains').innerHTML=doms.map((d,i)=>'<button class="btn btn-sm" data-emd="'+esc(d)+'" style="font-size:11px;height:26px;padding:0 8px'+(i===0&&d===emHeardDom?';border-color:var(--accent);color:var(--accent)':'')+'">@'+esc(d)+'</button>').join('');
   $('emDomains').querySelectorAll('[data-emd]').forEach(b=>b.onclick=()=>{
     const cur=$('emInput').value.trim();
     $('emInput').value=(cur.split('@')[0]||cur)+'@'+b.dataset.emd;
@@ -2355,8 +2365,8 @@ function setCapturedEmail(e){
    The transcript scrolls away faster than an agent can type, so every address
    the captions hear gets pinned above the lead card and stays there until the
    next call. Domain-only hits still help — she then types just the name. */
-let emCands=[], emAutoFilled=false, emPrev={};
-function clearEmailPin(){ emCands=[]; emAutoFilled=false; emPrev={}; if($('emPin')){ $('emPin').classList.remove('on'); $('emPinAlt').innerHTML=''; $('emPinVal').textContent='—'; $('emPinSrc').textContent=''; } }
+let emCands=[], emAutoFilled=false, emPrev={}, emCueUntil=0;
+function clearEmailPin(){ emCands=[]; emAutoFilled=false; emPrev={}; emCueUntil=0; emHeardDom=''; if($('emPin')){ $('emPin').classList.remove('on'); $('emPinAlt').innerHTML=''; $('emPinVal').textContent='—'; $('emPinSrc').textContent=''; } }
 // Telnyx sends captions in chunks, so "my email is john dot smith" and
 // "at gmail dot com" often arrive as two messages. Stitch a chunk onto the one
 // before it — but only when the previous chunk was already about an address AND
@@ -2365,9 +2375,15 @@ function clearEmailPin(){ emCands=[]; emAutoFilled=false; emPrev={}; if($('emPin
 const CAP_EM_CONT=/^\s*(at\b|@|dot\b|period\b|underscore\b|dash\b|gmail|g\s*mail|yahoo|hotmail|hot\s*mail|outlook|out\s*look|icloud|i\s*cloud|aol|comcast)/i;
 function scanCaptionForEmail(text,final,track){
   const k=track||'x', prev=emPrev[k]||'';
-  const stitched=(prev&&capHasEmail(prev)&&CAP_EM_CONT.test(text))?(prev+' '+text):text;
+  // A chunk can also break mid-domain ("...at we buy" / "homes dot com"), so a
+  // TLD arriving in the first few words counts as a continuation too.
+  const cont=CAP_EM_CONT.test(text)||/^\s*(\S+\s+){0,3}(dot\s+(com|net|org|co)\b|\.(com|net|org|co)\b)/i.test(text);
+  const stitched=(prev&&capHasEmail(prev)&&cont)?(prev+' '+text):text;
   if(final) emPrev[k]=text;
-  const c=emailCandidates(stitched); if(!c.length) return;
+  // "What's the best email for you?" opens a window on EITHER track — the reply
+  // is usually just "jesse lee at we buy homes dot com" with no cue word in it.
+  if(/\b(e-?\s?mail|address)\b/i.test(text)) emCueUntil=Date.now()+45000;
+  const c=emailCandidates(stitched,Date.now()<emCueUntil); if(!c.length) return;
   const best=c[0];
   emCands=[best].concat(emCands.filter(x=>x!==best)).slice(0,4);
   // A full address outranks a bare domain no matter which arrived last.
@@ -2382,6 +2398,8 @@ function scanCaptionForEmail(text,final,track){
   $('emPinVal').style.cursor='pointer';
   $('emPinVal').title='click to use';
   $('emPinVal').onclick=()=>setCapturedEmail(show);
+  const dom=show.split('@')[1]||'';
+  if(dom&&dom!==emHeardDom){ emHeardDom=dom; renderEmailHelpers(); }
   // Fill the box for her, but never overwrite what she typed herself.
   const cur=$('emInput').value.trim();
   if(full&&final&&(!cur||emAutoFilled)){ $('emInput').value=full; emAutoFilled=true; renderEmailHelpers(); }
