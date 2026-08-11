@@ -1134,7 +1134,10 @@ function logStateEvent(id, state) {
   if (st.loggedState === state) return;
   const now = new Date().toISOString();
   const durSec = st.stateStart ? Math.max(0, Math.round((Date.now() - st.stateStart) / 1000)) : null;
-  sbUpdate('agent_state_events', `agent_id=eq.${id}&ended_at=is.null`,
+  // started_at guard: this close races the insert below through independent
+  // HTTP writes — without it, a late-landing close catches the BRAND-NEW span
+  // and freezes it at 0s (undercounting paid time; bit us 2026-08-11).
+  sbUpdate('agent_state_events', `agent_id=eq.${id}&ended_at=is.null&started_at=lt.${encodeURIComponent(now)}`,
     { ended_at: now, duration_sec: durSec }).catch(() => {});
   st.loggedState = state; st.stateStart = Date.now();
   // OFFLINE isn't tracked as a span (we only closed the previous open one).
