@@ -540,6 +540,10 @@ function callableNow(lead) {
 // the agent's wait between connects at the cost of occasionally dropping a call
 // when more than one person answers at once. ring_secs caps how long a no-answer
 // rings before we give up and move to the next number (kills dead air).
+// Max simultaneous lines per agent. ReadyMode allows up to 12; the FCC 3%
+// abandonment guardrail (auto-clamp at 2.5%) is what actually governs safe
+// pacing, not this ceiling. Override with CPA_MAX env if ever needed.
+const CPA_MAX = Math.max(1, Math.min(20, parseInt(env('CPA_MAX', '12'), 10) || 12));
 let DIALER = { lines_per_agent: 1, ring_secs: 25 };
 async function loadDialerConfig() {
   if (!SB_HOST) return;
@@ -548,7 +552,7 @@ async function loadDialerConfig() {
     if (rows && rows[0] && rows[0].value) {
       const v = rows[0].value;
       DIALER = {
-        lines_per_agent: Math.max(1, Math.min(5, parseInt(v.lines_per_agent, 10) || 1)),
+        lines_per_agent: Math.max(1, Math.min(CPA_MAX, parseInt(v.lines_per_agent, 10) || 1)),
         ring_secs: Math.max(10, Math.min(60, parseInt(v.ring_secs, 10) || 25)),
       };
     }
@@ -1370,7 +1374,7 @@ app.post('/api/login', async (req, res) => {
 // this and show a "new version" banner when the server moves past them, so a
 // stale browser tab can never silently run old code again.
 const BUILD_VERSION = env('RENDER_GIT_COMMIT', 'dev').slice(0, 7);
-app.get('/api/version', (_req, res) => res.json({ v: BUILD_VERSION }));
+app.get('/api/version', (_req, res) => res.json({ v: BUILD_VERSION, cpa_max: CPA_MAX }));
 
 // Fresh identity: role + permissions come from the DB (not the JWT snapshot),
 // so a support console picks up newly-granted access without re-login.
@@ -1573,7 +1577,7 @@ app.patch('/api/admin/campaigns/:id', auth, adminOnly, async (req, res) => {
   // ── Predictive (background-AMD) pacing config ──────────────────────────────
   if (b.pacing_mode != null && ['power', 'predictive'].includes(b.pacing_mode)) patch.pacing_mode = b.pacing_mode;
   if (b.dial_ratio_min != null) patch.dial_ratio_min = Math.max(1, Math.min(4, Number(b.dial_ratio_min) || 1));
-  if (b.dial_ratio_max != null) patch.dial_ratio_max = Math.max(1, Math.min(6, Number(b.dial_ratio_max) || 3));
+  if (b.dial_ratio_max != null) patch.dial_ratio_max = Math.max(1, Math.min(CPA_MAX, Number(b.dial_ratio_max) || 3));
   if (b.abandon_soft_threshold != null) patch.abandon_soft_threshold = Math.max(0, Math.min(0.03, Number(b.abandon_soft_threshold) || 0.025));
   if (b.safe_harbor_url != null) patch.safe_harbor_url = String(b.safe_harbor_url).trim() || null;
   // amd_config: keep only the documented Telnyx sub-fields + our gated_bridge flag.
@@ -1997,7 +2001,7 @@ app.post('/api/admin/playlists', auth, adminOnly, async (req, res) => {
   const { name, priority, filters, selection_mode, lines_per_agent } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
   const lpaRaw = parseInt(lines_per_agent, 10);
-  const lpa = (lpaRaw >= 1 && lpaRaw <= 5) ? lpaRaw : null;   // null = inherit global default
+  const lpa = (lpaRaw >= 1 && lpaRaw <= CPA_MAX) ? lpaRaw : null;   // null = inherit global default
   try {
     const [row] = await sbInsert('playlists', {
       name, priority: Math.min(9, Math.max(1, priority || 5)),
@@ -2013,7 +2017,7 @@ app.patch('/api/admin/playlists/:pid', auth, adminOnly, async (req, res) => {
   const patch = {}; for (const k of allow) if (k in (req.body || {})) patch[k] = req.body[k];
   if ('lines_per_agent' in patch) {
     const n = parseInt(patch.lines_per_agent, 10);
-    patch.lines_per_agent = (n >= 1 && n <= 5) ? n : null;   // null = inherit global default
+    patch.lines_per_agent = (n >= 1 && n <= CPA_MAX) ? n : null;   // null = inherit global default
   }
   try { const [row] = await sbUpdate('playlists', `id=eq.${req.params.pid}`, patch); res.json({ ok: true, playlist: row }); }
   catch (e) { res.status(500).json({ error: e.message }); }
@@ -2346,7 +2350,7 @@ app.get('/api/admin/settings/dialer', auth, adminOnly, async (_req, res) => {
 app.put('/api/admin/settings/dialer', auth, adminOnly, async (req, res) => {
   const lpa = parseInt(req.body && req.body.lines_per_agent, 10);
   const rs = parseInt(req.body && req.body.ring_secs, 10);
-  if (!(lpa >= 1 && lpa <= 5)) return res.status(400).json({ error: 'lines_per_agent must be 1-5' });
+  if (!(lpa >= 1 && lpa <= CPA_MAX)) return res.status(400).json({ error: `lines_per_agent must be 1-${CPA_MAX}` });
   if (!(rs >= 10 && rs <= 60)) return res.status(400).json({ error: 'ring_secs must be 10-60' });
   const value = { lines_per_agent: lpa, ring_secs: rs };
   try {
@@ -2994,7 +2998,7 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
         liveDial[k] = (liveDial[k] || 0) + 1;
       }
     }
-    const cpaOf = (pl) => { const n = pl && pl.lines_per_agent; return (n >= 1 && n <= 5) ? n : DIALER.lines_per_agent; };
+    const cpaOf = (pl) => { const n = pl && pl.lines_per_agent; return (n >= 1 && n <= CPA_MAX) ? n : DIALER.lines_per_agent; };
     const liveKeys = (playlists || []).filter(p => p.active !== false && runningByPl[p.id] && onlineByPl[p.id]).map(p => p.id);
     const keys = new Set([...Object.keys(PLAYLIST_STATS), ...Object.keys(liveDial), ...liveKeys]);
     const rows = [];
@@ -4470,7 +4474,7 @@ async function pacingTick() {
       if (!st || !st.conferenceId || st.leadLeg || st.inbound) return false;
       if (st.state !== 'AVAILABLE' && st.state !== 'DIALING') return false;
       const inFlight = st.pending ? Object.keys(st.pending).length : 0;
-      return inFlight < 5;   // hard max; real per-playlist CPA enforced in the loop
+      return inFlight < CPA_MAX;   // hard max; real per-playlist CPA enforced in the loop
     });
     PACER_DEBUG = { at: new Date().toISOString(), rtAgents: Object.keys(rt).length, free: freeAgents.length };
     if (!freeAgents.length) return;
@@ -4515,7 +4519,7 @@ async function pacingTick() {
     // DIALER.lines_per_agent; null/invalid on the playlist = inherit global.
     const cpaOf = (pl) => {
       const n = pl && pl.lines_per_agent;
-      return (n >= 1 && n <= 5) ? n : DIALER.lines_per_agent;
+      return (n >= 1 && n <= CPA_MAX) ? n : DIALER.lines_per_agent;
     };
 
     // Pick the next dialable lead for one agent, honouring its playlist priority.
