@@ -5379,6 +5379,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
           // The assistant's end_call tool already wrote the definitive outcome to the
           // lead; don't clobber it with the generic ai_contacted/no_answer default.
         } else if (talked) {
+          st.inbound = false;   // inbound calls with a lead follow the normal wrap/disposition flow
           if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.CONTACTED`, { last_outcome: 'ai_contacted' }).catch(() => {});
         } else {
           // Never reached a human (no-answer/busy/ring-timeout). Machine was already
@@ -5830,11 +5831,11 @@ app.post('/webhooks/telnyx', async (req, res) => {
           ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }, 'call-ended-lead');
         const wasInbound = st.inbound === true;
         st.leadLeg = null; st.leadNumber = null; st.fromNumber = null; st.onCallSince = null;
-        if (wasInbound) {
-          // Inbound calls have no lead to disposition — return straight to AVAILABLE.
-          st.inbound = false; st.leadId = null;
+        if (wasInbound && !st.leadId) {
+          // Unidentified caller (no lead attached) — nothing to code, go straight back.
+          st.inbound = false;
           if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
-          console.log(`[bridge] inbound ended, agent ${agentId.slice(0, 8)} AVAILABLE`);
+          console.log(`[bridge] inbound ended (no lead), agent ${agentId.slice(0, 8)} AVAILABLE`);
         } else if (talked) {
           // Talked to a human → WRAP_UP, keeping leadId so /context + /disposition
           // resolve the right lead. When REQUIRE_DISPOSITION is on we do NOT start
