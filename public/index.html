@@ -1112,6 +1112,7 @@ function openWs(){
       // Bridge is happening — open the speaker NOW (this push can beat the
       // agent.state push by a beat; never clip the seller's "hello").
       openAudioNow();
+      inboundCall=!!m.inbound;
       // Server pushes the full lead profile at bridge time — render instantly
       // instead of waiting for the loadContext HTTP round trip (which still
       // runs on ON_CALL and fills in call history).
@@ -1367,7 +1368,7 @@ async function loadContext(){
   }catch(e){ /* transient */ }
 }
 
-let renderedLeadId=null, curLeadObj=null, curCallerId=null;
+let renderedLeadId=null, curLeadObj=null, curCallerId=null, inboundCall=false;
 function renderLead(l, callerId){
   curLeadObj=l; curCallerId=callerId;
   const name=[l.first_name,l.last_name].filter(Boolean).join(' ')||'Unknown contact';
@@ -1396,7 +1397,7 @@ function renderLead(l, callerId){
   $('leadCard').classList.remove('empty');
   $('leadCard').innerHTML=`
     <div style="display:flex;align-items:flex-start;gap:8px">
-      <h3 class="leadName" style="flex:1">${esc(name)}</h3>
+      <h3 class="leadName" style="flex:1">${esc(name)}${inboundCall?' <span class="pill pill--info" style="vertical-align:middle;margin-left:6px">📞 inbound</span>':''}</h3>
       ${fullAddr?`<a class="btn btn-sm" target="_blank" rel="noopener" title="Google this property" href="https://www.google.com/search?q=${encodeURIComponent(fullAddr)}">🔍</a>`:''}
       <button id="leadEdit" class="btn btn-sm" title="Fix wrong contact data">✎ Edit</button>
     </div>
@@ -1423,7 +1424,7 @@ function renderLead(l, callerId){
   // Only clear notes when a NEW lead lands — the instant WS push and the
   // loadContext refresh both render the same lead, and the second render must
   // not wipe what the agent already typed.
-  if(renderedLeadId!==l.id){ $('notes').value=''; renderedLeadId=l.id; loadLeadRecordings(l.id); }
+  if(renderedLeadId!==l.id){ $('notes').value=''; renderedLeadId=l.id; if(l.id) loadLeadRecordings(l.id); }
 }
 // In-place edit form for the lead card — fix bad data mid-call, save, re-render.
 function renderLeadEdit(){
@@ -1960,7 +1961,7 @@ function beep(){
 }
 
 function clearLead(){
-  curLeadId=null; renderedLeadId=null; curLeadObj=null;
+  curLeadId=null; renderedLeadId=null; curLeadObj=null; inboundCall=false;
   const lr=$('leadRecs'); if(lr) lr.remove();
   const ab=$('aiBox'); if(ab) ab.remove();
   const xb=$('xferBrief'); if(xb) xb.remove();
@@ -2608,7 +2609,7 @@ function dialerGuideHtml(role){
   sec('Numbers &amp; inbound calls',['admin','Admin'],
     '<h4>Numbers</h4>Leads → Numbers: see every Telnyx number, buy new ones by area code, and assign each DID to a campaign.'+
     '<h4>Outbound caller ID</h4>Auto-rotated per call matching the lead\'s area code where possible; agents can lock a specific one for manual dialing.'+
-    '<h4>Inbound</h4>A caller ringing any of your numbers is routed to a <b>random Ready agent</b> on that number\'s campaign (ReadyMode-style rotation). Nobody Ready → voicemail box: recorded, transcribed, and queued as a callback.')+
+    '<h4>Inbound</h4>The caller&rsquo;s contact card opens automatically with a <b>📞 inbound</b> badge — matched to an existing lead (full history, notes and dispositions work) or created from their number, so nobody answers blind. A caller ringing any of your numbers is routed to a <b>random Ready agent</b> on that number\'s campaign (ReadyMode-style rotation). Nobody Ready → voicemail box: recorded, transcribed, and queued as a callback.')+
 
   sec('Analytics &amp; Reports',['admin','Admin'],
     '<ul>'+
