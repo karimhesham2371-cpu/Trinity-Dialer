@@ -394,6 +394,7 @@ async function loadTeamChat() {
 // stored on leads.custom.ai, and the agent's console gets a live push so the
 // note box pre-fills while they're still in wrap-up.
 const AI_WRAP_ON = env('AI_WRAP', '1') !== '0';
+const AI_WRAP_STATS = { ok: 0, fail: 0, skipped: 0, lastError: null };   // surfaced on /health
 const AI_WRAP_MODEL = env('AI_WRAP_MODEL', 'anthropic/claude-haiku-4-5');
 const AI_STT_MODEL = env('AI_STT_MODEL', 'distil-whisper/distil-large-v2');
 async function telnyxAIChat(messages, maxTokens) {
@@ -406,14 +407,29 @@ async function telnyxAIChat(messages, maxTokens) {
   const j = await r.json();
   return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
 }
+// Telnyx transcription CANNOT fetch a URL itself (file_url always fails with
+// "failed to get file_url" — this silently killed the AI wrap for a full day:
+// 90 eligible calls, 1 summary). We fetch the audio ourselves — with the right
+// credentials for whichever store it lives in — and upload the bytes.
 async function telnyxTranscribe(fileUrl) {
+  let src = fileUrl, headers = {};
+  if (isArchived(fileUrl)) {
+    src = `https://${SB_HOST}/storage/v1/object/${fileUrl.slice(3)}`;
+    headers = { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` };
+  } else if (/api\.telnyx\.com/i.test(fileUrl)) {
+    headers = { Authorization: `Bearer ${TELNYX_KEY}` };
+  }
+  const audio = await fetchT(src, { headers }, 30000);
+  if (!audio.ok) throw new Error(`recording fetch HTTP ${audio.status}`);
+  const buf = Buffer.from(await audio.arrayBuffer());
+  if (buf.length < 2000) throw new Error(`recording too small (${buf.length}B)`);
   const form = new FormData();
   form.append('model', AI_STT_MODEL);
-  form.append('file_url', fileUrl);
-  const r = await fetch('https://api.telnyx.com/v2/ai/audio/transcriptions', {
+  form.append('file', new Blob([buf], { type: 'audio/mpeg' }), 'call.mp3');
+  const r = await fetchT('https://api.telnyx.com/v2/ai/audio/transcriptions', {
     method: 'POST', headers: { Authorization: `Bearer ${TELNYX_KEY}` }, body: form,
-  });
-  if (!r.ok) throw new Error(`transcribe HTTP ${r.status}: ${(await r.text().catch(() => '')).slice(0, 120)}`);
+  }, 60000);
+  if (!r.ok) throw new Error(`transcribe HTTP ${r.status}: ${(await r.text().catch(() => '')).slice(0, 160)}`);
   const j = await r.json();
   return (j.text || '').trim();
 }
@@ -430,7 +446,7 @@ async function aiWrapAnalyze(ccid, recUrl) {
   // and never-bridged legs (pure ring/machine recordings) are skipped.
   if (!call || !call.agent_id || !call.lead_id || !call.bridged_at) return;
   const talkSec = call.ended_at ? (new Date(call.ended_at) - new Date(call.bridged_at)) / 1000 : null;
-  if (talkSec != null && talkSec < 12) return;   // too short to contain a conversation
+  if (talkSec != null && talkSec < 12) { AI_WRAP_STATS.skipped++; return; }   // too short to contain a conversation
   const transcript = (await telnyxTranscribe(recUrl)).slice(0, 9000);
   if (transcript.length < 60) return;
   const cfg = await campaignConfig(call.campaign_id).catch(() => null);
@@ -1427,6 +1443,7 @@ app.get('/health', (_req, res) => {
     telnyx_key: !!TELNYX_KEY, connection_id: !!CONNECTION_ID, supabase: !!(SB_HOST && SB_KEY),
     caller_pool: CALLER_POOL.length, agents_online: Object.keys(rt).length,
     balance: BALANCE.amount, balance_currency: BALANCE.currency,
+    ai_wrap: AI_WRAP_STATS,
     pacer: { busy: pacingBusy, busy_for_sec: pacingBusy ? Math.round((Date.now() - pacingBusyAt) / 1000) : 0,
       last_tick_ago_sec: PACER_LAST_TICK ? Math.round((Date.now() - PACER_LAST_TICK) / 1000) : null },
     pacer_debug: PACER_DEBUG,
@@ -5359,7 +5376,9 @@ app.post('/webhooks/telnyx', async (req, res) => {
       // Small delay lets the call-ended/bridged fields land on the calls row first.
       if (ccid && url && AI_WRAP_ON && TELNYX_KEY && !vmboxRt[ccid]) {
         setTimeout(() => aiWrapAnalyze(ccid, url)
-          .catch(e => console.error(`[ai-wrap] ${ccid.slice(-8)}: ${e.message}`)), 4000);
+          .then(() => { AI_WRAP_STATS.ok++; })
+          .catch(e => { AI_WRAP_STATS.fail++; AI_WRAP_STATS.lastError = e.message;
+            console.error(`[ai-wrap] ${ccid.slice(-8)}: ${e.message}`); }), 4000);
       }
       // Voicemail-box recording → file it into the callback queue (spec §4).
       if (ccid && vmboxRt[ccid]) {
