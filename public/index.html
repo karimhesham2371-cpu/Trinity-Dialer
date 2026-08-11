@@ -862,7 +862,7 @@
 </div>
 
 <audio id="remoteAudio" autoplay muted></audio>
-<div id="balBanner" class="hidden" style="position:fixed;top:0;left:0;right:0;z-index:240;background:var(--danger);color:#fff;font:600 13px var(--font-ui);padding:9px 18px;text-align:center"></div>
+<div id="balBanner" class="hidden" title="Click to dismiss" style="position:fixed;bottom:76px;left:18px;z-index:180;max-width:300px;border-radius:10px;background:var(--danger);color:#fff;font:600 12px var(--font-ui);padding:9px 12px;box-shadow:0 6px 20px rgba(0,0,0,.45);cursor:pointer"></div>
 <div id="updateBanner" class="hidden" title="Click to load the new version">
   ⬆ A new version is available — click here to update (finish your current call first)
 </div>
@@ -2063,16 +2063,19 @@ let buildV=null, CPA_MAX=12;   // server-authoritative; refreshed by checkBuild(
 // Carrier balance watch: a zero/negative balance stops every call — including
 // the one that brings an agent's softphone online — so it must never be a
 // silent condition for whoever runs the floor.
+let balDismissed=null;   // level the user dismissed; a worse level re-shows
 async function checkBalance(){
   if(!TOKEN||!USER||!['admin','support'].includes(USER.role)) return;
   try{
     const b=await apiJson('/api/admin/balance');
     const el=$('balBanner');
+    el.onclick=()=>{ balDismissed=b.level; el.classList.add('hidden'); };
+    if(balDismissed==='critical'||(balDismissed==='low'&&b.level!=='critical')){ el.classList.add('hidden'); return; }
     if(b.level==='critical'){
-      el.textContent='⚠ Telnyx balance is '+b.amount+' '+b.currency+' — calls cannot be placed and agents cannot go online. Top up now.';
+      el.textContent='⚠ Balance '+b.amount+' '+b.currency+' — calls cannot be placed. Top up now.';
       el.style.background='var(--danger)'; el.classList.remove('hidden');
     } else if(b.level==='low'){
-      el.textContent='Telnyx balance is low: '+b.amount+' '+b.currency+' — top up to avoid the floor stopping mid-shift.';
+      el.textContent='Balance low: '+b.amount+' '+b.currency+' — top up soon.';
       el.style.background='var(--warn)'; el.style.color='var(--accent-ink)'; el.classList.remove('hidden');
     } else el.classList.add('hidden');
   }catch(e){}
