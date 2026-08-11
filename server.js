@@ -182,13 +182,16 @@ async function recycleSystemOutcome(leadId, kind) {
     }
     const rows = await sbSelect('leads', `id=eq.${leadId}&select=attempts,status`);
     const lead = rows && rows[0];
-    if (!lead || lead.status !== 'IN_PROGRESS') return;   // already coded / moved on
+    // Recyclable = still mid-dial, or parked by a lane that set a terminal
+    // system status. Agent-coded outcomes (DONE/DNC/CALLBACK/...) are never touched.
+    const RECYCLABLE = new Set(['IN_PROGRESS', 'NO_ANSWER', 'MACHINE']);
+    if (!lead || !RECYCLABLE.has(lead.status)) return;   // already coded / moved on
     const r = RECYCLE[kind] || RECYCLE.no_answer;
     if ((lead.attempts || 0) >= r.max_rounds) {
-      await sbUpdate('leads', `id=eq.${leadId}&status=eq.IN_PROGRESS`, { status: 'EXHAUSTED', last_outcome: kind });
+      await sbUpdate('leads', `id=eq.${leadId}`, { status: 'EXHAUSTED', last_outcome: kind });
     } else {
       const next = new Date(Date.now() + r.delay_minutes * 60000).toISOString();
-      await sbUpdate('leads', `id=eq.${leadId}&status=eq.IN_PROGRESS`, { status: 'NEW', next_callback_at: next, last_outcome: kind });
+      await sbUpdate('leads', `id=eq.${leadId}`, { status: 'NEW', next_callback_at: next, last_outcome: kind });
     }
   } catch (e) { console.error('[recycle]', e.message); }
 }
@@ -5014,8 +5017,7 @@ async function enginePacingTick() {
       if (Date.now() - (dialerRt[cc].at || 0) > DIALER_MAX_CALL_MS) {
         const info = dialerRt[cc]; delete dialerRt[cc];
         telnyx('POST', `/calls/${cc}/actions/hangup`, {}).catch(() => {});
-        if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
-          { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+        if (info.leadId) recycleSystemOutcome(info.leadId, 'no_answer').catch(() => {});
         console.log(`[engine] reclaimed stale slot ...${cc.slice(-8)}`);
       }
     }
@@ -5238,7 +5240,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
           // started (greet_first), so voicemails don't run the full assistant.
           delete aiRt[ccid];
           await telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
-          if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}`, { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
+          if (cs.leadId) recycleSystemOutcome(cs.leadId, 'voicemail').catch(() => {});
           saveCall({ telnyx_call_control_id: ccid, amd_result: r }, 'call-ai-machine');
           console.log(`[ai] dropped machine ${ccid ? ccid.slice(-8) : '-'} (result=${r})`);
         }
@@ -5335,7 +5337,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
           info.phase = 'MACHINE'; delete dialerRt[ccid];
           telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
           saveCall({ telnyx_call_control_id: ccid, call_phase: 'MACHINE', ended_at: new Date().toISOString() }, 'engine-machine');
-          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`, { status: 'MACHINE', last_outcome: 'auto_answering_machine' }).catch(() => {});
+          if (info.leadId) recycleSystemOutcome(info.leadId, 'voicemail').catch(() => {});
           autoDisposition(info, 'AUTO_ANSWERING_MACHINE');
           console.log(`[engine] machine ...${ccid.slice(-8)} (${r}) — leg killed, slot freed`);
           return;
@@ -5390,7 +5392,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
           // ended/prompt_ended without a beep — nothing to drop into; hang up.
           info.phase = 'MACHINE'; delete dialerRt[ccid];
           telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
-          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`, { status: 'MACHINE', last_outcome: 'auto_answering_machine' }).catch(() => {});
+          if (info.leadId) recycleSystemOutcome(info.leadId, 'voicemail').catch(() => {});
         }
         return;
       }
@@ -5404,13 +5406,11 @@ app.post('/webhooks/telnyx', async (req, res) => {
         // Only mark NO_ANSWER if we never got past DETECTING (i.e. no human/machine
         // verdict was recorded). MACHINE/ABANDONED/VOICEMAIL already dispositioned.
         if (info.phase === 'DIALING' || info.phase === 'DETECTING') {
-          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
-            { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+          if (info.leadId) recycleSystemOutcome(info.leadId, 'no_answer').catch(() => {});
         } else if (info.phase === 'WAIT_BEEP') {
           // Machine hung up before the beep: it WAS a machine — record it so the
           // lead doesn't stay stuck IN_PROGRESS and the kill is still countable.
-          if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
-            { status: 'MACHINE', last_outcome: 'auto_answering_machine' }).catch(() => {});
+          if (info.leadId) recycleSystemOutcome(info.leadId, 'voicemail').catch(() => {});
           autoDisposition(info, 'AUTO_ANSWERING_MACHINE');
         }
         return;
@@ -5433,8 +5433,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         // lands in this branch and must keep its recorded phase.
         saveCall({ telnyx_call_control_id: ccid, ended_at: new Date().toISOString(),
           hangup_cause: payload.hangup_cause || null }, 'engine-orphan-hangup');
-        sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.IN_PROGRESS`,
-          { status: 'NO_ANSWER', last_outcome: 'no_answer' }).catch(() => {});
+        recycleSystemOutcome(cs.leadId, 'no_answer').catch(() => {});
       }
       return;
     }
@@ -5585,8 +5584,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         if (!wantVm) {
           if (st && st.leadLeg === ccid) { st.leadLeg = null; st.onCallSince = null; }
           telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
-          if (info && info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
-            { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
+          if (info && info.leadId) recycleSystemOutcome(info.leadId, 'voicemail').catch(() => {});
         }
         // wantVm: leave the leg up; call.machine.*.greeting.ended handles the drop.
       }
@@ -5623,8 +5621,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         // No beep / no consent path in gated mode: don't leave the agent on a machine.
         if (st && st.leadLeg === ccid) { st.leadLeg = null; st.onCallSince = null; }
         telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
-        if (info && info.leadId) sbUpdate('leads', `id=eq.${info.leadId}&status=eq.IN_PROGRESS`,
-          { status: 'MACHINE', last_outcome: 'machine' }).catch(() => {});
+        if (info && info.leadId) recycleSystemOutcome(info.leadId, 'voicemail').catch(() => {});
       }
       return;
     }
