@@ -5379,7 +5379,6 @@ app.post('/webhooks/telnyx', async (req, res) => {
           // The assistant's end_call tool already wrote the definitive outcome to the
           // lead; don't clobber it with the generic ai_contacted/no_answer default.
         } else if (talked) {
-          st.inbound = false;   // inbound calls with a lead follow the normal wrap/disposition flow
           if (cs.leadId) sbUpdate('leads', `id=eq.${cs.leadId}&status=eq.CONTACTED`, { last_outcome: 'ai_contacted' }).catch(() => {});
         } else {
           // Never reached a human (no-answer/busy/ring-timeout). Machine was already
@@ -5837,6 +5836,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
           if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
           console.log(`[bridge] inbound ended (no lead), agent ${agentId.slice(0, 8)} AVAILABLE`);
         } else if (talked) {
+          st.inbound = false;   // an inbound call with a lead follows the normal wrap/disposition flow
           // Talked to a human → WRAP_UP, keeping leadId so /context + /disposition
           // resolve the right lead. When REQUIRE_DISPOSITION is on we do NOT start
           // an auto-return: the agent is held (awaitingDisp) until they code the
