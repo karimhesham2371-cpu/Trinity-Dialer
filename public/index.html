@@ -3268,7 +3268,9 @@ async function renderMap(){
       <button id="fmSend" class="btn btn-primary" style="white-space:nowrap">📣 Send</button>
     </div>
     <div class="floorwrap" id="floor"></div>
-    <div class="lbl mt3">Unseated agents</div><div class="benchwrap" id="bench"></div>`;
+    <div class="lbl mt3">Unseated agents</div><div class="benchwrap" id="bench"></div>
+    <div class="lbl mt3">Live floor <span class="faint" style="text-transform:none;letter-spacing:0">— who is doing what, right now</span></div>
+    <div class="tblwrap mt2"><div id="liveRoster"><p class="dim" style="padding:12px">Loading…</p></div></div>`;
   $('fmSend').onclick=async()=>{
     const text=$('fmText').value.trim();
     if(!text){ toast('Type a message first','warn'); return; }
@@ -3280,7 +3282,7 @@ async function renderMap(){
     finally{ b.disabled=false; }
   };
   $('fmText').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); $('fmSend').click(); } });
-  drawFloor(); openAdminWs(); ensureFloorTimer();
+  drawFloor(); openAdminWs(); ensureFloorTimer(); startLiveRoster();
   // Belt and braces: re-pull the authoritative snapshot every 30s so even a
   // missed push can only be stale for half a minute.
   if(window._floorSnapT) clearInterval(window._floorSnapT);
@@ -3294,6 +3296,49 @@ async function renderMap(){
         else if(a.stateSince && stateLabel(a.state)===stateLabel(cur.state) && !cur._labelHeld) cur.labelSince=Math.min(cur.labelSince||a.stateSince, a.stateSince); });
     }catch(e){}
   },30000);
+}
+// ── Live floor roster: state + live in-state clock + today's totals ──
+let rosterData=[], rosterPollT=null, rosterSkew=0;
+function rosterDur(sec){ sec=Math.max(0,Math.round(sec||0)); const h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),x=sec%60;
+  return h?h+'h '+String(m).padStart(2,'0')+'m':(m?m+'m '+String(x).padStart(2,'0')+'s':x+'s'); }
+function renderRoster(){
+  const box=$('liveRoster'); if(!box) return;
+  if(!rosterData.length){ box.innerHTML='<p class="dim" style="padding:12px">No agents or closers yet.</p>'; return; }
+  const order={ON_CALL:0,WRAP_UP:1,AVAILABLE:2,DIALING:2,CLAIMING:2,RESERVED:2,CONNECTING:3,BREAK:4,MEETING:5,OFFLINE:9};
+  const rows=[...rosterData].sort((a,b)=>(order[a.state]??8)-(order[b.state]??8)||a.name.localeCompare(b.name));
+  box.innerHTML=`<table class="wbtbl"><thead><tr>
+      <th>Agent</th><th>Status</th><th style="text-align:right">In state</th>
+      <th style="text-align:right">Talk</th><th style="text-align:right">Wait</th><th style="text-align:right">Wrap</th>
+      <th style="text-align:right">Break</th><th style="text-align:right">Calls</th><th style="text-align:right">Sales</th>
+      <th style="text-align:right">Paid</th></tr></thead><tbody>${rows.map(r=>{
+    const dc=stateDot(r.state);
+    return `<tr data-rid="${r.id}">
+      <td>${esc(r.name)}${r.role==='closer'?' <span class="pill pill--ok" style="font-size:9px">closer</span>':''}</td>
+      <td><span class="pill pill--${dc}"><span class="dot dot--${dc}${r.state==='ON_CALL'?' dot--pulse':''}"></span> ${esc(stateLabel(r.state))}</span></td>
+      <td class="mono" style="text-align:right" data-rtm>${r.since?fmtMS(Math.max(0,Date.now()-rosterSkew-r.since)):'—'}</td>
+      <td class="mono" style="text-align:right">${rosterDur(r.talk)}</td>
+      <td class="mono" style="text-align:right">${rosterDur(r.wait)}</td>
+      <td class="mono" style="text-align:right">${rosterDur(r.wrap)}</td>
+      <td class="mono" style="text-align:right">${rosterDur(r.brk)}</td>
+      <td class="mono" style="text-align:right">${r.calls}</td>
+      <td class="mono" style="text-align:right;color:${r.sales?'var(--ok)':'inherit'}">${r.sales}</td>
+      <td class="mono" style="text-align:right">${rosterDur(r.paid)}</td></tr>`;}).join('')}</tbody></table>`;
+}
+function tickRoster(){
+  const box=$('liveRoster'); if(!box) return;
+  rosterData.forEach(r=>{ const tr=box.querySelector('[data-rid="'+r.id+'"]'); if(!tr) return;
+    const c=tr.querySelector('[data-rtm]'); if(c) c.textContent=r.since?fmtMS(Math.max(0,Date.now()-rosterSkew-r.since)):'—'; });
+}
+async function loadRoster(){
+  if(!$('liveRoster')) return;
+  try{ const j=await apiJson('/api/admin/floor/live');
+    rosterSkew=Date.now()-(j.server_now||Date.now());   // align to server clock
+    rosterData=j.rows||[]; renderRoster(); }catch(e){}
+}
+function startLiveRoster(){
+  loadRoster();
+  if(rosterPollT) clearInterval(rosterPollT);
+  rosterPollT=setInterval(()=>{ if(!$('liveRoster')){ clearInterval(rosterPollT); rosterPollT=null; return; } loadRoster(); },5000);
 }
 function stateLabel(s){ return ({AVAILABLE:'Waiting',DIALING:'Waiting',CLAIMING:'Waiting',RESERVED:'Waiting',ON_CALL:'On call',WRAP_UP:'Wrap up',BREAK:'Break',MEETING:'Meeting',CONNECTING:'Connecting',OFFLINE:'Offline'})[s]||s; }
 // The seat timer measures how long the agent has been in the state the
@@ -3328,15 +3373,30 @@ function updateSeatState(aid,state){
   const a=floorAgents.find(x=>x.id===aid); const tm=el.querySelector('[data-tm]'); if(tm) tm.textContent=seatTimerTxt(a);
 }
 let floorTimerInt=null;
+// Repaint every seat clock from its stored start time. Called by the 1s tick,
+// but ALSO the moment the tab becomes visible/focused — browsers throttle
+// background-tab timers to ~1/minute, which froze these clocks on whatever
+// value they held when the tab lost focus (they read 00:00 right after a state
+// change). Never trust the interval alone for what the supervisor sees.
+function repaintSeatTimers(){
+  const floor=$('floor'); if(!floor) return false;
+  floorAgents.forEach(a=>{ const el=floor.querySelector('.seat[data-aid="'+a.id+'"]'); if(!el) return;
+    const tm=el.querySelector('[data-tm]'); if(tm) tm.textContent=seatTimerTxt(a);
+    const st=el.querySelector('[data-st]'); if(st) st.textContent=stateLabel(a.state); });
+  return true;
+}
 function ensureFloorTimer(){
   if(floorTimerInt) return;
   floorTimerInt=setInterval(()=>{
     const floor=$('floor');
     if(!floor||!document.body.contains(floor)){ clearInterval(floorTimerInt); floorTimerInt=null; return; }
-    floorAgents.forEach(a=>{ const el=floor.querySelector('.seat[data-aid="'+a.id+'"]'); if(!el) return;
-      const tm=el.querySelector('[data-tm]'); if(tm) tm.textContent=seatTimerTxt(a); });
+    repaintSeatTimers(); tickRoster();
   },1000);
 }
+// Instant catch-up whenever the operator actually looks at the page.
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden){ repaintSeatTimers(); tickRoster(); loadRoster(); } });
+window.addEventListener('focus',()=>{ repaintSeatTimers(); tickRoster(); });
+window.addEventListener('pageshow',repaintSeatTimers);
 function makeDraggable(el, agentId){
   el.addEventListener('mousedown',(e)=>{
     e.preventDefault(); const floor=$('floor'); const rect=floor.getBoundingClientRect();

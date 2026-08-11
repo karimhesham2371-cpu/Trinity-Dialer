@@ -3234,6 +3234,59 @@ app.get('/api/admin/reports/attendance', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Live floor roster: every agent's current state + today's totals in ONE
+// response (two queries, aggregated in memory) so a supervisor can see who is
+// working, who is waiting and who is idle, refreshed every few seconds.
+let _liveFloorCache = { at: 0, data: null };
+app.get('/api/admin/floor/live', auth, adminOnly, async (_req, res) => {
+  if (Date.now() - _liveFloorCache.at < 3000 && _liveFloorCache.data) return res.json(_liveFloorCache.data);
+  try {
+    const d = new Date();
+    const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const dayIso = new Date(dayStart).toISOString();
+    const [users, spans, calls, disps] = await Promise.all([
+      sbSelect('agents', 'role=in.(agent,closer)&active=eq.true&select=id,name,role&order=name.asc'),
+      sbSelectAll('agent_state_events', `started_at=gte.${dayIso}&select=agent_id,state,started_at,ended_at`),
+      sbSelectAll('calls', `created_at=gte.${dayIso}&bridged_at=not.is.null&select=agent_id`),
+      sbSelectAll('dispositions', `created_at=gte.${dayIso}&select=agent_id,code`),
+    ]);
+    const now = Date.now();
+    const agg = {};
+    const A = (id) => agg[id] || (agg[id] = { talk: 0, wrap: 0, brk: 0, wait: 0, meeting: 0,
+      worked: [], present: [], calls: 0, sales: 0 });
+    for (const sp of spans || []) {
+      const a = A(sp.agent_id);
+      const st = new Date(sp.started_at).getTime();
+      const en = sp.ended_at ? new Date(sp.ended_at).getTime() : now;
+      const dur = Math.max(0, en - st) / 1000;
+      if (sp.state === 'PRESENT') { a.present.push([st, en]); continue; }
+      if (sp.state === 'SESSION') continue;
+      if (PROD_LOGGED.has(sp.state)) a.worked.push([st, en]);
+      if (sp.state === 'ON_CALL') a.talk += dur;
+      else if (sp.state === 'WRAP_UP') a.wrap += dur;
+      else if (sp.state === 'BREAK') a.brk += dur;
+      else if (sp.state === 'MEETING') a.meeting += dur;
+      else if (['AVAILABLE', 'DIALING', 'CLAIMING', 'RESERVED', 'CONNECTING'].includes(sp.state)) a.wait += dur;
+    }
+    for (const c of calls || []) if (c.agent_id) A(c.agent_id).calls++;
+    for (const dp of disps || []) if (dp.agent_id && LONG_WRAP_RE.test(dp.code || '')) A(dp.agent_id).sales++;
+    const rows = (users || []).map(u => {
+      const a = agg[u.id] || A(u.id);
+      const st = rt[u.id] || {};
+      return { id: u.id, name: u.name, role: u.role,
+        state: st.state || 'OFFLINE', since: st.stateStart || null,
+        connected: !!st.conferenceId,
+        talk: Math.round(a.talk), wrap: Math.round(a.wrap), brk: Math.round(a.brk),
+        wait: Math.round(a.wait), meeting: Math.round(a.meeting),
+        paid: Math.round(unionSeconds([...a.worked, ...a.present], dayStart, now)),
+        calls: a.calls, sales: a.sales };
+    });
+    const data = { rows, server_now: now };
+    _liveFloorCache = { at: Date.now(), data };
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Office map: one agent's productivity today (panel shown on seat click) —
 // logged-in-at, hours logged, break / wrap durations, calls handled.
 app.get('/api/admin/floor/agent-stats', auth, adminOnly, async (req, res) => {
