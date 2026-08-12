@@ -4905,10 +4905,17 @@ async function renderPlaylistStats(){
         <button class="btn" id="plsReset" style="flex:0 0 auto">Reset counters</button>
       </div>
     </div>
-    <p class="dim" style="font-size:13px;margin-top:6px"><b>CPA</b> lines/agent (predictive shows the ceiling with the ratio in force now) · <b>Calls</b> dialed · <b>Ans</b> answered by an agent · <b>MD</b> machine-detected · <b>Drop</b> answered with no free agent (abandoned) · <b>Abd%</b> = Drop ÷ Ans · <b>Dial</b> ringing now. Counters cover <b>today</b> and reset automatically at midnight Eastern — mornings always start at zero (Reset counters clears them sooner). Watch <b>Abd%</b> — if it climbs, lower the playlist CPA. Live playlists (green dot) appear the moment they have a running campaign and connected agents. Auto-refresh 1s.</p>
+    <p class="dim" style="font-size:13px;margin-top:6px"><b>CPA</b> lines/agent (predictive shows the ceiling with the ratio in force now) · <b>Calls</b> dialed · <b>Ans</b> answered by an agent · <b>MD</b> machine-detected · <b>Drop</b> answered with no free agent (abandoned) · <b>Abd%</b> = Drop ÷ Ans · <b>Dial</b> ringing now. Calls/Ans/MD/Drop/Abd% cover <b>today</b> (reset at midnight Eastern; Reset counters clears them sooner). <b>NOW</b> is a rolling <b>15-minute</b> window — that is the one that reacts to a CPA change within minutes, because today's Abd% keeps this morning's drops in the numerator until midnight. Judge a pacing change by <b>NOW</b>, not by the daily figure. Live playlists (green dot) appear the moment they have a running campaign and connected agents. Auto-refresh 1s.</p>
     <div id="plsMsg" class="dim mt3" style="font-size:12px"></div>
     <div class="tblwrap mt3"><div id="plsRoot"><p class="dim">Loading…</p></div></div></div>`;
   const abdColor=(p)=> p>=10?'var(--danger)':(p>=5?'var(--warn)':'var(--ok)');
+  // Rolling window: shows the abandon rate of the last 15 minutes, plus how many
+  // answered calls it is based on — a percentage off 2 calls is not a signal.
+  const nowCell=(w)=>{
+    if(!w||!w.ans) return '<span class="dim">—</span>';
+    const thin = w.ans<5 ? ' <span class="dim" style="font-size:10px">(n='+w.ans+')</span>' : '';
+    return '<span style="color:'+abdColor(w.abd_pct||0)+';font-weight:600">'+(w.abd_pct||0).toFixed(1)+'%</span>'+thin;
+  };
   const render=(j)=>{
     const root=$('plsRoot'); if(!root) return;
     const rows=j.rows||[];
@@ -4922,6 +4929,7 @@ async function renderPlaylistStats(){
       <td style="text-align:right">${r.md}</td>
       <td style="text-align:right">${r.drop}</td>
       <td style="text-align:right;color:${abdColor(r.abd_pct)};font-weight:600">${r.abd_pct.toFixed(1)}%</td>
+      <td style="text-align:right">${nowCell(r.live15)}</td>
       <td style="text-align:right">${r.dial?`<b>${r.dial}</b>`:'0'}</td></tr>`).join('');
     const gdOff=rows.some(r=>r.guardrail===false);
     const t=j.totals||{};
@@ -4932,11 +4940,14 @@ async function renderPlaylistStats(){
       <td style="text-align:right">${t.md||0}</td>
       <td style="text-align:right">${t.drop||0}</td>
       <td style="text-align:right;color:${abdColor(t.abd_pct||0)}">${(t.abd_pct||0).toFixed(1)}%</td>
+      <td style="text-align:right">${nowCell(t.live15)}</td>
       <td style="text-align:right">${t.dial||0}</td></tr>`;
     root.innerHTML=(gdOff?`<div class="dim" style="font-size:12px;margin-bottom:8px;color:var(--warn)">⚠ Abandon guardrail is OFF — pacing is not auto-clamped. Watch Abd% below (US rule: 3% of answered calls).</div>`:'')+`<table class="wbtbl"><thead><tr>
       <th>Playlist</th><th style="text-align:right">CPA</th><th style="text-align:right">Calls</th>
       <th style="text-align:right">Ans</th><th style="text-align:right">MD</th><th style="text-align:right">Drop</th>
-      <th style="text-align:right">Abd%</th><th style="text-align:right">Dial</th></tr></thead>
+      <th style="text-align:right">Abd%<div class="dim" style="font-weight:400;font-size:10px">today</div></th>
+      <th style="text-align:right">NOW<div class="dim" style="font-weight:400;font-size:10px">last 15m</div></th>
+      <th style="text-align:right">Dial</th></tr></thead>
       <tbody>${body}${totRow}</tbody></table>`;
     if($('plsSince')) $('plsSince').textContent='today · since '+new Date(j.since).toLocaleTimeString([],{hour12:false});
   };

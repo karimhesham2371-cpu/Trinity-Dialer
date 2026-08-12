@@ -265,9 +265,42 @@ function rolloverPlaylistStats() {
   savePlaylistStats();
 }
 setInterval(rolloverPlaylistStats, 60 * 1000);
+// Rolling per-minute buckets behind the daily totals. A board called "Live"
+// has to answer "what is happening NOW" — a cumulative daily Abd% cannot move
+// after a pacing change (12 old drops sit in the numerator until midnight), so
+// operators watched a red number that no longer described reality.
+const ROLL_MINUTES = 60;
+const PLAYLIST_ROLL = {};   // key -> Map(minuteEpoch -> {calls,ans,md,drop})
+function rollBump(key, field, delta) {
+  const m = Math.floor(Date.now() / 60000);
+  const buckets = PLAYLIST_ROLL[key] || (PLAYLIST_ROLL[key] = new Map());
+  const b = buckets.get(m) || { calls: 0, ans: 0, md: 0, drop: 0 };
+  if (b[field] == null) return;
+  b[field] += delta; buckets.set(m, b);
+  for (const mm of buckets.keys()) if (mm < m - ROLL_MINUTES) buckets.delete(mm);
+}
+function rollWindow(key, minutes) {
+  const cut = Math.floor(Date.now() / 60000) - minutes;
+  const out = { calls: 0, ans: 0, md: 0, drop: 0 };
+  const buckets = PLAYLIST_ROLL[key];
+  if (buckets) for (const [m, b] of buckets) if (m > cut)
+    { out.calls += b.calls; out.ans += b.ans; out.md += b.md; out.drop += b.drop; }
+  return out;
+}
 function plStat(pid) {
   const k = pid || '__direct__';
-  return PLAYLIST_STATS[k] || (PLAYLIST_STATS[k] = { calls: 0, ans: 0, md: 0, drop: 0 });
+  const day = PLAYLIST_STATS[k] || (PLAYLIST_STATS[k] = { calls: 0, ans: 0, md: 0, drop: 0 });
+  // Proxy so every existing `plStat(x).drop++` feeds the rolling window too,
+  // with no call-site changes to miss.
+  return new Proxy(day, {
+    set(t, prop, val) {
+      const prev = Number(t[prop]) || 0;
+      t[prop] = val;
+      const d = (Number(val) || 0) - prev;
+      if (d > 0) rollBump(k, prop, d);
+      return true;
+    },
+  });
 }
 // Campaign → playlist resolver so the predictive engine's counters land on the
 // PLAYLIST row (where CPA is adjusted), not a synthetic campaign row. A campaign
@@ -3036,6 +3069,12 @@ app.get('/api/admin/reports/wallboard', auth, adminOnly, async (_req, res) => {
 // (machine-detected), Drop (answered but no free agent = abandoned), Abd% (Drop/
 // Ans), Dial (legs ringing right now). Counters are in-memory since boot/last
 // reset; Dial is derived live from rt[*].pending.
+// Last-15-minute view of a playlist: what the floor is doing right now, which
+// is what an operator changing CPA needs to see move.
+function liveWindow(key) {
+  const w = rollWindow(key, 15);
+  return { ...w, abd_pct: w.ans > 0 ? Math.round((w.drop / w.ans) * 1000) / 10 : 0 };
+}
 app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
   try {
     const [playlists, camps, pcs, pas] = await Promise.all([
@@ -3100,6 +3139,7 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
           cpa: (camp && camp.dial_ratio) || 1,
           calls: s.calls, ans: s.ans, md: s.md, drop: s.drop,
           abd_pct: s.ans > 0 ? Math.round((s.drop / s.ans) * 1000) / 10 : 0,
+          live15: liveWindow(k),
           dial,
         });
         continue;
@@ -3118,6 +3158,7 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
         ratio: ratioByPl[k] || null,   // predictive: lines/agent actually in force right now
         cpa: cpaOf(pl), calls: s.calls, ans: s.ans, md: s.md, drop: s.drop,
         abd_pct: s.ans > 0 ? Math.round((s.drop / s.ans) * 1000) / 10 : 0,
+        live15: liveWindow(k),
         dial,
       });
     }
@@ -3126,6 +3167,11 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
       t.calls += r.calls; t.ans += r.ans; t.md += r.md; t.drop += r.drop; t.dial += r.dial; return t;
     }, { calls: 0, ans: 0, md: 0, drop: 0, dial: 0 });
     tot.abd_pct = tot.ans > 0 ? Math.round((tot.drop / tot.ans) * 1000) / 10 : 0;
+    tot.live15 = rows.reduce((a, r) => {
+      const w = r.live15 || { calls: 0, ans: 0, md: 0, drop: 0 };
+      a.calls += w.calls; a.ans += w.ans; a.md += w.md; a.drop += w.drop; return a;
+    }, { calls: 0, ans: 0, md: 0, drop: 0 });
+    tot.live15.abd_pct = tot.live15.ans > 0 ? Math.round((tot.live15.drop / tot.live15.ans) * 1000) / 10 : 0;
     res.json({ ts: Date.now(), since: new Date(PLAYLIST_STATS_SINCE).toISOString(), rows, totals: tot });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
