@@ -1448,6 +1448,7 @@ app.get('/health', (_req, res) => {
     telnyx_key: !!TELNYX_KEY, connection_id: !!CONNECTION_ID, supabase: !!(SB_HOST && SB_KEY),
     caller_pool: CALLER_POOL.length, agents_online: Object.keys(rt).length,
     balance: BALANCE.amount, balance_currency: BALANCE.currency,
+    spend: spendSnapshot(),
     ai_wrap: AI_WRAP_STATS,
     pacer: { busy: pacingBusy, busy_for_sec: pacingBusy ? Math.round((Date.now() - pacingBusyAt) / 1000) : 0,
       last_tick_ago_sec: PACER_LAST_TICK ? Math.round((Date.now() - PACER_LAST_TICK) / 1000) : null },
@@ -4003,6 +4004,67 @@ app.get('/api/agent/script-preview', auth, async (req, res) => {
 // an agent's softphone online — so it presents as "everyone is offline". That
 // cost real diagnostic time twice on 2026-08-11; now it is surfaced loudly.
 let BALANCE = { amount: null, currency: 'USD', at: 0, error: null };
+
+// ── Live spend guard ─────────────────────────────────────────────────────────
+// Measuring spend after the fact cannot bound it; this does. Every answered leg
+// is priced the moment it happens (Telnyx bills a 60-second minimum plus a flat
+// premium-AMD fee per answer — rates measured from their own detail records on
+// 2026-08-12), and dialing stops for the rest of the hour once the cap is hit.
+// Telnyx's balance settles in lumps up to an hour late, so it can't be the
+// trigger — but it is still enforced as a floor so a dying balance halts dialing
+// before the carrier starts rejecting calls (which looks like "agent offline").
+const RATE_AMD       = parseFloat(env('RATE_AMD', '0.0065'));        // per answered call
+const RATE_VOICE_MIN = parseFloat(env('RATE_VOICE_MIN', '0.009'));   // per billed minute
+const RATE_REC_MIN   = parseFloat(env('RATE_REC_MIN', '0.002'));     // per recorded minute
+let SPEND_CAP_HOUR   = parseFloat(env('SPEND_CAP_HOUR', '16'));      // 0 disables
+const BALANCE_FLOOR  = parseFloat(env('BALANCE_FLOOR', '0.50'));
+const SPEND = { hourKey: '', dayKey: '', hour: 0, day: 0, answered: 0, recorded: 0,
+                paused: false, pausedAt: 0, pausedReason: null };
+function spendRoll() {
+  const now = new Date().toISOString();
+  const hk = now.slice(0, 13), dk = now.slice(0, 10);
+  if (SPEND.hourKey !== hk) {
+    SPEND.hourKey = hk; SPEND.hour = 0; SPEND.answered = 0; SPEND.recorded = 0;
+    if (SPEND.paused && SPEND.pausedReason === 'hourly-cap') {
+      SPEND.paused = false; SPEND.pausedReason = null;
+      console.log('[spend] new hour — dialing resumed');
+    }
+  }
+  if (SPEND.dayKey !== dk) { SPEND.dayKey = dk; SPEND.day = 0; }
+}
+function noteSpend(kind, minutes) {
+  spendRoll();
+  let c = 0;
+  if (kind === 'answered')       { c = RATE_AMD + RATE_VOICE_MIN; SPEND.answered++; }
+  else if (kind === 'extra_min') { c = RATE_VOICE_MIN * Math.max(0, minutes || 0); }
+  else if (kind === 'recording') { c = RATE_REC_MIN * Math.max(1, Math.ceil(minutes || 1)); SPEND.recorded++; }
+  SPEND.hour += c; SPEND.day += c;
+  if (!SPEND.paused && SPEND_CAP_HOUR > 0 && SPEND.hour >= SPEND_CAP_HOUR) {
+    SPEND.paused = true; SPEND.pausedAt = Date.now(); SPEND.pausedReason = 'hourly-cap';
+    console.error(`[spend] HOURLY CAP $${SPEND_CAP_HOUR} REACHED ($${SPEND.hour.toFixed(2)}) — dialing paused until the next hour`);
+  }
+}
+function spendAllowsDialing() {
+  spendRoll();
+  if (SPEND_CAP_HOUR > 0 && SPEND.hour >= SPEND_CAP_HOUR) return false;
+  if (BALANCE.amount != null && BALANCE.amount <= BALANCE_FLOOR) {
+    if (!SPEND.paused) {
+      SPEND.paused = true; SPEND.pausedAt = Date.now(); SPEND.pausedReason = 'balance-floor';
+      console.error(`[spend] balance $${BALANCE.amount} at/below floor $${BALANCE_FLOOR} — dialing paused`);
+    }
+    return false;
+  }
+  if (SPEND.paused && SPEND.pausedReason === 'balance-floor') { SPEND.paused = false; SPEND.pausedReason = null; }
+  return true;
+}
+function spendSnapshot() {
+  spendRoll();
+  return { hour_spent: +SPEND.hour.toFixed(4), hour_cap: SPEND_CAP_HOUR, day_spent: +SPEND.day.toFixed(4),
+    answered_this_hour: SPEND.answered, recorded_this_hour: SPEND.recorded,
+    dialing_paused: SPEND.paused, paused_reason: SPEND.pausedReason,
+    balance: BALANCE.amount, balance_floor: BALANCE_FLOOR,
+    rates: { amd: RATE_AMD, voice_min: RATE_VOICE_MIN, recording_min: RATE_REC_MIN } };
+}
 async function refreshBalance() {
   if (!TELNYX_KEY) return;
   try {
@@ -4022,6 +4084,15 @@ app.get('/api/admin/telnyx/usage', auth, adminOnly, async (req, res) => {
   if (!TELNYX_BILLING_PATHS.test(path)) return res.status(400).json({ error: 'path not allowed' });
   try { res.json(await telnyx('GET', path)); }
   catch (e) { res.status(502).json({ error: e.message }); }
+});
+app.get('/api/admin/spend', auth, adminOnly, (_req, res) => res.json(spendSnapshot()));
+// Raise/lower the ceiling live (0 disables). Takes effect on the next tick.
+app.put('/api/admin/spend', auth, adminOnly, (req, res) => {
+  const v = parseFloat(req.body && req.body.hour_cap);
+  if (!isFinite(v) || v < 0) return res.status(400).json({ error: 'hour_cap must be a number >= 0' });
+  SPEND_CAP_HOUR = v;
+  audit(req.user, 'SPEND_CAP', { meta: { hour_cap: v } });
+  res.json(spendSnapshot());
 });
 app.get('/api/admin/balance', auth, adminOnly, async (_req, res) => {
   if (Date.now() - BALANCE.at > 60 * 1000) await refreshBalance();
@@ -4726,6 +4797,7 @@ async function pacingTick() {
       pacingBusy = false;
     } else return;
   }
+  if (!spendAllowsDialing()) return;   // hourly spend cap / balance floor
   pacingBusy = true; pacingBusyAt = Date.now(); PACER_LAST_TICK = Date.now();
   try {
     // Agents that can take MORE dials: in-conference, not on a connected call,
@@ -4979,6 +5051,7 @@ async function startAiAssistant(ccid) {
 
 let aiPacingBusy = false, aiPacingBusyAt = 0;
 async function aiPacingTick() {
+  if (!spendAllowsDialing()) return;   // hourly spend cap / balance floor
   if (aiPacingBusy) {
     if (Date.now() - aiPacingBusyAt > 90 * 1000) { console.error('[ai] WATCHDOG: tick wedged >90s — force-releasing'); aiPacingBusy = false; }
     else return;
@@ -5236,6 +5309,7 @@ async function reserveReaper() {
 
 let enginePacingBusy = false, enginePacingBusyAt = 0;
 async function enginePacingTick() {
+  if (!spendAllowsDialing()) return;   // hourly spend cap / balance floor
   if (!SB_HOST || !CONNECTION_ID) return;
   if (AMD_MODE === 'disabled') return;   // predictive REQUIRES AMD; honor the global kill-switch by not dialing at all
   if (enginePacingBusy) {
@@ -5404,6 +5478,14 @@ app.post('/webhooks/telnyx', async (req, res) => {
               (payload.sip_hangup_cause ? ` sip=${payload.sip_hangup_cause}` : '') +
               (payload.to ? ` to=${payload.to}` : ''));
   sbWrite('POST', 'call_events', { event_type: event, telnyx_call_control_id: ccid, client_state: cs, payload }, 'return=minimal', 'call_events');
+
+  // Price the call as it happens — the agent's own WebRTC leg is not a PSTN cost.
+  if (event === 'call.answered' && role !== 'agent') noteSpend('answered');
+  if (event === 'call.recording.saved') noteSpend('recording', 1);
+  if (event === 'call.hangup' && payload.start_time && payload.end_time) {
+    const mins = (new Date(payload.end_time) - new Date(payload.start_time)) / 60000;
+    if (mins > 1) noteSpend('extra_min', Math.ceil(mins) - 1);   // first minute already charged at answer
+  }
 
   try {
     // Live caption segment → stream to the owning agent/closer console. The
