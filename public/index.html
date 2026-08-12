@@ -4905,15 +4905,16 @@ async function renderPlaylistStats(){
         <button class="btn" id="plsReset" style="flex:0 0 auto">Reset counters</button>
       </div>
     </div>
-    <p class="dim" style="font-size:13px;margin-top:6px"><b>CPA</b> lines/agent (predictive shows the ceiling with the ratio in force now) · <b>Calls</b> dialed · <b>Ans</b> answered by an agent · <b>MD</b> machine-detected · <b>Drop</b> answered with no free agent (abandoned) · <b>Abd%</b> = Drop ÷ Ans · <b>Dial</b> ringing now. Calls/Ans/MD/Drop/Abd% cover <b>today</b> (reset at midnight Eastern; Reset counters clears them sooner). <b>NOW</b> is a rolling <b>15-minute</b> window — that is the one that reacts to a CPA change within minutes, because today's Abd% keeps this morning's drops in the numerator until midnight. Judge a pacing change by <b>NOW</b>, not by the daily figure. Live playlists (green dot) appear the moment they have a running campaign and connected agents. Auto-refresh 1s.</p>
+    <p class="dim" style="font-size:13px;margin-top:6px"><b>CPA</b> lines/agent (predictive shows the ceiling with the ratio in force now) · <b>Calls</b> dialed · <b>Ans</b> answered by an agent · <b>MD</b> machine-detected · <b>Drop</b> answered with no free agent (abandoned) · <b>Abd%</b> = Drop ÷ (Ans + Drop) — the FCC counts an abandoned call as a live answer, so it belongs in the denominator · <b>Dial</b> ringing now. Calls/Ans/MD/Drop/Abd% cover <b>today</b> (reset at midnight Eastern; Reset counters clears them sooner). <b>NOW</b> is a rolling <b>15-minute</b> window — that is the one that reacts to a CPA change within minutes, because today's Abd% keeps this morning's drops in the numerator until midnight. Judge a pacing change by <b>NOW</b>, not by the daily figure. Live playlists (green dot) appear the moment they have a running campaign and connected agents. Auto-refresh 1s.</p>
     <div id="plsMsg" class="dim mt3" style="font-size:12px"></div>
     <div class="tblwrap mt3"><div id="plsRoot"><p class="dim">Loading…</p></div></div></div>`;
   const abdColor=(p)=> p>=10?'var(--danger)':(p>=5?'var(--warn)':'var(--ok)');
   // Rolling window: shows the abandon rate of the last 15 minutes, plus how many
   // answered calls it is based on — a percentage off 2 calls is not a signal.
   const nowCell=(w)=>{
-    if(!w||!w.ans) return '<span class="dim">—</span>';
-    const thin = w.ans<5 ? ' <span class="dim" style="font-size:10px">(n='+w.ans+')</span>' : '';
+    if(!w||(!w.ans&&!w.drop)) return '<span class="dim">—</span>';
+    const n=(w.ans||0)+(w.drop||0);
+    const thin = n<5 ? ' <span class="dim" style="font-size:10px">(n='+n+')</span>' : '';
     return '<span style="color:'+abdColor(w.abd_pct||0)+';font-weight:600">'+(w.abd_pct||0).toFixed(1)+'%</span>'+thin;
   };
   const render=(j)=>{

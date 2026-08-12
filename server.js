@@ -3073,7 +3073,7 @@ app.get('/api/admin/reports/wallboard', auth, adminOnly, async (_req, res) => {
 // is what an operator changing CPA needs to see move.
 function liveWindow(key) {
   const w = rollWindow(key, 15);
-  return { ...w, abd_pct: w.ans > 0 ? Math.round((w.drop / w.ans) * 1000) / 10 : 0 };
+  return { ...w, abd_pct: (w.ans + w.drop) > 0 ? Math.round((w.drop / (w.ans + w.drop)) * 1000) / 10 : 0 };
 }
 app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
   try {
@@ -3138,7 +3138,7 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
           active: camp ? camp.status === 'RUNNING' : false,
           cpa: (camp && camp.dial_ratio) || 1,
           calls: s.calls, ans: s.ans, md: s.md, drop: s.drop,
-          abd_pct: s.ans > 0 ? Math.round((s.drop / s.ans) * 1000) / 10 : 0,
+          abd_pct: (s.ans + s.drop) > 0 ? Math.round((s.drop / (s.ans + s.drop)) * 1000) / 10 : 0,
           live15: liveWindow(k),
           dial,
         });
@@ -3157,7 +3157,7 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
         guardrail: GUARDRAIL.enabled,
         ratio: ratioByPl[k] || null,   // predictive: lines/agent actually in force right now
         cpa: cpaOf(pl), calls: s.calls, ans: s.ans, md: s.md, drop: s.drop,
-        abd_pct: s.ans > 0 ? Math.round((s.drop / s.ans) * 1000) / 10 : 0,
+        abd_pct: (s.ans + s.drop) > 0 ? Math.round((s.drop / (s.ans + s.drop)) * 1000) / 10 : 0,
         live15: liveWindow(k),
         dial,
       });
@@ -3166,12 +3166,12 @@ app.get('/api/admin/reports/playlists', auth, adminOnly, async (_req, res) => {
     const tot = rows.reduce((t, r) => {
       t.calls += r.calls; t.ans += r.ans; t.md += r.md; t.drop += r.drop; t.dial += r.dial; return t;
     }, { calls: 0, ans: 0, md: 0, drop: 0, dial: 0 });
-    tot.abd_pct = tot.ans > 0 ? Math.round((tot.drop / tot.ans) * 1000) / 10 : 0;
+    tot.abd_pct = (tot.ans + tot.drop) > 0 ? Math.round((tot.drop / (tot.ans + tot.drop)) * 1000) / 10 : 0;
     tot.live15 = rows.reduce((a, r) => {
       const w = r.live15 || { calls: 0, ans: 0, md: 0, drop: 0 };
       a.calls += w.calls; a.ans += w.ans; a.md += w.md; a.drop += w.drop; return a;
     }, { calls: 0, ans: 0, md: 0, drop: 0 });
-    tot.live15.abd_pct = tot.live15.ans > 0 ? Math.round((tot.live15.drop / tot.live15.ans) * 1000) / 10 : 0;
+    tot.live15.abd_pct = (tot.live15.ans + tot.live15.drop) > 0 ? Math.round((tot.live15.drop / (tot.live15.ans + tot.live15.drop)) * 1000) / 10 : 0;
     res.json({ ts: Date.now(), since: new Date(PLAYLIST_STATS_SINCE).toISOString(), rows, totals: tot });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
