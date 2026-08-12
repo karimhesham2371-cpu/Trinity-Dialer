@@ -4016,13 +4016,19 @@ let BALANCE = { amount: null, currency: 'USD', at: 0, error: null };
 const RATE_AMD       = parseFloat(env('RATE_AMD', '0.0065'));        // per answered call
 const RATE_VOICE_MIN = parseFloat(env('RATE_VOICE_MIN', '0.009'));   // per billed minute
 const RATE_REC_MIN   = parseFloat(env('RATE_REC_MIN', '0.002'));     // per recorded minute
-let SPEND_CAP_HOUR   = parseFloat(env('SPEND_CAP_HOUR', '16'));      // 0 disables
+let SPEND_CAP_HOUR   = parseFloat(env('SPEND_CAP_HOUR', '16'));      // runaway guard, 0 disables
+// The real ceiling is the SHIFT: a daily cap lets a busy hour run hot without
+// idling the agent, while still bounding the day (Karim, 2026-08-12: "$16 a
+// shift"). Counted on the Eastern business day, not UTC, so it resets
+// overnight rather than mid-shift.
+let SPEND_CAP_DAY    = parseFloat(env('SPEND_CAP_DAY', '16'));       // 0 disables
 const BALANCE_FLOOR  = parseFloat(env('BALANCE_FLOOR', '0.50'));
 const SPEND = { hourKey: '', dayKey: '', hour: 0, day: 0, answered: 0, recorded: 0,
                 paused: false, pausedAt: 0, pausedReason: null };
 function spendRoll() {
   const now = new Date().toISOString();
-  const hk = now.slice(0, 13), dk = now.slice(0, 10);
+  const hk = now.slice(0, 13);
+  const dk = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
   if (SPEND.hourKey !== hk) {
     SPEND.hourKey = hk; SPEND.hour = 0; SPEND.answered = 0; SPEND.recorded = 0;
     if (SPEND.paused && SPEND.pausedReason === 'hourly-cap') {
@@ -4030,7 +4036,13 @@ function spendRoll() {
       console.log('[spend] new hour — dialing resumed');
     }
   }
-  if (SPEND.dayKey !== dk) { SPEND.dayKey = dk; SPEND.day = 0; }
+  if (SPEND.dayKey !== dk) {
+    SPEND.dayKey = dk; SPEND.day = 0;
+    if (SPEND.paused && SPEND.pausedReason === 'daily-cap') {
+      SPEND.paused = false; SPEND.pausedReason = null;
+      console.log('[spend] new business day — dialing resumed');
+    }
+  }
 }
 function noteSpend(kind, minutes) {
   spendRoll();
@@ -4047,6 +4059,13 @@ function noteSpend(kind, minutes) {
 function spendAllowsDialing() {
   spendRoll();
   if (SPEND_CAP_HOUR > 0 && SPEND.hour >= SPEND_CAP_HOUR) return false;
+  if (SPEND_CAP_DAY > 0 && SPEND.day >= SPEND_CAP_DAY) {
+    if (!SPEND.paused) {
+      SPEND.paused = true; SPEND.pausedAt = Date.now(); SPEND.pausedReason = 'daily-cap';
+      console.error(`[spend] DAILY CAP $${SPEND_CAP_DAY} REACHED ($${SPEND.day.toFixed(2)}) — dialing paused for the rest of the business day`);
+    }
+    return false;
+  }
   if (BALANCE.amount != null && BALANCE.amount <= BALANCE_FLOOR) {
     if (!SPEND.paused) {
       SPEND.paused = true; SPEND.pausedAt = Date.now(); SPEND.pausedReason = 'balance-floor';
@@ -4059,7 +4078,9 @@ function spendAllowsDialing() {
 }
 function spendSnapshot() {
   spendRoll();
-  return { hour_spent: +SPEND.hour.toFixed(4), hour_cap: SPEND_CAP_HOUR, day_spent: +SPEND.day.toFixed(4),
+  return { hour_spent: +SPEND.hour.toFixed(4), hour_cap: SPEND_CAP_HOUR,
+    day_spent: +SPEND.day.toFixed(4), day_cap: SPEND_CAP_DAY,
+    day_pct: SPEND_CAP_DAY > 0 ? Math.round(100 * SPEND.day / SPEND_CAP_DAY) : null, business_day: SPEND.dayKey,
     answered_this_hour: SPEND.answered, recorded_this_hour: SPEND.recorded,
     dialing_paused: SPEND.paused, paused_reason: SPEND.pausedReason,
     balance: BALANCE.amount, balance_floor: BALANCE_FLOOR,
@@ -4088,10 +4109,20 @@ app.get('/api/admin/telnyx/usage', auth, adminOnly, async (req, res) => {
 app.get('/api/admin/spend', auth, adminOnly, (_req, res) => res.json(spendSnapshot()));
 // Raise/lower the ceiling live (0 disables). Takes effect on the next tick.
 app.put('/api/admin/spend', auth, adminOnly, (req, res) => {
-  const v = parseFloat(req.body && req.body.hour_cap);
-  if (!isFinite(v) || v < 0) return res.status(400).json({ error: 'hour_cap must be a number >= 0' });
-  SPEND_CAP_HOUR = v;
-  audit(req.user, 'SPEND_CAP', { meta: { hour_cap: v } });
+  const b = req.body || {};
+  const h = b.hour_cap != null ? parseFloat(b.hour_cap) : null;
+  const d = b.day_cap != null ? parseFloat(b.day_cap) : null;
+  if (h == null && d == null) return res.status(400).json({ error: 'hour_cap and/or day_cap required' });
+  if (h != null && (!isFinite(h) || h < 0)) return res.status(400).json({ error: 'hour_cap must be a number >= 0' });
+  if (d != null && (!isFinite(d) || d < 0)) return res.status(400).json({ error: 'day_cap must be a number >= 0' });
+  if (h != null) SPEND_CAP_HOUR = h;
+  if (d != null) SPEND_CAP_DAY = d;
+  // A raised cap should un-stick a pause immediately, not at the next rollover.
+  if (SPEND.paused && ((SPEND.pausedReason === 'daily-cap' && SPEND_CAP_DAY > SPEND.day) ||
+                       (SPEND.pausedReason === 'hourly-cap' && SPEND_CAP_HOUR > SPEND.hour))) {
+    SPEND.paused = false; SPEND.pausedReason = null;
+  }
+  audit(req.user, 'SPEND_CAP', { meta: { hour_cap: SPEND_CAP_HOUR, day_cap: SPEND_CAP_DAY } });
   res.json(spendSnapshot());
 });
 app.get('/api/admin/balance', auth, adminOnly, async (_req, res) => {
