@@ -4009,6 +4009,16 @@ async function refreshBalance() {
     else if (BALANCE.amount < 25) console.warn(`[balance] LOW: ${BALANCE.amount} ${BALANCE.currency}`);
   } catch (e) { BALANCE = { ...BALANCE, error: e.message, at: Date.now() }; }
 }
+// Read-only window into Telnyx's own billing data, so "where is the money
+// going" is answered by the carrier's numbers rather than inferred from ours.
+// GET-only and whitelisted to billing paths — this is a diagnostic, not a proxy.
+const TELNYX_BILLING_PATHS = /^\/(detail_records|usage_reports|ledger|billing_groups|balance|phone_numbers)(\/|\?|$)/;
+app.get('/api/admin/telnyx/usage', auth, adminOnly, async (req, res) => {
+  const path = String(req.query.path || '/balance');
+  if (!TELNYX_BILLING_PATHS.test(path)) return res.status(400).json({ error: 'path not allowed' });
+  try { res.json(await telnyx('GET', path)); }
+  catch (e) { res.status(502).json({ error: e.message }); }
+});
 app.get('/api/admin/balance', auth, adminOnly, async (_req, res) => {
   if (Date.now() - BALANCE.at > 60 * 1000) await refreshBalance();
   const amount = BALANCE.amount;
