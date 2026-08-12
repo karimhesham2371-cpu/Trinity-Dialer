@@ -393,7 +393,10 @@ async function loadTeamChat() {
 // signals. Summary lands in the lead's history as a 🤖 note, motivation data is
 // stored on leads.custom.ai, and the agent's console gets a live push so the
 // note box pre-fills while they're still in wrap-up.
-const AI_WRAP_ON = env('AI_WRAP', '1') !== '0';
+// AI wrap = one speech-to-text pass + one LLM call on EVERY connected call.
+// Off by default (Karim, 2026-08-12: "remove the ai wrap if it's costing us
+// money"). Set AI_WRAP=1 to re-enable.
+const AI_WRAP_ON = env('AI_WRAP', '0') === '1';
 const AI_WRAP_STATS = { ok: 0, fail: 0, skipped: 0, lastError: null };   // surfaced on /health
 const AI_WRAP_MODEL = env('AI_WRAP_MODEL', 'anthropic/claude-haiku-4-5');
 const AI_STT_MODEL = env('AI_STT_MODEL', 'distil-whisper/distil-large-v2');
@@ -1425,7 +1428,8 @@ app.post('/api/login', async (req, res) => {
 // this and show a "new version" banner when the server moves past them, so a
 // stale browser tab can never silently run old code again.
 const BUILD_VERSION = env('RENDER_GIT_COMMIT', 'dev').slice(0, 7);
-app.get('/api/version', (_req, res) => res.json({ v: BUILD_VERSION, cpa_max: CPA_MAX }));
+app.get('/api/version', (_req, res) => res.json({ v: BUILD_VERSION, cpa_max: CPA_MAX,
+  captions: CAPTIONS_ON, ai_wrap: AI_WRAP_ON }));
 
 // Fresh identity: role + permissions come from the DB (not the JWT snapshot),
 // so a support console picks up newly-granted access without re-login.
@@ -4101,6 +4105,9 @@ app.post('/api/agent/captions', auth, async (req, res) => {
   const st = rt[req.user.id];
   const on = !!(req.body && req.body.on);
   if (!st) return res.status(409).json({ error: 'softphone not connected' });
+  // Hard off: the client hides the control, but a stale tab must not be able to
+  // start a billed transcription stream.
+  if (!CAPTIONS_ON) { st.captions = false; return res.json({ ok: true, on: false, disabled: true }); }
   st.captions = on;
   try {
     if (st.leadLeg) {
@@ -4111,12 +4118,26 @@ app.post('/api/agent/captions', auth, async (req, res) => {
     res.json({ ok: true, on });
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
+// Live captions are billed per minute PER TRACK, and we transcribe both tracks —
+// so an hour on the phone bought an hour of speech-to-text twice over. Off by
+// default (Karim, 2026-08-12: "turn off live caption if it's costing us money").
+// Set CAPTIONS=1 to re-enable.
+const CAPTIONS_ON = env('CAPTIONS', '0') === '1';
 function startCaptionsIfWanted(agentId, ccid) {
+  if (!CAPTIONS_ON) return;
   const st = rt[agentId];
   if (!st || !st.captions || !ccid) return;
   telnyx('POST', `/calls/${ccid}/actions/transcription_start`,
     { language: 'en', transcription_engine: 'B', transcription_tracks: 'both' })
     .catch(e => console.error('[captions]', e.message));
+}
+// Recording starts at bridge — single channel (dual doubles the billed audio and
+// nothing downstream reads the second channel).
+function startCallRecording(ccid) {
+  if (!ccid) return;
+  telnyx('POST', `/calls/${ccid}/actions/record_start`,
+    { format: 'mp3', channels: 'single' })
+    .catch(e => console.error('[record]', e.message));
 }
 
 // ── Closer calendar: this user's scheduled callbacks, next 14 days + overdue ──
@@ -4559,7 +4580,6 @@ async function dialLead(agentId, lead, playlistId) {
     timeout_secs: DIALER.ring_secs,   // hard ring cap — no dead air on no-answers
     answering_machine_detection: amdParam,
     // Unconditional recording (per Karim). Recording is saved on call.recording.saved.
-    record: 'record-from-answer', record_channels: 'dual', record_format: 'mp3',
     client_state: enc({ role: 'lead', agentId, conf: st.conferenceId, leadId: lead.id, campaignId: lead.campaign_id, cid, amd: amdParam }),
   };
   if (amdParam !== 'disabled' && amdConf) dialBody.answering_machine_detection_config = amdConf;
@@ -4642,6 +4662,10 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
   pushLeadContext(agentId, info.lead || null);   // fire-and-forget: card renders before the join lands
   startCaptionsIfWanted(agentId, ccid);
   await telnyx('POST', `/conferences/${conf}/actions/join`, { call_control_id: ccid, start_conference_on_enter: true, mute: false });
+  // Record from the BRIDGE, not from answer (Karim, 2026-08-12): recording every
+  // answered leg meant paying to record answering machines and abandoned calls,
+  // ~90% of dials. Only a call an agent is actually on gets recorded now.
+  startCallRecording(ccid);
   await setAgentState(agentId, 'ON_CALL');
   plStat(st.leadPlaylistId).ans++;
   saveCall({ telnyx_call_control_id: ccid, bridged_at: new Date().toISOString(), amd_result: amd || null }, 'call-bridged');
@@ -4875,7 +4899,6 @@ async function dialAiLead(lead) {
     from,
     timeout_secs: DIALER.ring_secs,
     answering_machine_detection: AMD_MODE === 'disabled' ? 'disabled' : 'premium',
-    record: 'record-from-answer', record_channels: 'dual', record_format: 'mp3',
     client_state: enc({ role: 'ai', leadId: lead.id, campaignId: lead.campaign_id }),
   });
   const ccid = result.data && result.data.call_control_id;
@@ -5090,7 +5113,6 @@ async function dialEngineLead(lead, acfg) {
     from,
     timeout_secs: DIALER.ring_secs,
     answering_machine_detection: amdParam,
-    record: 'record-from-answer', record_channels: 'dual', record_format: 'mp3',
     client_state: enc({ role: 'dialer', cid, campaignId: lead.campaign_id, leadId: lead.id, amd: amdParam }),
   };
   if (amdParam !== 'disabled' && amdConf) dialBody.answering_machine_detection_config = amdConf;
@@ -5163,6 +5185,7 @@ async function engineBridgeToAgent(agentId, ccid, info) {
     st.state = 'ON_CALL';
     pushLeadContext(agentId, info.lead || null);
     startCaptionsIfWanted(agentId, ccid);
+    startCallRecording(ccid);   // agent is on the line — this one is worth recording
     plStat(plKeyForCampaign(info.campaignId)).ans++;
     await setAgentState(agentId, 'ON_CALL');
     info.phase = 'BRIDGED';
@@ -5736,6 +5759,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         st.onCallSince = Date.now(); st.state = 'ON_CALL';
         await setAgentState(agentId, 'ON_CALL');
         startCaptionsIfWanted(agentId, ccid);
+        startCallRecording(ccid);   // inbound the agent actually answered
         // Push the contact card immediately (same instant path as outbound); for
         // an unmatched caller push at least the number so the agent sees it.
         if (lead) pushLeadContext(agentId, lead);
@@ -5761,7 +5785,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         await telnyx('POST', `/calls/${ccid}/actions/speak`,
           { payload: greet, voice: 'female', language: 'en-US' });
         await telnyx('POST', `/calls/${ccid}/actions/record_start`,
-          { format: 'mp3', channels: 'single', transcription: true, transcription_engine: 'B' });
+          { format: 'mp3', channels: 'single' });   // no transcription: STT is billed per minute
         console.log(`[vmbox] recording started ...${ccid.slice(-8)}`);
       } catch (e) { console.error('[vmbox:start]', e.message); }
       // Auto-hangup as a safety net so a silent line can't hold the leg open.

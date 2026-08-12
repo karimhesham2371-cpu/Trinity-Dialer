@@ -2122,6 +2122,16 @@ async function checkBuild(){
     const r=await fetch('/api/version'); if(!r.ok) return;
     const j=await r.json();
     if(j.cpa_max) CPA_MAX=j.cpa_max;
+    // Captions are billed per minute per track — when the server has them off,
+    // hide the control and the caption-driven email listener entirely so nobody
+    // toggles a switch that does nothing.
+    if(j.captions===false){
+      const cw=$('capWrap'); if(cw) cw.style.display='none';
+      const el=$('emListen'); if(el) el.style.display='none';
+      if($('capToggle')) $('capToggle').checked=false;
+      localStorage.setItem('trinity_captions','0');
+      const cb=$('capBox'); if(cb){ cb.classList.add('hidden'); cb.innerHTML=''; }
+    }
     if(buildV===null){ buildV=j.v; try{ log('build '+j.v); }catch(e){} return; }
     if(j.v===buildV || pendingReload) return;
     // A stale tab silently runs old code — that has caused several "it's still
@@ -2864,7 +2874,7 @@ function dialerGuideHtml(role){
     '<li><b>Dialpad</b> — during a call it sends touch-tones (IVRs, extensions): click the buttons or, with the pad open, just type the digits on your keyboard. Off-call it becomes the manual dialer. Keep the pad <i>closed</i> if you want number keys to work as disposition hotkeys.</li>'+
     '<li><b>Hang up</b> — ends the live call, or cancels ringing background dials while Waiting.</li>'+
     '</ul>'+
-    '<h4>Capturing an email by ear</h4>The <b>Email capture</b> box sits under the lead card. Type only what you hear — tap a domain chip (@gmail.com, @yahoo.com…) instead of typing it, and the box repairs common mishearings (gmail.con → gmail.com). Under it appears a <b>phonetic read-back</b> (J·Oscar·Hotel·November) so you can confirm the address out loud letter by letter. With <b>Live captions</b> on, an address the contact speaks aloud ("john dot smith at gmail dot com") is detected automatically and shown next to the heading — click it to fill the box. Press Save (or Enter) and it is written to the contact.'+
+    '<h4>Capturing an email by ear</h4>The <b>Email capture</b> box sits under the lead card. Type only what you hear — tap a domain chip (@gmail.com, @yahoo.com…) instead of typing it, and the box repairs common mishearings (gmail.con → gmail.com). Under it appears a <b>phonetic read-back</b> (J·Oscar·Hotel·November) so you can confirm the address out loud letter by letter. Press Save (or Enter) and it is written to the contact. (Caption-driven email detection is disabled while live captions are off — captions are billed per minute.)'+
     '<h4>Manual outbound calls</h4>Open the dialpad while not on a call, type the number, press <b>Call</b>. DNC numbers are refused, and if the number matches a known lead the call attaches to that lead so history and dispositions work.'+
     '<h4>Caller ID</h4><b>Agents</b> never pick a number — the dialer auto-assigns a rotating caller ID matched to the lead\'s area code, on manual dials too (ReadyMode-style). <b>Closers</b> get a Caller ID dropdown on the dialpad: pick a number, press <b>Lock it</b>, and every manual call goes out from it — across calls and even redeploys — until they press <b>Change</b>.')+
 
@@ -2932,7 +2942,7 @@ function dialerGuideHtml(role){
     'The <b>💬</b> button (bottom-left, every role) opens one shared room for the whole floor. Agents ask for help, closers coordinate, support and admins answer — messages show each person\'s name colored by role, with an unread badge when the panel is closed. The last 200 messages persist across sessions.')+
 
   sec('Live captions',['all','Everyone'],
-    'Tick <b>Live captions</b> in the Call controls card and every call gets real-time subtitles under the state banner — <b>Seller</b> lines in gold, <b>You</b> in gray, with the in-progress sentence shown italic until it finalizes. The preference sticks per browser and follows warm transfers. Turn it off any time (captions are transcribed by Telnyx and billed per minute while on).')+
+    'Live captions are currently <b>switched off account-wide</b> to control cost — Telnyx bills transcription per minute, per track. The control is hidden while they are off. Capture emails with the <b>Email capture</b> box instead: domain chips and the phonetic read-back do the same job for free.')+
 
   sec('Floor messaging',['admin','Admin'],
     'Office map → the bar at the top. Type a message, choose <b>Everyone</b> or one agent, press <b>📣 Send</b>. It appears instantly as a blue banner across the top of their console with a chime; they click it to dismiss. Support users need the Office map permission. Messages are fire-and-forget — nothing is stored.')+
