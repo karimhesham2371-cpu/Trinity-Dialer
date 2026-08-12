@@ -3696,6 +3696,18 @@ app.post('/api/agent/hangup', auth, async (req, res) => {
   const st = rt[req.user.id];
   try {
     if (st && st.leadLeg) { await telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}); return res.json({ ok: true }); }
+    // Recovery: still ON_CALL but the leg reference is gone (a disposition cleared
+    // it, or a webhook was missed). Hang up the last leg we saw and unstick the
+    // agent — this button must never be a no-op while a call is on the line.
+    if (st && st.state === 'ON_CALL') {
+      if (st.lastLeadLeg) await telnyx('POST', `/calls/${st.lastLeadLeg}/actions/hangup`, {}).catch(() => {});
+      st.leadLeg = null; st.leadNumber = null; st.fromNumber = null; st.onCallSince = null; st.inbound = false;
+      st.state = st.conferenceId ? 'WRAP_UP' : 'OFFLINE';
+      await setAgentState(req.user.id, st.state);
+      if (st.state === 'WRAP_UP') scheduleWrapReturn(req.user.id, WRAP_SHORT_SEC);
+      console.log(`[hangup] recovered stuck ON_CALL for agent ${req.user.id.slice(0, 8)}`);
+      return res.json({ ok: true, recovered: true });
+    }
     // No connected call — cancel any still-ringing legs (manual dial or background
     // dials) and requeue their leads, then free the agent immediately.
     if (st && st.pending && Object.keys(st.pending).length) {
@@ -3837,7 +3849,7 @@ app.post('/api/agent/transfer', auth, async (req, res) => {
     await telnyx('POST', `/conferences/${st.conferenceId}/actions/leave`, { call_control_id: ccid });
     await telnyx('POST', `/conferences/${tgt.conferenceId}/actions/join`, { call_control_id: ccid });
     // Hand over runtime ownership: closer goes live, agent drops to wrap-up.
-    tgt.leadLeg = ccid; tgt.leadId = leadId; tgt.leadNumber = leadNumber;
+    tgt.leadLeg = ccid; tgt.lastLeadLeg = ccid; tgt.leadId = leadId; tgt.leadNumber = leadNumber;
     tgt.fromNumber = fromNumber; tgt.onCallSince = Date.now();
     st.leadLeg = null; st.leadId = null; st.leadNumber = null; st.fromNumber = null;
     st.onCallSince = null; st.awaitingDisp = false;
@@ -4396,12 +4408,27 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
     // Hang up the lead leg if still up, then run the wrap-up cooldown before the
     // pacer feeds the next call: 3s by default, 3 minutes for a positive outcome
     // (appointment / sale / lead) so the agent can finish paperwork.
-    let wrapSec = WRAP_SHORT_SEC;
+    let wrapSec = WRAP_SHORT_SEC, hangupFailed = false;
     if (st) {
       st.awaitingDisp = false;   // call is now coded — release the enforcement hold
-      if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});
-      st.leadLeg = null; st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null;
-      if (st.state === 'ON_CALL') {
+      // A live leg means this IS the call on the line, not a late code. Confirm the
+      // hangup before forgetting the leg: dropping it on a failed hangup left the
+      // call up with nothing left to hang up, so the Hangup button did nothing.
+      const codingCurrent = !!st.leadLeg;
+      if (codingCurrent) {
+        try {
+          await telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {});
+          st.leadLeg = null;
+        } catch (e) {
+          hangupFailed = true;
+          console.error('[disp:hangup]', e.message);   // keep leadLeg so /hangup still works
+        }
+      }
+      if (!hangupFailed) { st.leadNumber = null; st.leadId = null; st.fromNumber = null; st.onCallSince = null; }
+      if (hangupFailed) {
+        // Call is still up — stay ON_CALL so she can hang up manually.
+        wrapSec = 0;
+      } else if (st.state === 'ON_CALL' && !codingCurrent) {
         // Coded late — they are already on the next call. Never interrupt it.
         wrapSec = 0;
       } else if (st.state !== 'OFFLINE' && st.conferenceId) {
@@ -4415,7 +4442,7 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
         st.state = 'OFFLINE'; await setAgentState(req.user.id, 'OFFLINE');
       }
     }
-    res.json({ ok: true, next_status: patch.status, wrap_seconds: wrapSec });
+    res.json({ ok: true, next_status: patch.status, wrap_seconds: wrapSec, hangup_failed: hangupFailed });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -4594,7 +4621,7 @@ async function connectLeadLeg(agentId, ccid, cs, amd) {
   }
   const info = (st.pending && st.pending[ccid]) || {};
   if (st.pending) delete st.pending[ccid];
-  st.leadLeg = ccid;
+  st.leadLeg = ccid; st.lastLeadLeg = ccid;
   st.leadId = info.leadId || (cs && cs.leadId) || null;
   st.leadNumber = info.leadNumber || null;
   st.fromNumber = info.fromNumber || null;
@@ -5117,7 +5144,7 @@ async function engineBridgeToAgent(agentId, ccid, info) {
   try {
     await telnyx('POST', `/conferences/${conf}/actions/join`,
       { call_control_id: ccid, start_conference_on_enter: true, mute: false });
-    st.leadLeg = ccid;
+    st.leadLeg = ccid; st.lastLeadLeg = ccid;
     st.leadId = info.leadId || null;
     st.leadNumber = info.to || null;
     st.fromNumber = info.from || null;
@@ -5691,7 +5718,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
             }
           }
         } catch (e) { console.error('[inbound:lead]', e.message); }
-        st.leadLeg = ccid; st.inbound = true;
+        st.leadLeg = ccid; st.lastLeadLeg = ccid; st.inbound = true;
         st.leadId = lead ? lead.id : null;
         st.leadNumber = fromNum || null;
         st.fromNumber = toNum || null;   // the DID they called in on
@@ -5892,15 +5919,25 @@ app.post('/webhooks/telnyx', async (req, res) => {
         if (idle && st.state === 'DIALING') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
         return;
       }
-      const wasLead = st.leadLeg === ccid || (role === 'lead' && st.leadLeg == null);
+      // 'inbound' counts as the lead leg too: a disposition placed mid-call nulls
+      // st.leadLeg before this webhook lands, and without this the inbound leg
+      // matched no branch at all — the agent stayed pinned in ON_CALL forever.
+      const wasLead = st.leadLeg === ccid
+        || ((role === 'lead' || role === 'inbound') && st.leadLeg == null);
       if (wasLead) {
         if (ccid) endAiStream(ccid);   // notify + close any live-monitor listeners on this leg
         const talked = st.state === 'ON_CALL';   // agent actually spoke to a human
+        // Already coded (disposition ran first and set the wrap window): close the
+        // row out, but never re-recycle the lead or cut the wrap short.
+        const alreadyCoded = st.state === 'WRAP_UP';
         if (ccid) saveCall({ telnyx_call_control_id: ccid,
           ended_at: new Date().toISOString(), hangup_cause: payload.hangup_cause || null }, 'call-ended-lead');
         const wasInbound = st.inbound === true;
         st.leadLeg = null; st.leadNumber = null; st.fromNumber = null; st.onCallSince = null;
-        if (wasInbound && !st.leadId) {
+        if (alreadyCoded) {
+          st.inbound = false; st.leadId = null;
+          console.log(`[bridge] call ended (already coded), agent ${agentId.slice(0, 8)} stays in WRAP_UP`);
+        } else if (wasInbound && !st.leadId) {
           // Unidentified caller (no lead attached) — nothing to code, go straight back.
           st.inbound = false;
           if (st.state !== 'OFFLINE') { st.state = 'AVAILABLE'; await setAgentState(agentId, 'AVAILABLE'); }
@@ -6032,16 +6069,26 @@ async function reaperTick() {
       const onSince = st.onCallSince || st.stateStart;
       if (st.state === 'ON_CALL' && onSince && (now - onSince) > REAP_ONCALL_CHECK_MS) {
         let verdict = 'unknown';
-        if (st.leadLeg) {
-          try { const r = await telnyx('GET', `/calls/${st.leadLeg}`); verdict = (r && r.data && r.data.is_alive) ? 'alive' : 'dead'; }
+        // Check the last leg we saw, not just the current one: an orphaned call
+        // (reference lost, contact still connected) must be hung up, not assumed
+        // dead — assuming left the caller sitting on a live line.
+        const leg = st.leadLeg || st.lastLeadLeg;
+        if (leg) {
+          try { const r = await telnyx('GET', `/calls/${leg}`); verdict = (r && r.data && r.data.is_alive) ? 'alive' : 'dead'; }
           catch { verdict = 'unknown'; }   // transient Telnyx error → DON'T assume dead (avoids freeing a live call)
-        } else { verdict = 'dead'; }        // ON_CALL with no leg is already broken
+        } else { verdict = 'dead'; }        // ON_CALL with no leg at all is already broken
+        if (verdict === 'alive' && !st.leadLeg) {
+          console.log(`[reaper] agent ${id.slice(0,8)} ON_CALL with an orphaned live leg -> hanging it up`);
+          await telnyx('POST', `/calls/${leg}/actions/hangup`, {}).catch(() => {});
+          verdict = 'dead';
+        }
         // Only free on a confirmed-dead verdict. A transient API error leaves the
         // agent alone (re-checked next tick) — treating it as dead risked freeing
         // a genuinely live call and bridging the next lead into the same conference.
         if (verdict === 'dead') {
           console.log(`[reaper] agent ${id.slice(0,8)} stuck ON_CALL (Telnyx confirms call dead) -> freeing`);
           if (st.leadLeg) telnyx('POST', `/calls/${st.leadLeg}/actions/hangup`, {}).catch(() => {});  // ensure the leg is gone (no cross-conference bleed)
+          st.lastLeadLeg = null;
           st.leadLeg = null; st.leadNumber = null; st.fromNumber = null; st.onCallSince = null;
           if (st.conferenceId) {
             // The agent talked to a human — hold for a disposition, same as a normal
