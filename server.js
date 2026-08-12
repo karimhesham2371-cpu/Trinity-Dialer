@@ -1207,10 +1207,11 @@ async function setAgentState(id, state) {
 // (appointment / sale / lead) so they can finish paperwork. Server-authoritative
 // so it survives a client refresh and correctly gates pacing (WRAP_UP is not
 // dialable). The client renders the countdown off `wrapUntil` in the snapshot.
-// Wrap-up rule (Karim, 2026-08-11): 5 seconds after EVERY call — agents cannot
-// select or extend it — except a SALE disposition, which gets 3 minutes so the
-// agent can fill the lead into the web form.
-const WRAP_SHORT_SEC = 5, WRAP_LONG_SEC = 180;
+// Wrap-up rule (Karim, 2026-08-11; window raised 5s -> 10s on 2026-08-12):
+// 10 seconds after EVERY call — agents cannot select or extend it — except a
+// SALE disposition, which gets 3 minutes so the agent can fill the lead into
+// the web form.
+const WRAP_SHORT_SEC = 10, WRAP_LONG_SEC = 180;
 // Require a disposition on every CONNECTED call before the agent gets the next
 // one. When on, a talked call holds the agent in WRAP_UP with no auto-return
 // until they submit a disposition (the wrap timer starts only after they code
@@ -4432,7 +4433,7 @@ app.post('/api/agent/disposition', auth, async (req, res) => {
         // Coded late — they are already on the next call. Never interrupt it.
         wrapSec = 0;
       } else if (st.state !== 'OFFLINE' && st.conferenceId) {
-        // Sale/appointment extends the 5s window to 3 minutes for the web form;
+        // Sale/appointment extends the short window to 3 minutes for the web form;
         // every other outcome keeps the short window.
         wrapSec = wrapSecondsFor(disp);
         st.state = 'WRAP_UP';
