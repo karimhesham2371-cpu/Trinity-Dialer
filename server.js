@@ -4980,8 +4980,11 @@ async function pacingTick() {
       pacingBusy = false;
     } else return;
   }
+  // Stamp the heartbeat BEFORE the spend gate: a tick that runs and declines
+  // to dial is alive, not wedged — /health must show the difference.
+  PACER_LAST_TICK = Date.now();
   if (!spendAllowsDialing()) return;   // hourly spend cap / balance floor
-  pacingBusy = true; pacingBusyAt = Date.now(); PACER_LAST_TICK = Date.now();
+  pacingBusy = true; pacingBusyAt = Date.now();
   try {
     // Agents that can take MORE dials: in-conference, not on a connected call,
     // not inbound, and with fewer in-flight legs than the CPA ratio allows.
