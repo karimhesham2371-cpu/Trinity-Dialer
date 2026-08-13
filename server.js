@@ -2798,7 +2798,9 @@ app.get('/api/admin/reports/calls', auth, adminOnly, async (req, res) => {
   const join = result && result !== 'all' ? 'leads!inner' : 'leads';
   const f = [
     `select=*,${join}(first_name,last_name,address,state,phone,status,last_outcome),campaigns(name)`,
-    'agent_id=not.is.null',
+    // lane=all exposes engine/unbridged legs too — cost analysis needs the
+    // machine answers, which never get an agent_id.
+    ...(req.query.lane === 'all' ? [] : ['agent_id=not.is.null']),
     'order=created_at.desc', `limit=${PER + 1}`, `offset=${page * PER}`,
   ];
   if (from)        f.push(`created_at=gte.${encodeURIComponent(from)}`);
