@@ -702,6 +702,19 @@ async function campaignAmd(campaignId) {
 // One row per AMD webhook. Best-effort (table ships in scripts/amd_schema.sql);
 // never retried so a missing table can't spam the durable outbox.
 function amdEvent(row) { sbReq('POST', 'amd_events', row, 'return=minimal').catch(() => {}); }
+// Telnyx bills a 60-second minimum on every answered US call AND fines calls
+// that last <=6s a $0.01 short-duration surcharge (their ToS). Killing a
+// machine at 4s therefore pays the full minute PLUS the fine. The minute is
+// unavoidable; the fine is not: hold the doomed leg to ~6.6s before hanging
+// up. The extra seconds are inside audio we've already paid for, the dial slot
+// was freed at verdict time, and the agent never sees this leg. ~360 machine
+// kills/day at a penny each is ~$3.5/shift for a setTimeout.
+const SD_HOLD_MS = 6600;
+function hangupPastSurcharge(ccid, answeredAt) {
+  const elapsed = answeredAt ? Date.now() - answeredAt : SD_HOLD_MS;   // unknown start -> don't delay
+  const wait = Math.max(0, Math.min(SD_HOLD_MS, SD_HOLD_MS - elapsed));
+  setTimeout(() => { telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {}); }, wait);
+}
 // Rolling per-campaign abandoned-rate guardrail (FCC: <=3% per campaign per 30
 // days). Recomputed lazily from the calls table and cached; pacing reads it to
 // throttle the dial ratio before the cap is hit.
@@ -5837,7 +5850,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
           const wantVm = acfg && acfg.vmDrop && acfg.vmConsent && acfg.vmUrl;
           if (wantVm) { info.phase = 'WAIT_BEEP'; return; }   // hold for greeting.ended beep
           info.phase = 'MACHINE'; delete dialerRt[ccid];
-          telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+          hangupPastSurcharge(ccid, info.answeredAt);   // slot freed NOW; leg dies past the 6s fine
           saveCall({ telnyx_call_control_id: ccid, call_phase: 'MACHINE', ended_at: new Date().toISOString() }, 'engine-machine');
           if (info.leadId) recycleSystemOutcome(info.leadId, 'voicemail').catch(() => {});
           autoDisposition(info, 'AUTO_ANSWERING_MACHINE');
@@ -5893,7 +5906,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         } else if (r !== 'beep_detected' && r !== 'no_beep_detected') {
           // ended/prompt_ended without a beep — nothing to drop into; hang up.
           info.phase = 'MACHINE'; delete dialerRt[ccid];
-          telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+          hangupPastSurcharge(ccid, info.answeredAt);
           if (info.leadId) recycleSystemOutcome(info.leadId, 'voicemail').catch(() => {});
         }
         return;
@@ -6122,7 +6135,7 @@ app.post('/webhooks/telnyx', async (req, res) => {
         const wantVm = acfg && acfg.vmDrop && acfg.vmConsent && acfg.vmUrl;
         if (!wantVm) {
           if (st && st.leadLeg === ccid) { st.leadLeg = null; st.onCallSince = null; }
-          telnyx('POST', `/calls/${ccid}/actions/hangup`, {}).catch(() => {});
+          hangupPastSurcharge(ccid, info && info.answeredAt);
           if (info && info.leadId) recycleSystemOutcome(info.leadId, 'voicemail').catch(() => {});
         }
         // wantVm: leave the leg up; call.machine.*.greeting.ended handles the drop.
