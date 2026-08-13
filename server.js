@@ -4168,13 +4168,23 @@ let BALANCE = { amount: null, currency: 'USD', at: 0, error: null };
 const RATE_AMD       = parseFloat(env('RATE_AMD', '0.0065'));        // per answered call
 const RATE_VOICE_MIN = parseFloat(env('RATE_VOICE_MIN', '0.009'));   // per billed minute
 const RATE_REC_MIN   = parseFloat(env('RATE_REC_MIN', '0.002'));     // per recorded minute
-let SPEND_CAP_HOUR   = parseFloat(env('SPEND_CAP_HOUR', '16'));      // runaway guard, 0 disables
+let SPEND_CAP_HOUR   = parseFloat(env('SPEND_CAP_HOUR', '6'));       // runaway guard, 0 disables
 // The real ceiling is the SHIFT: a daily cap lets a busy hour run hot without
 // idling the agent, while still bounding the day (Karim, 2026-08-12: "$16 a
 // shift"). Counted on the Eastern business day, not UTC, so it resets
 // overnight rather than mid-shift.
-let SPEND_CAP_DAY    = parseFloat(env('SPEND_CAP_DAY', '16'));       // 0 disables
+// Day cap defaults OFF (Karim, 2026-08-13: dialing must never stop on spend).
+let SPEND_CAP_DAY    = parseFloat(env('SPEND_CAP_DAY', '0'));        // 0 disables
 const BALANCE_FLOOR  = parseFloat(env('BALANCE_FLOOR', '0.50'));
+async function loadSpendCaps() {
+  try {
+    const rows = await sbSelect('app_settings', 'key=eq.spend_caps&select=value');
+    const v = rows && rows[0] && rows[0].value;
+    if (v && isFinite(v.hour)) SPEND_CAP_HOUR = v.hour;
+    if (v && isFinite(v.day))  SPEND_CAP_DAY  = v.day;
+    console.log(`[spend] caps loaded: hour $${SPEND_CAP_HOUR}, day $${SPEND_CAP_DAY || 'off'}`);
+  } catch {}
+}
 const SPEND = { hourKey: '', dayKey: '', hour: 0, day: 0, answered: 0, recorded: 0,
                 paused: false, pausedAt: 0, pausedReason: null };
 function spendRoll() {
@@ -4269,6 +4279,9 @@ app.put('/api/admin/spend', auth, adminOnly, (req, res) => {
   if (d != null && (!isFinite(d) || d < 0)) return res.status(400).json({ error: 'day_cap must be a number >= 0' });
   if (h != null) SPEND_CAP_HOUR = h;
   if (d != null) SPEND_CAP_DAY = d;
+  sbReq('POST', 'app_settings?on_conflict=key',
+    { key: 'spend_caps', value: { hour: SPEND_CAP_HOUR, day: SPEND_CAP_DAY }, updated_at: new Date().toISOString() },
+    'resolution=merge-duplicates,return=minimal').catch(() => {});
   // A raised cap should un-stick a pause immediately, not at the next rollover.
   if (SPEND.paused && ((SPEND.pausedReason === 'daily-cap' && SPEND_CAP_DAY > SPEND.day) ||
                        (SPEND.pausedReason === 'hourly-cap' && SPEND_CAP_HOUR > SPEND.hour))) {
@@ -6627,6 +6640,7 @@ server.listen(PORT, async () => {
   await loadCallingWindow();
   await loadDialerConfig();
   await loadPlaylistStats();
+  await loadSpendCaps();
   await loadCallerLocks();
   await loadCoachCfg();
   await loadTeamChat();
