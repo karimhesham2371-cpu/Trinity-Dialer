@@ -867,31 +867,77 @@ const { createDetector: createShadowDetector } = require('./lib/shadowamd');
 const SHADOW_AMD_ON = env('SHADOW_AMD', '1') === '1';
 const SHADOW_STATS = { started: 0, verdicts: 0, errors: 0, byResult: {} };
 const shadowRt = new Map();   // ccid -> { det, campaignId, startedAt }
+// ── AMD decider ────────────────────────────────────────────────────────────
+// Who routes answered calls: 'premium' (Telnyx, the default) or 'shadow' (our
+// detector). In shadow mode a per-dial sample still runs premium — those legs
+// keep paying the fee and keep producing ground truth, so agreement stays
+// measured continuously even after cutover. Our verdict is injected through
+// our own webhook endpoint as a synthetic premium event, so cutover reuses
+// the battle-tested routing branches byte for byte.
+let AMD_DECIDER = { mode: 'premium', sample: 0.10, reverted_at: null, revert_reason: null };
+async function loadAmdDecider() {
+  try {
+    const rows = await sbSelect('app_settings', 'key=eq.amd_decider&select=value');
+    const v = rows && rows[0] && rows[0].value;
+    if (v && ['premium', 'shadow'].includes(v.mode))
+      AMD_DECIDER = { ...AMD_DECIDER, ...v };
+    console.log(`[amd-decider] mode=${AMD_DECIDER.mode} sample=${AMD_DECIDER.sample}`);
+  } catch {}
+}
+function saveAmdDecider() {
+  sbReq('POST', 'app_settings?on_conflict=key',
+    { key: 'amd_decider', value: AMD_DECIDER, updated_at: new Date().toISOString() },
+    'resolution=merge-duplicates,return=minimal').catch(() => {});
+}
+const SHADOW_DECIDE_LOG = [];   // { at, result } — the sentinel reads this window
+async function dispatchShadowVerdict(ccid, cs64, result) {
+  const map = { human: 'human_residence', machine: 'machine', not_sure: 'not_sure', silence: 'silence' };
+  const body = { data: { id: `shadow-${Date.now()}-${ccid.slice(-12)}`,
+    event_type: 'call.machine.premium.detection.ended',
+    payload: { call_control_id: ccid, client_state: cs64 || null, result: map[result] || 'not_sure' } } };
+  try {
+    await fetchT(`http://127.0.0.1:${PORT}/webhooks/telnyx?token=${WH_TOKEN}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, 8000);
+  } catch (e) { console.error('[shadow-decide]', e.message); }
+}
 const SHADOW_KEY = crypto.createHmac('sha256', JWT_SECRET).update('shadow-amd').digest('hex').slice(0, 24);
-function startShadowAmd(ccid, campaignId) {
+function startShadowAmd(ccid, campaignId, opts) {
   if (!SHADOW_AMD_ON || !PUBLIC_HOST || !ccid || shadowRt.has(ccid)) return;
+  const decides = !!(opts && opts.decides), cs64 = opts && opts.cs64;
   const det = createShadowDetector((v) => {
     SHADOW_STATS.verdicts++;
     SHADOW_STATS.byResult[v.result] = (SHADOW_STATS.byResult[v.result] || 0) + 1;
     amdEvent({ call_id: ccid, campaign_id: campaignId || null, amd_mode: 'shadow',
       event_type: 'shadow.verdict', result: v.result, latency_ms: v.ms,
-      raw: { reason: v.reason, features: v.features } });
+      raw: { reason: v.reason, features: v.features, decided: decides } });
+    if (decides) {
+      SHADOW_DECIDE_LOG.push({ at: Date.now(), result: v.result });
+      if (SHADOW_DECIDE_LOG.length > 500) SHADOW_DECIDE_LOG.splice(0, 200);
+      dispatchShadowVerdict(ccid, cs64, v.result);
+    }
     const st = shadowRt.get(ccid);
-    if (st && st.ws) { try { st.ws.close(); } catch {} }
+    if (st) { if (st.fallback) clearTimeout(st.fallback); if (st.ws) { try { st.ws.close(); } catch {} } }
     shadowRt.delete(ccid);
     // Verdict is in — stop paying for the fork. The call itself is untouched.
     telnyx('POST', `/calls/${ccid}/actions/streaming_stop`, {}).catch(() => {});
   });
-  shadowRt.set(ccid, { det, campaignId, startedAt: Date.now(), ws: null });
+  const entry = { det, campaignId, startedAt: Date.now(), ws: null, fallback: null };
+  // When we ARE the decider a verdict must always arrive: if the fork dies or
+  // never connects, finish() at 7.5s routes not_sure (silence_policy takes it
+  // from there) — the detector's own 5.2s deadline beats this in normal use.
+  if (decides) entry.fallback = setTimeout(() => {
+    if (shadowRt.has(ccid)) { shadowRt.get(ccid).det.finish(); }
+  }, 7500);
+  shadowRt.set(ccid, entry);
   SHADOW_STATS.started++;
   telnyx('POST', `/calls/${ccid}/actions/streaming_start`, {
     stream_url: `wss://${PUBLIC_HOST}/amd-shadow?k=${SHADOW_KEY}`,
     stream_track: 'inbound_track',
   }).catch((e) => {
-    // A fork can fail (call already down, or a live-monitor fork holds the slot).
-    // Shadow is best-effort by design — drop this sample, never touch the call.
     SHADOW_STATS.errors++;
-    shadowRt.delete(ccid);
+    const st = shadowRt.get(ccid);
+    if (st && decides) st.det.finish();          // deciding leg: route not_sure NOW
+    else shadowRt.delete(ccid);                  // pure shadow: drop the sample
   });
 }
 function endShadowAmd(ccid) {
@@ -1543,6 +1589,7 @@ app.get('/health', (_req, res) => {
     balance: BALANCE.amount, balance_currency: BALANCE.currency,
     spend: spendSnapshot(),
     shadow_amd: SHADOW_STATS,
+    amd_decider: { mode: AMD_DECIDER.mode, sample: AMD_DECIDER.sample, reverted: AMD_DECIDER.revert_reason },
     ai_wrap: AI_WRAP_STATS,
     pacer: { busy: pacingBusy, busy_for_sec: pacingBusy ? Math.round((Date.now() - pacingBusyAt) / 1000) : 0,
       last_tick_ago_sec: PACER_LAST_TICK ? Math.round((Date.now() - PACER_LAST_TICK) / 1000) : null },
@@ -3000,6 +3047,46 @@ app.get('/api/admin/analytics', auth, adminOnly, async (req, res) => {
 // gate: nothing replaces premium until the matrix here says our detector
 // matches or beats it. human-vs-machine disagreements are the ones that count;
 // ambiguous classes (silence / not_sure) are shown but judged separately.
+// Cutover control. PUT {mode:'shadow'|'premium', sample?:0..0.5}. Flipping to
+// shadow arms the sentinel; flipping back is instant and always available.
+app.get('/api/admin/amd-decider', auth, adminOnly, (_req, res) =>
+  res.json({ ...AMD_DECIDER, recent_decides: SHADOW_DECIDE_LOG.slice(-50).length }));
+app.put('/api/admin/amd-decider', auth, adminOnly, (req, res) => {
+  const b = req.body || {};
+  if (b.mode && !['premium', 'shadow'].includes(b.mode)) return res.status(400).json({ error: 'mode must be premium|shadow' });
+  if (b.sample != null && !(isFinite(b.sample) && b.sample >= 0 && b.sample <= 0.5))
+    return res.status(400).json({ error: 'sample must be 0..0.5' });
+  if (b.mode) { AMD_DECIDER.mode = b.mode; AMD_DECIDER.reverted_at = null; AMD_DECIDER.revert_reason = null; }
+  if (b.sample != null) AMD_DECIDER.sample = b.sample;
+  saveAmdDecider();
+  audit(req.user, 'AMD_DECIDER', { meta: { mode: AMD_DECIDER.mode, sample: AMD_DECIDER.sample } });
+  console.log(`[amd-decider] ${AMD_DECIDER.mode.toUpperCase()} (sample ${AMD_DECIDER.sample})`);
+  res.json(AMD_DECIDER);
+});
+// Sentinel: while our detector routes calls, watch its live verdict mix. A
+// broken detector shows up as an impossible distribution — near-everything
+// machine (hangs up on the floor's humans) or near-nothing machine (floods the
+// agent with voicemail). Either trips an automatic revert to premium. Runs on
+// the last 30 minutes and needs >=25 decided calls before it will judge.
+function shadowSentinel() {
+  if (AMD_DECIDER.mode !== 'shadow') return;
+  const cut = Date.now() - 30 * 60e3;
+  const win = SHADOW_DECIDE_LOG.filter(x => x.at > cut);
+  if (win.length < 25) return;
+  const share = (r) => win.filter(x => x.result === r).length / win.length;
+  const mach = share('machine'), hum = share('human');
+  let reason = null;
+  if (mach > 0.90) reason = `machine share ${(mach * 100).toFixed(0)}% — likely hanging up on humans`;
+  else if (mach < 0.05 && win.length >= 40) reason = `machine share ${(mach * 100).toFixed(0)}% — likely flooding the agent with voicemail`;
+  else if (hum + mach < 0.25) reason = `ambiguous share ${((1 - hum - mach) * 100).toFixed(0)}% — detector not reaching verdicts`;
+  if (reason) {
+    AMD_DECIDER.mode = 'premium';
+    AMD_DECIDER.reverted_at = new Date().toISOString();
+    AMD_DECIDER.revert_reason = reason;
+    saveAmdDecider();
+    console.error(`[amd-decider] SENTINEL REVERT -> premium: ${reason}`);
+  }
+}
 app.get('/api/admin/amd-shadow', auth, adminOnly, async (req, res) => {
   try {
     const hours = Math.max(1, Math.min(168, parseInt(req.query.hours, 10) || 24));
@@ -3033,7 +3120,18 @@ app.get('/api/admin/amd-shadow', auth, adminOnly, async (req, res) => {
       if (sv.latency_ms != null) latS.push(sv.latency_ms);
     }
     const med = (a) => a.length ? a.sort((x, y) => x - y)[Math.floor(a.length / 2)] : null;
-    res.json({ hours, shadow_verdicts: shad.size, premium_verdicts: prem.size,
+    // Cutover gate: enough volume, zero hard errors, and we find at least 85%
+    // of the humans premium finds. Advisory — the flip is still a human action.
+    let humBoth = 0, humOurs = 0;
+    for (const [ccid, sv] of shad) {
+      const pv = prem.get(ccid);
+      if (pv && cls(pv.result) === 'human') { humBoth++; if (cls(sv.result) === 'human') humOurs++; }
+    }
+    const gate = { min_compared: 150, compared: both, hard_disagreements: hardDisagree,
+      human_recall_pct: humBoth ? Math.round(1000 * humOurs / humBoth) / 10 : null,
+      passes: both >= 150 && hardDisagree === 0 && humBoth > 0 && (humOurs / humBoth) >= 0.85 };
+    res.json({ hours, decider: AMD_DECIDER, gate,
+      shadow_verdicts: shad.size, premium_verdicts: prem.size,
       compared: both, agreement_pct: both ? Math.round(1000 * agree / both) / 10 : null,
       hard_disagreements: hardDisagree,
       hard_disagree_pct: both ? Math.round(1000 * hardDisagree / both) / 10 : null,
@@ -4837,7 +4935,12 @@ async function dialLead(agentId, lead, playlistId) {
   // Per-campaign AMD config (mode + optional analysis-time overrides). Falls back
   // to premium; a campaign set to 'disabled' opts out entirely.
   const acfg = await campaignAmd(lead.campaign_id);
-  const amdParam = AMD_MODE === 'disabled' ? 'disabled' : acfg.mode;
+  let amdParam = AMD_MODE === 'disabled' ? 'disabled' : acfg.mode;
+  let csAmd = amdParam;
+  if (AMD_DECIDER.mode === 'shadow' && amdParam !== 'disabled') {
+    if (Math.random() < AMD_DECIDER.sample) csAmd = amdParam;      // calibration sample keeps premium
+    else { amdParam = 'disabled'; csAmd = 'shadow'; }              // our detector routes this leg
+  }
   const amdConf  = amdConfigParam(acfg.config);
   const cid = crypto.randomUUID();   // our internal call id — correlates every webhook back to this dial
   const dialBody = {
@@ -4847,7 +4950,7 @@ async function dialLead(agentId, lead, playlistId) {
     timeout_secs: DIALER.ring_secs,   // hard ring cap — no dead air on no-answers
     answering_machine_detection: amdParam,
     // Unconditional recording (per Karim). Recording is saved on call.recording.saved.
-    client_state: enc({ role: 'lead', agentId, conf: st.conferenceId, leadId: lead.id, campaignId: lead.campaign_id, cid, amd: amdParam }),
+    client_state: enc({ role: 'lead', agentId, conf: st.conferenceId, leadId: lead.id, campaignId: lead.campaign_id, cid, amd: csAmd }),
   };
   if (amdParam !== 'disabled' && amdConf) dialBody.answering_machine_detection_config = amdConf;
   const result = await telnyx('POST', '/calls', dialBody);
@@ -5376,7 +5479,12 @@ async function dialEngineLead(lead, acfg) {
   // The engine is USELESS without AMD (the whole state machine keys off the
   // detection webhook), so predictive dials always force premium — overriding
   // both the campaign's amd_mode and the global AMD_MODE env (spec §2).
-  const amdParam = 'premium';
+  let amdParam = 'premium';
+  let csAmd = amdParam;
+  if (AMD_DECIDER.mode === 'shadow') {
+    if (Math.random() < AMD_DECIDER.sample) csAmd = 'premium';
+    else { amdParam = 'disabled'; csAmd = 'shadow'; }
+  }
   const amdConf = amdConfigParam(acfg.config);
   const cid = crypto.randomUUID();
   const dialBody = {
@@ -5385,7 +5493,7 @@ async function dialEngineLead(lead, acfg) {
     from,
     timeout_secs: DIALER.ring_secs,
     answering_machine_detection: amdParam,
-    client_state: enc({ role: 'dialer', cid, campaignId: lead.campaign_id, leadId: lead.id, amd: amdParam }),
+    client_state: enc({ role: 'dialer', cid, campaignId: lead.campaign_id, leadId: lead.id, amd: csAmd }),
   };
   if (amdParam !== 'disabled' && amdConf) dialBody.answering_machine_detection_config = amdConf;
   // Mark IN_PROGRESS BEFORE dialing so the next pick can't re-select this lead.
@@ -5681,7 +5789,8 @@ app.post('/webhooks/telnyx', async (req, res) => {
   // Price the call as it happens — the agent's own WebRTC leg is not a PSTN cost.
   if (event === 'call.answered' && role !== 'agent') noteSpend('answered');
   if (event === 'call.answered' && (role === 'lead' || role === 'dialer') && ccid)
-    startShadowAmd(ccid, (cs && cs.campaignId) || null);
+    startShadowAmd(ccid, (cs && cs.campaignId) || null,
+      { decides: !!(cs && cs.amd === 'shadow'), cs64: payload.client_state || null });
   if (event === 'call.hangup' && ccid) endShadowAmd(ccid);
   if (event === 'call.recording.saved') noteSpend('recording', 1);
   if (event === 'call.hangup' && payload.start_time && payload.end_time) {
@@ -6641,6 +6750,7 @@ server.listen(PORT, async () => {
   await loadDialerConfig();
   await loadPlaylistStats();
   await loadSpendCaps();
+  await loadAmdDecider();
   await loadCallerLocks();
   await loadCoachCfg();
   await loadTeamChat();
@@ -6666,6 +6776,7 @@ server.listen(PORT, async () => {
   setInterval(reserveReaper, 5 * 1000);       // revert agents stuck in RESERVED (bridge that never landed)
   setInterval(flushOutbox, 5 * 1000);     // drain any Supabase writes that failed, at-least-once
   setInterval(reaperTick, 30 * 1000);
+  setInterval(shadowSentinel, 60 * 1000);   // auto-revert while our AMD routes calls
   setInterval(refreshCallerPool, 5 * 60 * 1000);
   setInterval(loadCallingWindow, 5 * 60 * 1000);
   setInterval(loadDialerConfig, 60 * 1000);
