@@ -841,6 +841,53 @@ const aiRt = {};
 // in the browser. On the last listener leaving (or call hangup) we stop the fork so
 // media streaming only costs money while someone is actually listening.
 const aiStreams = new Map();
+
+// ── Shadow AMD ──────────────────────────────────────────────────────────────
+// Our own answering-machine detector (lib/shadowamd.js) listening on a media
+// fork of every auto-dialed leg. SHADOW ONLY: premium AMD still makes every
+// routing decision; this logs a second verdict per call into amd_events
+// (event_type 'shadow.verdict') so /api/admin/amd-shadow can measure agreement
+// on real traffic before any cutover is even discussed. Fork starts at ANSWER
+// (never on ringing — no streaming spend on unanswered dials) and stops the
+// moment a verdict lands, so it listens for ~2-5 s per answered call.
+const { createDetector: createShadowDetector } = require('./lib/shadowamd');
+const SHADOW_AMD_ON = env('SHADOW_AMD', '1') === '1';
+const SHADOW_STATS = { started: 0, verdicts: 0, errors: 0, byResult: {} };
+const shadowRt = new Map();   // ccid -> { det, campaignId, startedAt }
+const SHADOW_KEY = crypto.createHmac('sha256', JWT_SECRET).update('shadow-amd').digest('hex').slice(0, 24);
+function startShadowAmd(ccid, campaignId) {
+  if (!SHADOW_AMD_ON || !PUBLIC_HOST || !ccid || shadowRt.has(ccid)) return;
+  const det = createShadowDetector((v) => {
+    SHADOW_STATS.verdicts++;
+    SHADOW_STATS.byResult[v.result] = (SHADOW_STATS.byResult[v.result] || 0) + 1;
+    amdEvent({ call_id: ccid, campaign_id: campaignId || null, amd_mode: 'shadow',
+      event_type: 'shadow.verdict', result: v.result, latency_ms: v.ms,
+      raw: { reason: v.reason, features: v.features } });
+    const st = shadowRt.get(ccid);
+    if (st && st.ws) { try { st.ws.close(); } catch {} }
+    shadowRt.delete(ccid);
+    // Verdict is in — stop paying for the fork. The call itself is untouched.
+    telnyx('POST', `/calls/${ccid}/actions/streaming_stop`, {}).catch(() => {});
+  });
+  shadowRt.set(ccid, { det, campaignId, startedAt: Date.now(), ws: null });
+  SHADOW_STATS.started++;
+  telnyx('POST', `/calls/${ccid}/actions/streaming_start`, {
+    stream_url: `wss://${PUBLIC_HOST}/amd-shadow?k=${SHADOW_KEY}`,
+    stream_track: 'inbound_track',
+  }).catch((e) => {
+    // A fork can fail (call already down, or a live-monitor fork holds the slot).
+    // Shadow is best-effort by design — drop this sample, never touch the call.
+    SHADOW_STATS.errors++;
+    shadowRt.delete(ccid);
+  });
+}
+function endShadowAmd(ccid) {
+  const st = ccid && shadowRt.get(ccid);
+  if (!st) return;
+  st.det.finish();   // logs not_sure/silence if the call died before a verdict
+  shadowRt.delete(ccid);
+}
+
 // Signed per-call key so only Telnyx (using the URL we handed it) can push audio.
 function streamKey(ccid) {
   return crypto.createHmac('sha256', JWT_SECRET).update('aistream:' + ccid).digest('hex').slice(0, 24);
@@ -1482,6 +1529,7 @@ app.get('/health', (_req, res) => {
     caller_pool: CALLER_POOL.length, agents_online: Object.keys(rt).length,
     balance: BALANCE.amount, balance_currency: BALANCE.currency,
     spend: spendSnapshot(),
+    shadow_amd: SHADOW_STATS,
     ai_wrap: AI_WRAP_STATS,
     pacer: { busy: pacingBusy, busy_for_sec: pacingBusy ? Math.round((Date.now() - pacingBusyAt) / 1000) : 0,
       last_tick_ago_sec: PACER_LAST_TICK ? Math.round((Date.now() - PACER_LAST_TICK) / 1000) : null },
@@ -2935,6 +2983,51 @@ app.get('/api/admin/analytics', auth, adminOnly, async (req, res) => {
 //     human but the agent marked voicemail/no-answer (false negative / miss)
 //   • abandoned rate vs the FCC 3% cap
 // Reads the calls + dispositions tables directly; degrades to zeros pre-migration.
+// Shadow-vs-premium agreement on real traffic. This report IS the cutover
+// gate: nothing replaces premium until the matrix here says our detector
+// matches or beats it. human-vs-machine disagreements are the ones that count;
+// ambiguous classes (silence / not_sure) are shown but judged separately.
+app.get('/api/admin/amd-shadow', auth, adminOnly, async (req, res) => {
+  try {
+    const hours = Math.max(1, Math.min(168, parseInt(req.query.hours, 10) || 24));
+    const from = new Date(Date.now() - hours * 3600e3).toISOString();
+    const rows = await sbSelectAll('amd_events',
+      `created_at=gte.${encodeURIComponent(from)}&event_type=in.(%22call.machine.premium.detection.ended%22,%22shadow.verdict%22)&select=call_id,event_type,result,latency_ms,raw`);
+    const prem = new Map(), shad = new Map();
+    for (const r of rows || []) {
+      if (!r.call_id) continue;
+      if (r.event_type === 'shadow.verdict') shad.set(r.call_id, r);
+      else prem.set(r.call_id, r);
+    }
+    const cls = (result) => AMD_HUMAN_RESULTS.has(result) ? 'human'
+      : AMD_MACHINE_RESULTS.has(result) ? 'machine' : 'ambiguous';
+    const matrix = {}; const latP = [], latS = []; let both = 0, agree = 0, hardDisagree = 0;
+    const disagreements = [];
+    for (const [ccid, sv] of shad) {
+      const pv = prem.get(ccid);
+      if (!pv) continue;
+      both++;
+      const pc = cls(pv.result), sc = cls(sv.result);
+      const key = `premium:${pc} / shadow:${sc}`;
+      matrix[key] = (matrix[key] || 0) + 1;
+      if (pc === sc) agree++;
+      if ((pc === 'human' && sc === 'machine') || (pc === 'machine' && sc === 'human')) {
+        hardDisagree++;
+        if (disagreements.length < 25) disagreements.push({ call_id: ccid,
+          premium: pv.result, shadow: sv.result, shadow_reason: sv.raw && sv.raw.reason });
+      }
+      if (pv.latency_ms != null) latP.push(pv.latency_ms);
+      if (sv.latency_ms != null) latS.push(sv.latency_ms);
+    }
+    const med = (a) => a.length ? a.sort((x, y) => x - y)[Math.floor(a.length / 2)] : null;
+    res.json({ hours, shadow_verdicts: shad.size, premium_verdicts: prem.size,
+      compared: both, agreement_pct: both ? Math.round(1000 * agree / both) / 10 : null,
+      hard_disagreements: hardDisagree,
+      hard_disagree_pct: both ? Math.round(1000 * hardDisagree / both) / 10 : null,
+      median_latency_ms: { premium: med(latP), shadow: med(latS) },
+      matrix, disagreement_samples: disagreements, live: SHADOW_STATS });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/admin/amd-stats', auth, adminOnly, async (req, res) => {
   const now = Date.now();
   const from = req.query.from ? new Date(req.query.from).getTime() : (now - 7 * 864e5);
@@ -5558,6 +5651,9 @@ app.post('/webhooks/telnyx', async (req, res) => {
 
   // Price the call as it happens — the agent's own WebRTC leg is not a PSTN cost.
   if (event === 'call.answered' && role !== 'agent') noteSpend('answered');
+  if (event === 'call.answered' && (role === 'lead' || role === 'dialer') && ccid)
+    startShadowAmd(ccid, (cs && cs.campaignId) || null);
+  if (event === 'call.hangup' && ccid) endShadowAmd(ccid);
   if (event === 'call.recording.saved') noteSpend('recording', 1);
   if (event === 'call.hangup' && payload.start_time && payload.end_time) {
     const mins = (new Date(payload.end_time) - new Date(payload.start_time)) / 60000;
@@ -6342,6 +6438,29 @@ setInterval(() => { for (const c of wsClients) { try { c.ws.ping(); } catch {} }
 // audio as JSON frames: {event:'media', media:{track, payload:<base64 μ-law 8k>}}.
 // We prefix each payload with a track byte (0=inbound/contact, 1=outbound/AI) and
 // relay the raw μ-law bytes as a binary frame to every browser listening to this call.
+const shadowWss = new WebSocketServer({ noServer: true });
+shadowWss.on('connection', (ws, req) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.searchParams.get('k') !== SHADOW_KEY) { ws.close(4003, 'forbidden'); return; }
+  let ccid = null;
+  ws.on('message', (data) => {
+    let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
+    if (msg.event === 'start' && msg.start) {
+      ccid = msg.start.call_control_id || null;
+      const st = ccid && shadowRt.get(ccid);
+      if (st) st.ws = ws; else { try { ws.close(); } catch {} }
+      return;
+    }
+    if (msg.event === 'media' && ccid && msg.media && msg.media.payload) {
+      const st = shadowRt.get(ccid);
+      if (st) st.det.feed(msg.media.payload);
+    }
+    if (msg.event === 'stop' && ccid) endShadowAmd(ccid);
+  });
+  ws.on('close', () => { if (ccid) endShadowAmd(ccid); });
+  ws.on('error', () => {});
+});
+
 const mediaWss = new WebSocketServer({ noServer: true });
 mediaWss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://x');
@@ -6436,6 +6555,7 @@ server.on('upgrade', (req, socket, head) => {
   try { pathname = new URL(req.url, 'http://x').pathname; }
   catch { socket.destroy(); return; }
   const target = pathname === '/ws' ? wss
+    : pathname === '/amd-shadow' ? shadowWss
     : pathname === '/telnyx-media' ? mediaWss
     : pathname === '/ws/ai-listen' ? listenWss
     : pathname === '/ws/monitor' ? monitorWss
