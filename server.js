@@ -35,14 +35,16 @@ const CRED_CONNECTION_ID = env('TELNYX_CRED_CONNECTION_ID', '3001006440748943295
 const WH_TOKEN           = env('WH_TOKEN', 'trinity-2026');
 const TELNYX_PUBLIC_KEY   = env('TELNYX_PUBLIC_KEY', '');   // base64 Ed25519 key for webhook signature verification
 // AMD_MODE:
-//   'greet_first' (default) — greet the instant the line is answered, keep premium
+//   'greet_first' — greet the instant the line is answered, keep premium
 //        AMD running in the background; if AMD later says "machine" the call is
 //        dropped a few seconds in. Zero human-lead loss (no 5-6s AMD gate before
-//        the bot speaks), tiny cost of a few seconds of assistant on voicemails.
-//   'premium'    — wait for premium AMD to confirm human before greeting (no
-//        assistant cost on voicemails, but ~5-6s of dead air → owners hang up).
+//        the bot speaks), but pays a few seconds of assistant on EVERY pickup —
+//        including voicemails and 3-second hang-ups (the real cost driver).
+//   'premium' (default) — wait for premium AMD to confirm human before greeting,
+//        so voicemails + instant hang-ups never attach the assistant (big saving
+//        on cold lists); costs ~5-6s of dead air before she speaks to real humans.
 //   'disabled'   — greet on answer, no AMD at all (assistant fully engages VMs).
-const AMD_MODE           = env('AMD_MODE', 'greet_first');
+const AMD_MODE           = env('AMD_MODE', 'premium');
 const SB_HOST            = env('SUPABASE_HOST');
 const SB_KEY             = env('SUPABASE_KEY');
 const DEFAULT_FROM       = env('DEFAULT_FROM', '+19168850241');
@@ -864,7 +866,7 @@ const aiStreams = new Map();
 // (never on ringing — no streaming spend on unanswered dials) and stops the
 // moment a verdict lands, so it listens for ~2-5 s per answered call.
 const { createDetector: createShadowDetector } = require('./lib/shadowamd');
-const SHADOW_AMD_ON = env('SHADOW_AMD', '1') === '1';
+const SHADOW_AMD_ON = env('SHADOW_AMD', '0') === '1';   // default OFF — the media fork costs money per answered call
 const SHADOW_STATS = { started: 0, verdicts: 0, errors: 0, byResult: {} };
 const shadowRt = new Map();   // ccid -> { det, campaignId, startedAt }
 // ── AMD decider ────────────────────────────────────────────────────────────
