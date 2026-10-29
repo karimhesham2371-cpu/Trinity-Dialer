@@ -5243,10 +5243,15 @@ async function nextAiLead(nowIso) {
   const cids = AI.campaign_ids;
   if (!cids.length) return null;
   const inList = cids.map(c => `"${c}"`).join(',');
+  // callableNow (calling-window) is computed in JS from each lead's area-code/state
+  // timezone, so we can't push it into SQL. Scan a deep batch and return the first
+  // lead inside its window. A shallow limit (was 15) STALLS the whole lane whenever
+  // the front of the queue is a run of not-yet-in-window timezones (e.g. West-coast
+  // leads before 10am) even though callable leads exist further back.
   const leads = await sbSelect('leads',
     `campaign_id=in.(${inList})&dnc=eq.false&status=in.(NEW,CALLBACK)` +
     `&or=(next_callback_at.is.null,next_callback_at.lte.${nowIso})` +
-    `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=15&select=*`);
+    `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=2000&select=*`);
   return (leads || []).find(callableNow) || null;
 }
 
