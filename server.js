@@ -2758,11 +2758,26 @@ app.post('/api/admin/ai/hangup', auth, adminOnly, async (req, res) => {
   info.resultRecorded = true;
   if (info.leadId) sbUpdate('leads', `id=eq.${info.leadId}`,
     { status: 'CONTACTED', last_outcome: 'manual_hangup' }).catch(() => {});
+  let telnyxEnded = false;
   try {
     await telnyx('POST', `/calls/${ccid}/actions/hangup`, {});
     console.log(`[ai] manual hangup ${ccid.slice(-8)} by admin`);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    // Telnyx 422/90018 = call already ended. That's not a failure here — the
+    // slot leaked because we missed the hangup webhook. Clear it regardless so
+    // the button always frees the phantom instead of dying with a 500.
+    const alreadyEnded = /already ended|90018|not .*active/i.test(e.message || '') ||
+                         / 422:/.test(e.message || '');
+    if (!alreadyEnded) {
+      // real error (network, auth) — still clear the slot but report it
+      delete aiRt[ccid];
+      return res.status(502).json({ error: e.message, slot_cleared: true });
+    }
+    telnyxEnded = true;
+    console.log(`[ai] manual hangup ${ccid.slice(-8)}: already ended on Telnyx, cleared leaked slot`);
+  }
+  delete aiRt[ccid];
+  res.json({ ok: true, was_already_ended: telnyxEnded });
 });
 
 // ══ ADMIN: reports ══════════════════════════════════════════════════════════════
