@@ -5360,6 +5360,13 @@ async function startAiAssistant(ccid) {
     const street = String(info.address).split(',')[0].trim();
     dyn.property_address = street || info.address;
   }
+  // The lead's real callback number, so Julia can read it back for confirmation.
+  // Without this the prompt had no number to substitute and the model parroted
+  // the literal example digits from the instructions (confirmed 916-885-0241 bug).
+  if (info.leadNumber) {
+    const d = String(info.leadNumber).replace(/\D/g, '').slice(-10);
+    if (d.length === 10) dyn.contact_phone = d;
+  }
   try {
     await telnyx('POST', `/calls/${ccid}/actions/ai_assistant_start`, {
       assistant: { id: AI.assistant_id, dynamic_variables: dyn },
