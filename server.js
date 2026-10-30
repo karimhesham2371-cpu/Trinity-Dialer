@@ -5341,14 +5341,36 @@ async function dialAiLead(lead) {
   // Full property address from the mapped lead columns (street, city, state, zip).
   const propertyAddress = [lead.address, lead.city, lead.state, lead.zip]
     .map(x => String(x || '').trim()).filter(Boolean).join(', ');
-  const result = await telnyx('POST', '/calls', {
-    connection_id: CONNECTION_ID,
-    to: lead.phone,
-    from,
-    timeout_secs: DIALER.ring_secs,
-    answering_machine_detection: AMD_MODE === 'disabled' ? 'disabled' : 'premium',
-    client_state: enc({ role: 'ai', leadId: lead.id, campaignId: lead.campaign_id }),
-  });
+  let result;
+  try {
+    result = await telnyx('POST', '/calls', {
+      connection_id: CONNECTION_ID,
+      to: lead.phone,
+      from,
+      timeout_secs: DIALER.ring_secs,
+      answering_machine_detection: AMD_MODE === 'disabled' ? 'disabled' : 'premium',
+      client_state: enc({ role: 'ai', leadId: lead.id, campaignId: lead.campaign_id }),
+    });
+  } catch (e) {
+    // CRITICAL: if the dial fails we MUST move the lead out of the NEW/CALLBACK
+    // pool, else nextAiLead hands back the same lead every tick and the whole lane
+    // wedges forever (observed 2026-10-30: one invalid number D11 froze dialing).
+    const msg = e.message || '';
+    const invalid = /10010|\bD11\b|invalid/i.test(msg);
+    if (invalid) {
+      await sbUpdate('leads', `id=eq.${lead.id}`,
+        { status: 'BAD', last_outcome: 'invalid_number', attempts: (lead.attempts || 0) + 1,
+          last_attempt_at: new Date().toISOString() }).catch(() => {});
+      console.error(`[ai:dial] invalid number ${lead.phone} (D11) — marked BAD`);
+    } else {
+      // transient (rate limit, 5xx, network): back off 30 min so the lane advances.
+      await sbUpdate('leads', `id=eq.${lead.id}`,
+        { status: 'CALLBACK', attempts: (lead.attempts || 0) + 1, last_attempt_at: new Date().toISOString(),
+          next_callback_at: new Date(Date.now() + 30 * 60 * 1000).toISOString() }).catch(() => {});
+      console.error(`[ai:dial] dial failed ${lead.phone} (${msg.slice(0, 80)}) — 30m cooldown`);
+    }
+    return;   // pacer continues to the next lead
+  }
   const ccid = result.data && result.data.call_control_id;
   if (!ccid) return;
   aiRt[ccid] = { leadId: lead.id, leadNumber: lead.phone, fromNumber: from,
@@ -5462,7 +5484,7 @@ async function aiPacingTick() {
       const lead = await nextAiLead(nowIso);   // dialAiLead marks IN_PROGRESS, so no re-pick
       if (!lead) { AI_TICK.lastExit = 'nolead'; break; }
       try { await dialAiLead(lead); dialed++; AI_TICK.lastExit = 'dialed:' + dialed; }
-      catch (e) { console.error('[ai:dial]', e.message); AI_TICK.lastExit = 'dialerr:' + e.message; break; }
+      catch (e) { console.error('[ai:dial]', e.message); AI_TICK.lastExit = 'dialerr:' + e.message; continue; }
     }
   } catch (e) { console.error('[aiPacing]', e.message); AI_TICK.lastExit = 'threw:' + e.message; }
   finally { aiPacingBusy = false; }
