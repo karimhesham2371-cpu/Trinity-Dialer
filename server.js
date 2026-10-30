@@ -2780,6 +2780,43 @@ app.post('/api/admin/ai/hangup', auth, adminOnly, async (req, res) => {
   res.json({ ok: true, was_already_ended: telnyxEnded });
 });
 
+// Diagnostic: runs the exact AI-pacer gates and reports which one blocks dialing.
+app.get('/api/admin/ai/diag', auth, adminOnly, async (_req, res) => {
+  const out = {
+    enabled: AI.enabled, assistant_id: AI.assistant_id, campaign_ids: AI.campaign_ids,
+    concurrency: AI.concurrency, did_numbers: AI.did_numbers,
+    aiRt_count: Object.keys(aiRt).length, slots: AI.concurrency - Object.keys(aiRt).length,
+    sb_host: !!SB_HOST, connection_id: !!CONNECTION_ID, caller_pool: CALLER_POOL.length,
+    default_from: DEFAULT_FROM,
+    balance: BALANCE.amount, balance_floor: BALANCE_FLOOR,
+    spend_paused: SPEND.paused, paused_reason: SPEND.pausedReason, spend_hour: SPEND.hour, spend_cap_hour: SPEND_CAP_HOUR,
+    amd_mode: AMD_MODE,
+  };
+  try { out.spendAllowsDialing = spendAllowsDialing(); } catch (e) { out.spendAllowsDialing = 'THREW: ' + e.message; }
+  try {
+    const nowIso = new Date().toISOString();
+    const t0 = Date.now();
+    const lead = await nextAiLead(nowIso);
+    out.nextAiLead_ms = Date.now() - t0;
+    if (lead) {
+      out.nextAiLead = { phone: lead.phone, status: lead.status, state: stateOfLead(lead),
+        callable: callableNow(lead), from_would_be: pickCallerId(areaCodeOf(lead.phone), AI.did_numbers) };
+    } else {
+      // Dig: how many due candidates exist, and how many pass callableNow?
+      const inList = AI.campaign_ids.map(c => `"${c}"`).join(',');
+      const leads = await sbSelect('leads',
+        `campaign_id=in.(${inList})&dnc=eq.false&status=in.(NEW,CALLBACK)` +
+        `&or=(next_callback_at.is.null,next_callback_at.lte.${nowIso})` +
+        `&order=next_callback_at.asc.nullsfirst,created_at.asc&limit=2000&select=*`);
+      out.nextAiLead = null;
+      out.due_fetched = (leads || []).length;
+      out.due_callable = (leads || []).filter(callableNow).length;
+      out.sample = (leads || []).slice(0, 3).map(l => ({ phone: l.phone, state: stateOfLead(l), callable: callableNow(l) }));
+    }
+  } catch (e) { out.nextAiLead_error = e.message; }
+  res.json(out);
+});
+
 // ══ ADMIN: reports ══════════════════════════════════════════════════════════════
 // 1) Audit Logs — user activity trail. Filters: from, to, actor_id, action, limit.
 app.get('/api/admin/reports/audit', auth, adminOnly, async (req, res) => {
