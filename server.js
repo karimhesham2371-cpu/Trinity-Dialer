@@ -2781,8 +2781,10 @@ app.post('/api/admin/ai/hangup', auth, adminOnly, async (req, res) => {
 });
 
 // Diagnostic: runs the exact AI-pacer gates and reports which one blocks dialing.
-app.get('/api/admin/ai/diag', auth, adminOnly, async (_req, res) => {
+app.get('/api/admin/ai/diag', auth, adminOnly, async (req, res) => {
   const out = {
+    tick: { count: AI_TICK.count, last_ago_sec: AI_TICK.lastAt ? Math.round((Date.now() - AI_TICK.lastAt) / 1000) : null, last_exit: AI_TICK.lastExit },
+    pacing_busy: aiPacingBusy, busy_for_sec: aiPacingBusy ? Math.round((Date.now() - aiPacingBusyAt) / 1000) : 0,
     enabled: AI.enabled, assistant_id: AI.assistant_id, campaign_ids: AI.campaign_ids,
     concurrency: AI.concurrency, did_numbers: AI.did_numbers,
     aiRt_count: Object.keys(aiRt).length, slots: AI.concurrency - Object.keys(aiRt).length,
@@ -2814,6 +2816,17 @@ app.get('/api/admin/ai/diag', auth, adminOnly, async (_req, res) => {
       out.sample = (leads || []).slice(0, 3).map(l => ({ phone: l.phone, state: stateOfLead(l), callable: callableNow(l) }));
     }
   } catch (e) { out.nextAiLead_error = e.message; }
+  // ?force=1 runs one tick directly and reports what it did.
+  if (req.query.force) {
+    const before = Object.keys(aiRt).length;
+    const tickBefore = AI_TICK.count;
+    try { await aiPacingTick(); out.force = { ok: true }; }
+    catch (e) { out.force = { threw: e.message }; }
+    out.force.aiRt_before = before;
+    out.force.aiRt_after = Object.keys(aiRt).length;
+    out.force.tick_ran = AI_TICK.count > tickBefore;
+    out.force.last_exit = AI_TICK.lastExit;
+  }
   res.json(out);
 });
 
@@ -5420,15 +5433,17 @@ async function startAiAssistant(ccid) {
 }
 
 let aiPacingBusy = false, aiPacingBusyAt = 0;
+let AI_TICK = { count: 0, lastAt: 0, lastExit: null };
 async function aiPacingTick() {
-  if (!spendAllowsDialing()) return;   // hourly spend cap / balance floor
+  AI_TICK.count++; AI_TICK.lastAt = Date.now(); AI_TICK.lastExit = 'enter';
+  if (!spendAllowsDialing()) { AI_TICK.lastExit = 'spend'; return; }   // hourly spend cap / balance floor
   if (aiPacingBusy) {
     if (Date.now() - aiPacingBusyAt > 90 * 1000) { console.error('[ai] WATCHDOG: tick wedged >90s — force-releasing'); aiPacingBusy = false; }
-    else return;
+    else { AI_TICK.lastExit = 'busy'; return; }
   }
   aiPacingBusyAt = Date.now();
-  if (!AI.enabled || !AI.assistant_id || !AI.campaign_ids.length) return;
-  if (!SB_HOST || !CONNECTION_ID) return;
+  if (!AI.enabled || !AI.assistant_id || !AI.campaign_ids.length) { AI_TICK.lastExit = 'disabled'; return; }
+  if (!SB_HOST || !CONNECTION_ID) { AI_TICK.lastExit = 'noinfra'; return; }
   aiPacingBusy = true;
   try {
     // Reclaim leaked slots (missed hangup webhook) before counting capacity.
@@ -5440,15 +5455,16 @@ async function aiPacingTick() {
       }
     }
     let slots = AI.concurrency - Object.keys(aiRt).length;
-    if (slots <= 0) return;
+    if (slots <= 0) { AI_TICK.lastExit = 'noslots'; return; }
     const nowIso = new Date().toISOString();
+    let dialed = 0;
     while (slots-- > 0) {
       const lead = await nextAiLead(nowIso);   // dialAiLead marks IN_PROGRESS, so no re-pick
-      if (!lead) break;
-      try { await dialAiLead(lead); }
-      catch (e) { console.error('[ai:dial]', e.message); break; }
+      if (!lead) { AI_TICK.lastExit = 'nolead'; break; }
+      try { await dialAiLead(lead); dialed++; AI_TICK.lastExit = 'dialed:' + dialed; }
+      catch (e) { console.error('[ai:dial]', e.message); AI_TICK.lastExit = 'dialerr:' + e.message; break; }
     }
-  } catch (e) { console.error('[aiPacing]', e.message); }
+  } catch (e) { console.error('[aiPacing]', e.message); AI_TICK.lastExit = 'threw:' + e.message; }
   finally { aiPacingBusy = false; }
 }
 
